@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""agent-close: end an agent's session and remove its git worktree, once its work is landed.
+
+    agent-close NAME [--force] [--dry-run]     # a session name/id (agent-send --list) or tmux name
+    agent-close --self [--force]               # from inside the agent, as its very last step
+
+Refuses (exit 2) while the worktree has uncommitted or untracked files, or commits that are not
+on origin's default branch; --force discards them. Only a linked worktree is removed (never a
+main checkout or a plain directory), with its branch; git-ignored files go with it. With --self
+the tmux session ends two seconds after this prints, so the agent sees the result.
+Exit codes: 0 closed, 1 error, 2 refused, 4 not found.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import close  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-close", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("name", nargs="?", help="session name or id, or tmux session name")
+    ap.add_argument("--self", dest="self_", action="store_true", help="close the session this runs in")
+    ap.add_argument("--force", action="store_true", help="discard uncommitted or unmerged work")
+    ap.add_argument("--dry-run", action="store_true", help="check and say what would happen; change nothing")
+    a = ap.parse_args(argv)
+    if bool(a.name) == a.self_:
+        ap.error("give a NAME or --self")
+    info, err = close.find(a.name, self_=a.self_)
+    if err:
+        print("agent-close: " + err, file=sys.stderr)
+        return 4
+    code, lines = close.close(info, force=a.force, dry_run=a.dry_run, self_=a.self_)
+    for l in lines:
+        print(l, file=sys.stderr if code == 2 else sys.stdout)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""agent-mailroom: poll the agents Gmail inbox and route replies to sessions.
+
+    agent-mailroom            run forever (systemd --user service)
+    agent-mailroom --once     one poll, then exit
+    agent-mailroom --dry-run  decide and log, but deliver nothing and change no labels
+    agent-mailroom --baseline reset the history cursor to now (ignore anything older)
+
+Every 30 s (config poll_seconds) it asks Gmail for messages added to INBOX since the last
+history id, and for each one walks the routing slip:
+
+  1. sender not on the allowlist       -> held   (never delivered anywhere)
+     reply/forward to [mailroom] notice -> the orchestrator, before any session hints
+  2. In-Reply-To/References we sent    -> that session
+  3. Gmail thread we sent in           -> that session
+  4. agents+TAG@ in To/Delivered-To    -> the session that owns TAG
+  5. [#TAG] in the subject             -> the session that owns TAG
+  6. no match, sender known            -> the orchestrator: one fresh `claude -p` run per event
+     (agentmail/orchestrate.py); a failed run holds the mail and alerts the owner
+
+Two sender tiers: `allowlist` is the owner; `collaborators` are other people's agents, whose
+mail is delivered marked as external-agent input and is rate-limited and loop-guarded. Both tiers
+need a DKIM pass for the sender's domain (require_dkim). Everyone else is held.
+
+Delivered mail goes to the session via agent-send (resuming it if it is not live) and is
+labelled mailroom/delivered and marked read. Held mail is labelled mailroom/held and left
+unread. Own outbound copies are ignored. State: ~/.local/state/agent-mail/mailroom.sqlite.
+"""
+import argparse
+import fcntl
+import signal
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import alerts, config, deliver, gmail, orchestrate, recovery, registry, routing, statuslog  # noqa: E402
+from agentmail.store import Store  # noqa: E402
+
+STOP = False
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
+
+
+def on_signal(signum, frame):
+    global STOP
+    STOP = True
+    log("signal %d, finishing the current message before stopping" % signum)
+
+
+def process(svc, st, cfg, gid, dry_run):
+    if st.seen(gid):
+        return
+    msg = gmail.get_full(svc, gid)
+    hdrs = gmail.headers(msg)
+    from_name, from_addr = routing.sender(hdrs.get("from", ""))
+    subject = hdrs.get("subject", "")
+    thread_id = msg.get("threadId")
+    labels = cfg["labels"]
+    owner = config.owner_name(cfg)
+
+    if from_addr == cfg["account"]:
+        st.record_inbound(gmail_id=gid, thread_id=thread_id, message_id=hdrs.get("message-id"),
+                          from_addr=from_addr, from_name=from_name, subject=subject,
+                          action="skipped", detail="own message")
+        log("skip   %s from ourselves: %r" % (gid, subject))
+        return
+
+    body = routing.strip_quotes(gmail.body_text(msg))
+    session, rule = routing.match(st, hdrs, thread_id, cfg["account"])
+    if session is not None and session["cli"] == "orchestrator":
+        session, rule = None, "orchestrator-thread"   # the orchestrator has no session; run it with the thread
+    tier = routing.sender_tier(from_addr, cfg)
+    auth = gmail.auth_results(hdrs)
+    collab = cfg["collaborators"].get(from_addr, {}) if tier == "collaborator" else {}
+    who_name = (collab.get("name") if collab else None) or from_name
+
+    def hold(inbound_id, detail, alert=None):
+        st.update_inbound(inbound_id, action="held", detail=detail)
+        log("hold   #%d from %s %r: %s (match %s)" % (inbound_id, from_addr, subject, detail, rule or "none"))
+        if not dry_run:
+            gmail.modify(svc, gid, add=[gmail.ensure_label(svc, labels["held"])])
+            if alert:
+                alerts.send_alert(svc, st, cfg, *alert)
+
+    inbound_id = st.record_inbound(
+        gmail_id=gid, thread_id=thread_id, message_id=hdrs.get("message-id"),
+        from_addr=from_addr, from_name=from_name, subject=subject,
+        matched_tag=session["tag"] if session else None, match_rule=rule, action="pending", body=body)
+
+    if tier is None:
+        return hold(inbound_id, "sender not on allowlist")
+    if cfg.get("require_dkim", True) and not routing.dkim_ok(from_addr, auth):
+        return hold(inbound_id, "DKIM check failed for %s (auth: %s)" % (from_addr, auth["raw"][:120] or "no Authentication-Results header"),
+                    alert=("dkim", from_addr, "mail from %s failed DKIM; held" % from_addr,
+                           "Subject %r. Authentication-Results: %s\n\nMail that fails DKIM is never released (it could be forged; it is "
+                           "inbound #%d). If it was genuine, send it again from a client that signs it. If it keeps happening "
+                           "for a real sender, set require_dkim=false." % (subject, auth["raw"] or "(none)", inbound_id)))
+
+    # thread transcript: for the orchestrator always; for a session only when a collaborator wrote
+    thread_msgs = []
+    if thread_id and (session is None or tier == "collaborator"):
+        try:
+            thread_msgs = gmail.thread_messages(svc, thread_id)
+        except Exception as e:
+            log("warn   could not fetch thread %s: %s" % (thread_id, e))
+    thread_txt = routing.thread_context(thread_msgs, cfg["account"], cfg["collaborators"]) if thread_msgs else ""
+    if session is None and any(routing.sender(h.get("from", ""))[1] == cfg["account"] and
+                               h.get("x-agent-mailroom") == "alert" for h, _b, _ts, _gid in thread_msgs):
+        rule = "mailroom-notice"
+        st.update_inbound(inbound_id, match_rule=rule)
+
+    if tier == "collaborator":
+        n_hour = st.count_from_since(from_addr, time.time() - 3600)
+        if n_hour > int(cfg.get("collaborator_hourly_cap", 10)):
+            return hold(inbound_id, "collaborator hourly cap (%d) exceeded" % cfg["collaborator_hourly_cap"],
+                        alert=("flood", from_addr, "%s sent more than %d mails in an hour; holding" % (who_name, cfg["collaborator_hourly_cap"]),
+                               "Latest subject %r. Held mail: `agent-mail inbox --held`." % subject))
+        run = routing.trailing_agent_run(thread_msgs, cfg["account"], cfg["collaborators"]) if thread_msgs else 0
+        if run > int(cfg.get("agent_thread_cap", 12)):
+            return hold(inbound_id, "agent-to-agent thread has %d messages with no human; loop guard" % run,
+                        alert=("loop", thread_id or from_addr, "possible agent loop with %s; thread held" % who_name,
+                               "Thread %r has %d consecutive agent messages. Reply in the thread yourself to reset the guard, "
+                               "or `agent-mail release %d <session>`." % (subject, run, inbound_id)))
+        if cfg.get("notify_owner_new_collab_thread", True) and thread_id and not st.thread_seen_before(thread_id, gid) and not dry_run:
+            alerts.send_alert(svc, st, cfg, "collab-thread", thread_id,
+                              "%s started a thread: %s" % (who_name, subject),
+                              "From %s. First message:\n\n%s\n\nNo action needed; this is the visibility notice for a new "
+                              "agent-to-agent thread. It is being handled by %s." % (
+                                  from_addr, body[:1500], ("session %s" % (session["session_name"] or session["session_id"][:8])) if session else "the orchestrator"))
+
+    if session is not None:
+        who = "%s@%s %s [%s]" % (session["cli"], session["origin_host"], session["session_name"] or "", session["session_id"][:8])
+        if tier == "collaborator":
+            text = routing.collaborator_text(inbound_id, who_name, from_addr, collab.get("owner"), subject, body, thread_txt,
+                                             owner_name=owner)
+        else:
+            text = routing.inbound_text(inbound_id, from_name, from_addr, subject, body)
+        if dry_run:
+            log("would deliver #%d (%s) from %s %r -> %s via %s" % (inbound_id, tier, from_addr, subject, who, rule))
+            st.update_inbound(inbound_id, action="dry-run", detail="would deliver to " + who)
+            return
+        rc, out = deliver.deliver_session(session, text, cfg)
+        if rc == 0:
+            action = "queued" if session["origin_host"] != cfg["host_id"] else "delivered"
+            st.update_inbound(inbound_id, action=action, detail="%s: %s" % (tier, out))
+            gmail.modify(svc, gid, add=[gmail.ensure_label(svc, labels["delivered"])], remove=["UNREAD"])
+            log("deliver #%d (%s) from %s %r -> %s via %s: %s" % (inbound_id, tier, from_addr, subject, who, rule, out))
+        else:
+            hold(inbound_id, "delivery failed (%d): %s" % (rc, out))
+            recovery.hold_delivery(st, st.inbound(inbound_id), session, "delivery failed (%d): %s" % (rc, out))
+            recovery.notify(svc, st, cfg, st.inbound(inbound_id))
+        return
+
+    # ---- nobody claimed it: the orchestrator
+    text = routing.orchestrator_event(inbound_id, tier, who_name, from_addr, collab.get("owner"), subject, body, thread_txt,
+                                      owner_name=owner)
+    own_msgs = {mid for h, _b, _ts, mid in thread_msgs[:-1]
+                if routing.sender(h.get("from", ""))[1] == cfg["account"] and h.get("x-agent-mailroom") != "alert"}
+    sent_rows = st.sent_rows_in_thread(thread_id) if thread_id else []
+    if (rule is None and sent_rows and not any(r["tag"] for r in sent_rows)
+            and own_msgs <= {r["gmail_id"] for r in sent_rows}):
+        # Only `--unrouted` mail (cloud-watchdog, status reports, memwatch) went into this thread,
+        # so it belongs to the orchestrator: a reply here is not a lost session's mail.
+        rule = "unrouted-thread"
+        st.update_inbound(inbound_id, match_rule=rule)
+    unowned_reply = (rule not in ("orchestrator-thread", "mailroom-notice", "unrouted-thread")
+                     and bool(sent_rows or own_msgs))
+    if rule == "mailroom-notice":
+        text += ("\n\n[Mailroom routing context: %s is replying to or forwarding a mailroom notice. "
+                 "Handle this here; quoted session tags belong to the notice, not this reply. "
+                 "Check the saved mail and delivery state before retrying anything. "
+                 "Do not resume the old session just because its tag appears in the notice.]" % owner if tier == "owner" else
+                 "\n\n[Mailroom routing context: this is a reply to a mailroom notice. Handle it here; "
+                 "quoted session tags are not routing instructions. The collaborator guard still applies.]")
+    if unowned_reply:
+        text += ("\n\n[Mailroom routing context: this is an unowned reply. First run `agent-mail recover %d` "
+                 "for a bounded read-only search of this machine, then the configured recovery hosts. It saves the "
+                 "result and notifies %s. "
+                 "Do not repeat that notification. Transcript matches are leads, not routing authority. "
+                 "Do not restart Mac sessions or apply project changes. Record the unresolved handoff "
+                 "in STATE.md; a successful orchestrator turn does not count as delivery.]" % (inbound_id, owner))
+    if dry_run:
+        log("would run orchestrator for #%d (%s) from %s %r" % (inbound_id, tier, from_addr, subject))
+        st.update_inbound(inbound_id, action="dry-run", detail="would run the orchestrator")
+        return
+    if cfg.get("orchestrator_mode", "exec") == "session":
+        rc, out = deliver.deliver_target(cfg["orchestrator"], text, resume=False, dangerous=cfg["resume_dangerous"])
+        ok, detail = rc == 0, out
+    else:
+        st.update_inbound(inbound_id, action="orchestrating", match_rule="orchestrator", detail="run started")
+        gmail.modify(svc, gid, remove=["UNREAD"])
+        info = orchestrate.run_event(text, "mail", cfg)
+        ok = info["ok"]
+        detail = "orchestrator run: $%s, %s turns, %ss%s" % (info["cost"], info["turns"], info["duration_s"],
+                                                           "" if ok else "; ERROR " + info["error"][:300])
+    current = st.inbound(inbound_id)
+    if current["match_rule"] == "manual" and current["action"] in ("delivered", "queued"):
+        log("explicit handoff of #%d retained" % inbound_id)
+    elif unowned_reply:
+        # Enforce retention even if the model omits recovery or says it has finished.
+        recovery.recover(st, cfg, current)
+        st.update_inbound(inbound_id, action="held")
+        gmail.modify(svc, gid, add=[gmail.ensure_label(svc, labels["held"])],
+                     remove=[gmail.ensure_label(svc, labels["delivered"])])
+        recovery.notify(svc, st, cfg, st.inbound(inbound_id))
+        log("held unowned reply #%d after recovery; orchestrator ok=%s" % (inbound_id, ok))
+    elif current["recovery_json"] and current["action"] == "held":
+        recovery.notify(svc, st, cfg, current)
+    elif ok:
+        st.update_inbound(inbound_id, action="delivered", match_rule="orchestrator", detail=detail)
+        gmail.modify(svc, gid, add=[gmail.ensure_label(svc, labels["delivered"])], remove=["UNREAD"])
+        log("orchestrated #%d (%s) from %s %r: %s" % (inbound_id, tier, from_addr, subject, detail))
+    else:
+        hold(inbound_id, "orchestrator failed: " + detail,
+             alert=("orchestrator-fail", "run", "orchestrator run failed on mail #%d" % inbound_id,
+                    "The orchestrator couldn't finish handling your email. Nothing has been lost: the email is "
+                    "saved in Gmail and in the mailroom. It may have done part of the work before stopping.\n\n"
+                    "Reply here if you need help continuing. Delivery stays on hold until someone checks what "
+                    "was done and fixes the problem; you don't need to resend your email.\n\n"
+                    "From: %s\nSubject: %s\nFor diagnosis: %s\nSaved mail: agent-mail show %d\n"
+                    "After checking the outcome: agent-mail rerun %d." % (from_addr, subject, detail, inbound_id, inbound_id)))
+
+
+def poll(svc, st, cfg, dry_run):
+    start = st.get_meta("history_id")
+    if not start:
+        start = str(gmail.profile(svc)["historyId"])
+        st.set_meta("history_id", start)
+        log("baseline history_id %s; older mail is ignored" % start)
+    try:
+        ids, newest = gmail.history_since(svc, start)
+    except gmail.HistoryGone:
+        log("history id %s is gone; falling back to a 2-day search" % start)
+        ids = gmail.list_recent(svc)
+        newest = str(gmail.profile(svc)["historyId"])
+    for gid in ids:
+        if STOP:
+            # Keep the old cursor: the next poll skips saved messages and picks up
+            # the remainder. Advancing it here would silently drop that remainder.
+            return 0
+        try:
+            process(svc, st, cfg, gid, dry_run)
+        except Exception as e:  # one bad message must not stall the queue
+            log("error  %s: %s: %s" % (gid, type(e).__name__, e))
+            if not st.seen(gid):
+                st.record_inbound(gmail_id=gid, action="error", detail="%s: %s" % (type(e).__name__, e))
+    st.set_meta("history_id", newest)
+    st.set_meta("last_poll", int(time.time()))
+    if not dry_run and not STOP:
+        watchdog(svc, st, cfg)
+    return len(ids)
+
+
+def watchdog(svc, st, cfg):
+    """No model here either. Two detectors for 'an agent is stuck and cannot say so'."""
+    now = time.time()
+    # 1. quota notifications written to the status log by the Notification hook
+    last = float(st.get_meta("watchdog_quota_ts", now - 3600))
+    for e in statuslog.read(since=last, event="quota"):
+        who = e.get("name") or e.get("session_id", "")[:8]
+        if alerts.send_alert(svc, st, cfg, "quota", who, "usage limit hit by %s" % who,
+                             "%s reported %s at %s in %s." % (who, e.get("text", "quota event"),
+                                                             time.strftime("%H:%M", time.localtime(e.get("ts", now))), e.get("cwd", ""))):
+            log("alert  quota event from %s" % who)
+    st.set_meta("watchdog_quota_ts", now)
+    # A transient alert failure must not strand a retained reply without a notice.
+    for row in st.con.execute("select * from inbound where action='held' and recovery_json is not null "
+                              "and notified_at is null order by id limit 10").fetchall():
+        try:
+            recovery.notify(svc, st, cfg, row)
+        except Exception as e:
+            log("reply #%s notification failed: %s" % (row["id"], e))
+    # (the orchestrator now runs as a synchronous `claude -p` per event, so its outcome is known
+    #  immediately; see process())
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-mailroom", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--baseline", action="store_true", help="reset the history cursor to now")
+    a = ap.parse_args(argv)
+
+    cfg = config.load()
+    try:
+        config.require_account(cfg)
+    except config.ConfigError as e:
+        print("agent-mailroom: %s" % e, file=sys.stderr)
+        return 2
+    if not cfg["allowlist"]:
+        print("agent-mailroom: warning: config `allowlist` is empty, so every inbound mail is held. "
+              "Add the owner's address to %s." % config.CONFIG_PATH, file=sys.stderr)
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(config.LOCK_PATH, "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("agent-mailroom: another instance holds %s" % config.LOCK_PATH, file=sys.stderr)
+        return 1
+
+    st = Store()
+    try:
+        svc = gmail.service()
+    except RuntimeError as e:   # no token yet: say what to run instead of a traceback
+        print("agent-mailroom: %s" % e, file=sys.stderr)
+        return 2
+    if a.baseline:
+        hid = str(gmail.profile(svc)["historyId"])
+        st.set_meta("history_id", hid)
+        log("history cursor reset to %s" % hid)
+    for name in cfg["labels"].values():
+        gmail.ensure_label(svc, name)
+    log("mailroom up: %s, allowlist %s, poll %ss%s" % (
+        cfg["account"], ", ".join(cfg["allowlist"]), cfg["poll_seconds"], " (dry run)" if a.dry_run else ""))
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    backoff = 0
+    while not STOP:
+        try:
+            n = poll(svc, st, cfg, a.dry_run)
+            backoff = 0
+            if a.once:
+                log("once: %d new message(s)" % n)
+                break
+        except Exception as e:
+            backoff = min(300, (backoff or 15) * 2)
+            log("poll error %s: %s; retrying in %ss" % (type(e).__name__, e, backoff))
+            try:
+                svc = gmail.service()
+            except Exception as e2:
+                log("re-auth failed: %s" % e2)
+            if a.once:
+                return 1
+        wait = backoff or cfg["poll_seconds"]
+        for _ in range(int(wait)):
+            if STOP:
+                break
+            time.sleep(1)
+    log("mailroom down")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

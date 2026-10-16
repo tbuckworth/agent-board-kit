@@ -1,0 +1,11 @@
+{
+  "crossSessionInbound": "accept",
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-status hook --cli claude", "timeout": 20, "async": true}]}],
+    "Stop":         [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-status hook --cli claude", "timeout": 20, "async": true}]}],
+    "StopFailure":  [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-status hook --cli claude", "timeout": 20, "async": true}]}],
+    "SessionEnd":   [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-status hook --cli claude", "timeout": 20}]}],
+    "Notification": [{"matcher": "quota_auto_resume_fired|quota_auto_resume_stale|quota_auto_resume_disabled",
+                      "hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-status hook --cli claude", "timeout": 20, "async": true}]}]
+  }
+}

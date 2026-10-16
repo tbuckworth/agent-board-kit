@@ -1,0 +1,114 @@
+/* Design tokens — "Midnight Iris" color scheme */
+:root {
+  /* Colors */
+  --color-primary: #5C5CE0;
+  --color-primary-hover: #4A4ACC;
+  --color-primary-light: rgba(92, 92, 224, 0.12);
+  --color-accent: #E8735A;
+  --color-accent-hover: #D4624A;
+  --color-accent-light: rgba(232, 115, 90, 0.12);
+  --color-bg: #FAFAF8;
+  --color-surface: #FFFFFF;
+  --color-surface-hover: #F5F5F3;
+  --color-surface-active: #EDEDEB;
+  --color-text: #1A1A2E;
+  --color-text-secondary: #6B6B80;
+  --color-text-tertiary: #9E9EB0;
+  --color-border: #E2E2E8;
+  --color-border-light: #F0F0F4;
+  --color-claude: #D4A574;
+  --color-claude-bg: rgba(212, 165, 116, 0.1);
+  --color-priority-high: #D94652;
+  --color-priority-med: #E8A840;
+  --color-priority-low: #4CAF82;
+  --color-success: #4CAF82;
+  --color-error: #D94652;
+  --color-warning: #E8A840;
+  --color-follow-up: #A86A00;
+  --color-overlay: rgba(26, 26, 46, 0.5);
+
+  /* Typography */
+  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.8125rem;
+  --font-size-base: 0.875rem;
+  --font-size-md: 1rem;
+  --font-size-lg: 1.125rem;
+  --font-size-xl: 1.5rem;
+  --font-size-2xl: 2rem;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --line-height-tight: 1.2;
+  --line-height-base: 1.5;
+  --line-height-relaxed: 1.75;
+
+  /* Spacing */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.16);
+
+  /* Layout */
+  --sidebar-width: 260px;
+  --topbar-height: 56px;
+  --slide-over-width: 480px;
+  --max-content-width: 800px;
+  --bottom-nav-height: 56px;
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-base: 200ms ease;
+  --transition-slow: 300ms ease;
+
+  color-scheme: light;
+}
+
+/* Dark mode */
+[data-theme="dark"] {
+  --color-primary: #8B8BF0;
+  --color-primary-hover: #9D9DF5;
+  --color-primary-light: rgba(139, 139, 240, 0.15);
+  --color-accent: #F09580;
+  --color-accent-hover: #F5A894;
+  --color-accent-light: rgba(240, 149, 128, 0.15);
+  --color-bg: #141420;
+  --color-surface: #1E1E30;
+  --color-surface-hover: #282840;
+  --color-surface-active: #32324A;
+  --color-text: #EEEEF2;
+  --color-text-secondary: #A0A0B8;
+  --color-text-tertiary: #6E6E88;
+  --color-border: #2E2E45;
+  --color-border-light: #232338;
+  --color-claude: #C4956A;
+  --color-claude-bg: rgba(196, 149, 106, 0.12);
+  --color-overlay: rgba(10, 10, 20, 0.7);
+  --color-follow-up: #F2B85A;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.4);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.5);
+
+  color-scheme: dark;
+}

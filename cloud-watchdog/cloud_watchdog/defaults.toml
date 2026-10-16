@@ -1,0 +1,153 @@
+# cloud-watchdog defaults. Override any key in ~/.config/cloud-watchdog/config.toml
+# (same structure; tables are merged key by key). This file lists NO accounts: a provider with no
+# configured account is simply not watched. See the example at the end of this file.
+
+owner_name = ""                # empty: the mailroom's owner_name, else "the owner"
+owner_email = ""               # empty: the mailroom's owner_email, else its allowlist[0]
+repos_root = ""                # empty: the mailroom's repos_root, else ~/code (owner search looks for commits here)
+slow_interval_min = 60         # billing, Slurm, spend APIs (the fast pass runs every timer tick)
+digest_hour_local = 8          # the daily digest goes out on the first check at/after this hour
+timezone = ""                  # IANA name such as "America/New_York"; empty = the machine's local time zone
+shadow_days = 0                # `cloud-watch install`: days of shadow before going live by itself; 0 = never
+max_emails_per_day = 6         # beyond this, emails fold into the next digest
+# modal_python = "/path/to/python"   # the Python the `modal` CLI runs on; found from its shebang if unset
+
+[identity]
+# Who "you" are on shared accounts. Leave a list empty and ownership on that provider stays "unknown":
+# everything billing is treated as possibly yours, and the owner search (registration, transcripts)
+# decides which agent to ask.
+#
+# Modal user names (as `modal app history` shows them). A Modal app whose latest deployer (or, for a
+# `modal run` app, whose creator) is one of these is yours; any other named user is someone else's
+# ("foreign": ignored, except a crash loop, which is emailed to you). The user behind the watchdog's own
+# token for a workspace counts as you too. ONLY apps deployed by a user listed here can ever be
+# auto-stopped; empty = the watchdog never stops anything on its own.
+owner_modal_users = []
+# Lambda SSH key names you launch with. A box with none of these keys is someone else's; boxes with one
+# of them also get the idle-GPU check over SSH.
+owner_lambda_ssh_keys = []
+# Modal apps that hold several people's work but bill as one app (the spend split lists them as "shared").
+modal_shared_apps = []
+
+[secrets]
+# Where each account's keys come from, unless the account sets its own `secrets = "..."`:
+#   "env-file"  <env_dir>/<provider>-<account>.env (KEY=value lines, mode 600). Default.
+#   "bws"       Bitwarden Secrets Manager: `bws run` with the token and project id files below.
+#   "environ"   the watchdog's own environment (e.g. a systemd drop-in with EnvironmentFile=).
+#   "none"      no keys (Slurm over SSH, or a Modal account that uses a ~/.modal.toml profile).
+backend = "env-file"
+env_dir = "~/.config/cloud-watchdog/accounts"
+bws_token_file = "~/.config/bws/token"
+bws_project_file = "~/.config/bws/project-id"
+
+[accounts]
+# None by default. Add yours in ~/.config/cloud-watchdog/config.toml (example at the end of this file).
+
+# ---------------------------------------------------------------- rules
+# Rules are independent: any one firing is enough. Inside a rule every condition must hold.
+
+[rules.crash_loop]
+window_min = 120           # a container failing every ~30 min still shows several failures in 2 h
+min_failures = 3           # distinct containers that logged a failure in the window
+min_failure_ratio = 0.5    # failed containers / containers seen in the window
+consecutive_checks = 2
+owner_wait_min = 15
+
+[rules.high_burn]
+usd_per_hour = 25
+
+[rules.long_running]
+lambda_hours = 24
+hf_hours = 24              # also used for DeepInfra deployments
+slurm_hours = 12
+modal_active_hours = 12    # at least one container running non-stop
+
+[rules.cost]
+ask_owner_usd = 150        # no ack: message the owning agent
+email_owner_usd = 500      # no ack: email you, then again at each doubling
+acked_floor_usd = 500      # acked: email you at max(floor, multiple * X), then each doubling
+acked_multiple = 2
+
+[rules.idle_gpu]
+consecutive_checks = 3
+gpu_util_max_pct = 5
+work_pattern = 'main\.py|python.*train|python.*eval|vllm|torchrun|accelerate'
+
+[rules.account_spend]      # "provider:account" = USD per rolling 24 h -> a digest line. None by default.
+# "modal:main" = 200
+# "openrouter:main" = 50
+
+[rules.storage]
+modal_volumes_usd_month = 100   # weekly digest line (Mondays)
+
+[rules.blind]
+consecutive_failures = 3
+
+# ---------------------------------------------------------------- ladder
+[ladder]
+owner_wait_min = 30
+max_pings = 3
+reemail_hours = 24
+
+[investigator]
+# A capped `claude -p` that looks for the owning session when the deterministic search finds none.
+# Runs only in live mode.
+enabled = true
+model = "sonnet"
+max_budget_usd = 1.0
+daily_cap_usd = 5.0
+timeout_s = 600
+
+[transcripts]
+roots = ["~/.claude/projects", "~/.codex/sessions"]
+lookback_days = 1          # search files modified since launch minus this
+# Transcript dirs that only talk *about* resources (never launch them).
+exclude = ["-orchestrator", "-cloud-watchdog", "cloud-watchdog-investigator"]
+launch_verbs = ['modal deploy', 'modal run', 'modal serve', 'instance-operations/launch',
+                'sbatch', 'Submitted batch job']
+
+# ---------------------------------------------------------------- example config.toml
+# Copy what you need into ~/.config/cloud-watchdog/config.toml. Account names are
+# "provider:anything"; the part after the colon is yours to choose.
+#
+# [identity]
+# owner_modal_users = ["alex-1234"]          # your Modal user name(s); enables crash-loop auto-stop
+# owner_lambda_ssh_keys = ["alex-laptop"]
+#
+# [accounts."modal:main"]
+# provider = "modal"                         # keys: MODAL_TOKEN_ID, MODAL_TOKEN_SECRET
+# auto_stop = true                           # may stop crash-looping apps deployed by owner_modal_users
+#
+# [accounts."modal:team"]
+# provider = "modal"
+# profile = "team-workspace"                 # a ~/.modal.toml profile instead of keys
+# secrets = "none"
+#
+# [accounts."lambda:main"]
+# provider = "lambda"                        # key: LAMBDA_API_KEY
+#
+# [accounts."slurm:cluster"]
+# provider = "slurm"
+# secrets = "none"                           # uses your SSH config
+# ssh_host = "cluster-login"                 # ssh alias of a node where squeue/scancel work
+# paid_partitions = ["gpu-paid-*"]           # glob patterns; jobs on other partitions are ignored
+# slow_only = true
+# [accounts."slurm:cluster".partition_rates]  # USD per hour for a job on that partition (glob patterns ok)
+# "gpu-paid-a100" = 1.50
+#
+# [accounts."hf:main"]
+# provider = "hf"                            # key: HF_TOKEN
+#
+# [accounts."deepinfra:main"]
+# provider = "deepinfra"                     # key: DEEPINFRA_API_KEY
+#
+# [accounts."openrouter:main"]
+# provider = "openrouter"                    # key: OPENROUTER_API_KEY
+# slow_only = true
+#
+# With secrets = "bws" (or [secrets] backend = "bws"), map each key the provider needs to the
+# name of a secret in your Bitwarden project; the child gets only these:
+# [accounts."lambda:work"]
+# provider = "lambda"
+# secrets = "bws"
+# env = { LAMBDA_API_KEY = "WORK_LAMBDA_API_KEY" }

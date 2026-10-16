@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""agent-orchestrate: run the orchestrator once, on one event, with a fresh context.
+
+    agent-orchestrate "event text"            # or the text on stdin
+    agent-orchestrate --source peer < msg.txt
+    agent-orchestrate --runs [--limit N]      # recent runs: cost, turns, outcome
+    agent-orchestrate --show-command
+
+The mailroom calls this for mail no session claimed; agent-send calls it when a message is
+addressed to the orchestrator and no live session has that name. It runs
+`claude -p --model <orchestrator_model>` in the orchestrator directory and prints the result.
+"""
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import config, orchestrate  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-orchestrate", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("text", nargs="*")
+    ap.add_argument("--source", default="manual", help="label for the run log (mail, peer, manual)")
+    ap.add_argument("--runs", action="store_true", help="list recent runs")
+    ap.add_argument("--limit", type=int, default=20)
+    ap.add_argument("--show-command", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    cfg = config.load()
+
+    if a.show_command:
+        print(" ".join(orchestrate.command(cfg)), "  (cwd %s, prompt on stdin)" % cfg.get("orchestrator_dir"))
+        return 0
+    if a.runs:
+        runs = orchestrate.recent_runs(a.limit)
+        for r in runs:
+            ts = time.strftime("%m-%d %H:%M", time.localtime(r.get("ts", 0)))
+            cost = ("$%.3f" % r["cost"]) if isinstance(r.get("cost"), (int, float)) else "-"
+            print("%s %-6s %-4s %7s %3s turns %6ss  %s" % (
+                ts, r.get("source", ""), "ok" if r.get("ok") else "FAIL", cost, r.get("turns") or "-",
+                r.get("duration_s") or "-", (r.get("error") or r.get("result") or "").replace("\n", " ")[:90]))
+        total = sum(r["cost"] for r in orchestrate.recent_runs(100000) if isinstance(r.get("cost"), (int, float)))
+        print("total logged cost: $%.2f over %d runs" % (total, len(orchestrate.recent_runs(100000))))
+        return 0
+
+    text = " ".join(a.text).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+    if not text:
+        print("agent-orchestrate: no event text", file=sys.stderr)
+        return 1
+    info = orchestrate.run_event(text, a.source, cfg)
+    if a.json:
+        print(json.dumps(info, indent=2))
+    else:
+        print("%s · $%s · %s turns · %ss" % ("ok" if info["ok"] else "FAILED", info["cost"], info["turns"], info["duration_s"]))
+        print(info["result"] if info["ok"] else info["error"])
+    return 0 if info["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""agent-switch: move a live agent to another CLI, Claude login, model or effort (the agent board's right-click).
+
+    agent-switch NAME --options [--json]          # what it runs now, whether it is busy, and every choice
+    agent-switch NAME --to claude:personal|claude:work|codex [--model M] [--effort E] [--force] [--dry-run] [--json]
+    agent-switch NAME --model M [--effort E] [--force] [--json]       # same CLI and login, new model or effort
+
+Claude Code to Claude Code (another login, model or effort) and Codex to Codex (model or effort) continue the same
+conversation in the same tmux pane. Claude Code <-> Codex is a handoff: the new CLI starts in the same pane and
+folder, reads a handoff record (original brief + condensed conversation), and the agent's mail routing moves to the
+new session. An idle agent switches at once; a busy one needs --force, which cuts its turn off and tells it so.
+Exit codes: 0 switched (or nothing to do), 3 busy and --force not given, 2 refused (unknown agent, target or model,
+or not agent-spawn's tmux layout), 1 the switch was attempted and failed. Desktop only.
+Mechanics and limits: agentmail/switch.py.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import signal
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import config, statuslog, switch  # noqa: E402
+
+BIN = Path(__file__).resolve().parent
+FAILOVER_STATE = config.STATE_DIR / "failover.json"
+
+
+def spawn_module():
+    loader = importlib.machinery.SourceFileLoader("agent_spawn", str(BIN / "agent-spawn"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    sp = importlib.util.module_from_spec(spec)
+    loader.exec_module(sp)
+    return sp
+
+
+def helpers():
+    sp = spawn_module()
+
+    def trust(cwd, config_dir):
+        return sp.ensure_trust(cwd, sp.claude_json_for(config_dir))
+
+    def preamble(st, cli):
+        return sp.preamble(st["name"] or st["id"][:8], st["cwd"], statuslog.git_facts(st["cwd"])["branch"], cli)
+
+    def rehome(old_cli, old_sid, new_cli, new_sid, name, cwd):
+        from agentmail.store import Store
+        return Store().rehome(old_cli, old_sid, new_cli, new_sid, name, cwd, config.load().get("host_id") or "desktop")
+    return trust, preamble, rehome
+
+
+def forget_failover(session_id):
+    """A switch by hand is the owner's choice: agent-failover must not move the agent back to an earlier login."""
+    try:
+        st = json.loads(FAILOVER_STATE.read_text())
+    except (OSError, ValueError):
+        return
+    if st.get("sessions", {}).pop(session_id, None) is not None:
+        FAILOVER_STATE.write_text(json.dumps(st, indent=1))
+
+
+def show_options(opts):
+    a = opts["agent"]
+    print("%s: %s%s, model %s, effort %s, %s%s" % (
+        a["name"], a["cli"], (" (%s login)" % a["account"]) if a["cli"] == "claude" else "", a["model"], a["effort"],
+        "BUSY (switching will interrupt it)" if a["busy"] else "idle",
+        "" if a["movable"] else "; cannot switch: " + a["why_not"]))
+    for t in opts["targets"]:
+        print("  %-18s %-9s %-11s %s" % (t["target"], "current" if t["current"] else t["kind"], t["status"], t["usage"]))
+    for cli, models in opts["models"].items():
+        print("  %s models: %s" % (cli, ", ".join("%s [%s]" % (m["value"], "/".join(m["efforts"])) for m in models)))
+
+
+def main(argv=None):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # `agent-switch X --options | head` ends quietly
+    ap = argparse.ArgumentParser(prog="agent-switch", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("name", help="agent name or session id")
+    ap.add_argument("--options", action="store_true", help="show the agent and every choice; change nothing")
+    ap.add_argument("--to", help="claude:<login> or codex (default: stay on the current CLI and login)")
+    ap.add_argument("--model")
+    ap.add_argument("--effort")
+    ap.add_argument("--force", action="store_true", help="switch even if the agent is mid-turn (interrupts it)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    cfg = config.load()
+    try:
+        if a.options:
+            opts = switch.options(a.name, cfg)
+            print(json.dumps(opts, indent=1)) if a.json else show_options(opts)
+            return 0
+        if not (a.to or a.model or a.effort):
+            ap.error("give --to, --model or --effort (or --options)")
+        trust, preamble, rehome = helpers()
+        res = switch.switch(a.name, cfg, to=a.to, model=a.model, effort=a.effort, force=a.force, dry_run=a.dry_run,
+                            trust=trust, preamble=preamble, rehome=rehome)
+    except switch.SwitchError as e:
+        if a.json:
+            print(json.dumps({"ok": False, "refused": True, "detail": str(e)}))
+        else:
+            print("agent-switch: %s" % e, file=sys.stderr)
+        return 2
+    if res["ok"] and not a.dry_run and not res["detail"].startswith("already"):
+        sess = switch.find(a.name, cfg) if not res.get("new_id") else None
+        sid = res.get("new_id") or (sess or {}).get("id", "")
+        forget_failover(sid)
+        statuslog.append({"cli": "codex" if "Codex" in res["to"] else "claude", "session_id": sid, "name": a.name,
+                          "event": "switch", "text": "%s -> %s: %s" % (res["from"], res["to"], res["detail"][:200])})
+    if a.json:
+        print(json.dumps(res, indent=1))
+    else:
+        print(res["detail"])
+    if res["needs_force"]:
+        return 3
+    return 0 if res["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

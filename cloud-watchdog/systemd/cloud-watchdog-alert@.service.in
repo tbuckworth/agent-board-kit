@@ -1,0 +1,7 @@
+[Unit]
+Description=cloud-watchdog failure alert for %i
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={{PYTHON}} {{KIT_DIR}}/cloud-watchdog/bin/cloud-watch alert-failure %i

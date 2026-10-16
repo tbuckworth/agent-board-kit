@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""agent-spawn: start a Claude Code or Codex agent in a tmux session, in a fresh worktree.
+
+    agent-spawn --repo NAME_OR_PATH --branch BRANCH [--base origin/main] BRIEF-OPTS
+    agent-spawn --new-repo NAME [--org OWNER] [--public] BRIEF-OPTS
+    agent-spawn --dir PATH BRIEF-OPTS                       # existing directory, no worktree
+    BRIEF-OPTS: --brief FILE | --brief-text TEXT | brief on stdin
+    Common: [--cli claude|codex] [--account NAME|codex|auto] [--model M]
+            [--effort low|medium|high|xhigh|max] [--name NAME] [--reuse]
+            [--memory-max SIZE] [--swap-max SIZE] [--dry-run] [--json]
+
+Defaults: Claude runs claude-opus-5-5 and Codex runs gpt-6.1-sol, both at effort xhigh.
+--model/--effort override them per task; config keys spawn_<cli>_model and spawn_<cli>_effort
+(~/.config/agent-mail/config.json) change them per machine.
+
+Which CLI and account: --account NAME runs Claude on that login (config usage.claude_accounts; a second
+login is its own CLAUDE_CONFIG_DIR, set in the agent's tmux session), --account codex runs Codex.
+--cli alone keeps the old behaviour (Claude means the default login). --account auto, or no --cli,
+--account or --model when config spawn_route is "auto", picks by remaining plan usage (agent-usage): the
+first account in usage.order with headroom, skipping accounts whose owner rules exclude the repo.
+
+Default rule: existing repo -> fetch, new branch off origin/main, worktree at
+<parent>/<repo>-<branch> (next to the main checkout), tmux session named after the branch,
+agent launched inside it with the brief as its first prompt. New project -> private GitHub
+repo under config github_owner (or --org), cloned into config repos_root (default ~/code),
+trusted for both CLIs, agent launched on main. A bare --repo NAME is looked up in repos_root;
+the AGENT_SPAWN_ROOT environment variable overrides repos_root.
+
+Each agent runs in its own systemd scope, agent-NAME.scope, capped by config agent_memory_max and
+agent_swap_max (default 32G and 2G; --memory-max/--swap-max per launch, "off" for none). If the cap
+cannot be applied the agent still starts, uncapped, and the output says why. A tmux server found
+inside a service's cgroup (the mailroom's) is moved to tmux-server.scope, so restarting that service
+cannot kill every agent's terminal.
+
+Claude gets `--name NAME --dangerously-skip-permissions`; Codex gets
+`-s danger-full-access -a never`, is renamed with /rename once its prompt is up, and the
+brief is queued with `codex queue`. Neither CLI is on PATH in cron or non-login shells;
+this script finds them itself.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import config, memcap, registry, statuslog, usage  # noqa: E402
+
+HOME = Path.home()
+BRIEF_DIR = HOME / ".local" / "state" / "agent-spawn"
+CODEX_CONFIG = registry.CODEX_HOME / "config.toml"
+CLAUDE_JSON = HOME / ".claude.json"
+
+
+def die(msg, code=1):
+    print("agent-spawn: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, cwd=None, check=True, timeout=120):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode != 0:
+        die("%s failed: %s" % (" ".join(map(str, cmd)), (r.stderr or r.stdout).strip()))
+    return r
+
+
+def slug(s):
+    s = re.sub(r"[^A-Za-z0-9._/-]+", "-", s.strip()).strip("-")
+    return s or "work"
+
+
+def tmux_name(s):
+    return re.sub(r"[.:\s]+", "-", s).strip("-")[:60]
+
+
+def pick_base(repo, explicit):
+    if explicit:
+        return explicit
+    for cand in ("origin/main", "origin/master", "main", "master"):
+        if run(["git", "rev-parse", "--verify", "--quiet", cand], cwd=repo, check=False).returncode == 0:
+            return cand
+    return "HEAD"
+
+
+def branch_exists(repo, branch):
+    return run(["git", "show-ref", "--verify", "--quiet", "refs/heads/" + branch], cwd=repo, check=False).returncode == 0
+
+
+def claude_json_for(config_dir):
+    """Each login keeps its own .claude.json (project trust included): ~/.claude.json, or inside its config dir."""
+    return Path(config_dir) / ".claude.json" if config_dir else CLAUDE_JSON
+
+
+def trust_claude(path, claude_json=None):
+    """New git repos under a trusted parent still prompt; write the trust the docs describe."""
+    claude_json = claude_json or CLAUDE_JSON
+    try:
+        d = json.loads(claude_json.read_text()) if claude_json.exists() else {}
+        proj = d.setdefault("projects", {})
+        entry = proj.setdefault(path, {})
+        if entry.get("hasTrustDialogAccepted"):
+            return False
+        entry["hasTrustDialogAccepted"] = True
+        tmp = claude_json.with_suffix(".json.agent-spawn.tmp")
+        tmp.write_text(json.dumps(d, indent=2))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, claude_json)
+        return True
+    except Exception as e:
+        print("agent-spawn: warning: could not pre-trust %s for Claude: %s" % (path, e), file=sys.stderr)
+        return False
+
+
+def trust_codex(path):
+    try:
+        text = CODEX_CONFIG.read_text() if CODEX_CONFIG.exists() else ""
+        if ('[projects."%s"]' % path) in text:
+            return False
+        with open(CODEX_CONFIG, "a") as fh:
+            if text and not text.endswith("\n"):
+                fh.write("\n")
+            fh.write('\n[projects."%s"]\ntrust_level = "trusted"\n' % path)
+        return True
+    except Exception as e:
+        print("agent-spawn: warning: could not pre-trust %s for Codex: %s" % (path, e), file=sys.stderr)
+        return False
+
+
+def repo_root(path):
+    """The main checkout of the repo `path` is in (worktrees resolve to it), or `path` itself."""
+    root = run(["git", "rev-parse", "--git-common-dir"], cwd=path, check=False).stdout.strip()
+    if root:
+        return str(Path(os.path.join(path, root)).resolve().parent)
+    return str(Path(path).resolve())
+
+
+def ensure_trust(path, claude_json=None):
+    """Trust the git repo root of `path` (or `path` itself) for both CLIs, only if not already.
+    Worktrees inherit trust from the main checkout, so this is a no-op for them.
+    claude_json: the Claude login's own .claude.json (default ~/.claude.json)."""
+    claude_json = claude_json or CLAUDE_JSON
+    main_root = repo_root(path)
+    try:
+        d = json.loads(claude_json.read_text()) if claude_json.exists() else {}
+        claude_ok = d.get("projects", {}).get(main_root, {}).get("hasTrustDialogAccepted", False)
+    except Exception:
+        claude_ok = False
+    out = {}
+    if not claude_ok and (claude_json == CLAUDE_JSON or claude_json.exists()):
+        out["claude"] = trust_claude(main_root, claude_json)
+    out["codex"] = trust_codex(main_root)
+    return out
+
+
+def tmux(*args, check=True):
+    return run(["tmux"] + list(args), check=check)
+
+
+def tmux_has(name):
+    return tmux("has-session", "-t", "=" + name, check=False).returncode == 0
+
+
+def repos_root(cfg=None):
+    """Where repos live: $AGENT_SPAWN_ROOT, else config repos_root (default ~/code)."""
+    if os.environ.get("AGENT_SPAWN_ROOT"):
+        return Path(os.path.expanduser(os.environ["AGENT_SPAWN_ROOT"]))
+    cfg = config.load() if cfg is None else cfg
+    return Path(os.path.expanduser(cfg.get("repos_root") or config.DEFAULTS["repos_root"]))
+
+
+def preamble(name, path, branch, cli, cfg=None):
+    cfg = config.load() if cfg is None else cfg
+    owner = config.owner_name(cfg)
+    email = config.owner_email(cfg) or "OWNER_EMAIL (config owner_email is not set)"
+    return (
+        "You were started by agent-spawn on %s's machine, on their behalf (usually relayed by the orchestrator "
+        "from an email they sent). Session name: %s. Working directory: %s. Branch: %s.\n\n"
+        "Protocol: record milestones, blockers and finished work with `agent-status note \"...\"` (free, no model). "
+        "Email %s only when you are done or blocked and they must act, or when they asked for email updates: "
+        "`agent-mail send --to %s --subject ... --body-file ...`%s. "
+        "Their replies come back into this session automatically. Commit as you go; do not push unless the brief says so. "
+        "If %s asks you to close (in any words), run `agent-close --self --dry-run`. If it reports unlanded work, "
+        "say what is left and ask whether to land it or discard it (then `--force`). Otherwise reply with a "
+        "one-line confirmation and run `agent-close --self` as your very last step: it ends this session and "
+        "removes your worktree.\n\n"
+        "Brief:\n\n" % (owner, name, path, branch or "-", owner, email,
+                          (" (Codex: add `--session %s`)" % name) if cli == "codex" else "", owner)
+    )
+
+
+def cap_pane(name, props):
+    """Move the new session's pane shell (no children yet) into agent-NAME.scope, and the tmux server out of
+    any service's cgroup. Called before the launch line is typed, so the agent starts inside the cap."""
+    pane = tmux("display-message", "-p", "-t", "=%s:" % name, "#{pane_pid} #{pid}", check=False)
+    try:
+        pane_pid, server_pid = (int(x) for x in pane.stdout.split())
+    except (AttributeError, ValueError):
+        return "uncapped: no pane pid from tmux"
+    # The server first, never touching the pane: the pane's own move must be the last one, or a slow move could
+    # land it in the uncapped tmux-server.scope.
+    moved, how = memcap.free_from_service(server_pid, "tmux-server", "tmux server", exclude=memcap.tree(pane_pid))
+    _, msg = memcap.adopt(pane_pid, name, props, "agent %s (agent-spawn)" % name, settle=0)
+    return msg + ("; tmux server " + how if moved else "")
+
+
+def launch_claude(name, path, brief_path, model, effort, props=None, config_dir=None):
+    cl = registry.claude_bin() or die("claude binary not found")
+    cmd = [cl, "--name", name, "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
+    line = " ".join(shlex.quote(c) for c in cmd) + ' "$(cat %s)"' % shlex.quote(str(brief_path))
+    # Another login: the whole tmux session gets its CLAUDE_CONFIG_DIR, so a later `claude --resume` there,
+    # and every agent-mail/agent-send the agent runs, see the same login. The default login must run with it
+    # unset, and a new tmux session inherits the server's environment, which may carry another login's.
+    env = ["-e", "CLAUDE_CONFIG_DIR=" + config_dir] if config_dir else []
+    tmux("new-session", "-d", "-s", name, "-c", path, "-x", "200", "-y", "50", *env)
+    if not config_dir:   # keep it out of this pane's shell and of any window opened in the session later
+        tmux("set-environment", "-t", name, "-r", "CLAUDE_CONFIG_DIR")
+        line = "unset CLAUDE_CONFIG_DIR; " + line
+    out = {"launch": line, "tmux_env": env[1:]}
+    if props is not None:
+        out["memory"] = cap_pane(name, props)
+    tmux("send-keys", "-t", name, "-l", line)
+    time.sleep(0.3)
+    tmux("send-keys", "-t", name, "Enter")
+    return out
+
+
+def wait_for(pred, timeout, step=1.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        v = pred()
+        if v:
+            return v
+        time.sleep(step)
+    return None
+
+
+def launch_codex(name, path, brief_path, model, effort, props=None):
+    cx = registry.codex_bin() or die("codex binary not found")
+    before = registry.codex_live_ids()
+    cmd = [cx, "-s", "danger-full-access", "-a", "never", "-C", path]
+    if model:
+        cmd += ["-m", model]
+    if effort:
+        cmd += ["-c", "model_reasoning_effort=%s" % shlex.quote(effort)]
+    line = " ".join(shlex.quote(c) for c in cmd)
+    tmux("new-session", "-d", "-s", name, "-c", path, "-x", "200", "-y", "50")
+    memory = cap_pane(name, props) if props is not None else None
+    tmux("send-keys", "-t", name, "-l", line)
+    time.sleep(0.3)
+    tmux("send-keys", "-t", name, "Enter")
+    new = wait_for(lambda: (registry.codex_live_ids() - before) or None, timeout=60, step=1.0)
+    if not new:
+        return {"launch": line, "memory": memory,
+                "warning": "codex thread did not appear within 60 s; brief not queued, no /rename"}
+    tid = sorted(new)[0]
+    # wait for the prompt (trust/update dialogs may sit in front of it)
+    def prompt_up():
+        pane = tmux("capture-pane", "-p", "-t", name, check=False).stdout
+        if "Press enter to continue" in pane or "Do you trust" in pane:
+            tmux("send-keys", "-t", name, "Enter", check=False)  # accept trust / skip update
+            return None
+        return "Ask Codex" in pane or "›" in pane
+    wait_for(prompt_up, timeout=45, step=1.5)
+    tmux("send-keys", "-t", name, "-l", "/rename " + name)
+    time.sleep(0.3)
+    tmux("send-keys", "-t", name, "Enter")
+    time.sleep(2)
+    brief = Path(brief_path).read_text()
+    r = run([cx, "queue", "--thread", tid, "--message", brief], check=False, timeout=60)
+    out = (r.stdout + r.stderr).strip()
+    return {"launch": line, "memory": memory, "thread": tid, "queued": "Queued message" in out,
+            "queue_output": out[:200]}
+
+
+def choose_route(a, cfg, owner, read=None):
+    """-> {cli, account, config_dir, routed, why, avoid}. Explicit --account, --cli or --model always win;
+    usage decides only with --account auto, or when config spawn_route is "auto" and none of them was given."""
+    s = usage.settings(cfg)
+    auto = a.account == "auto" or (not a.account and not a.cli and not a.model and cfg.get("spawn_route") == "auto")
+    route = {"routed": False, "why": "", "avoid": []}
+    if a.account and a.account != "auto":
+        try:
+            cli, acct = usage.parse_target(a.account, s)
+        except ValueError as e:
+            die(str(e))
+        if a.cli and a.cli != cli:
+            die("--cli %s contradicts --account %s" % (a.cli, a.account))
+        route.update(cli=cli, account=acct, why="--account " + a.account)
+    elif not auto:
+        cli = a.cli or "claude"
+        route.update(cli=cli, account=usage.default_account(s) if cli == "claude" else None)
+    else:
+        only = a.cli or ("claude" if a.model else None)   # a --model is a Claude model unless --cli says otherwise
+        try:
+            snaps = (read or usage.snapshots)(cfg)
+            models = {"claude": a.model or cfg.get("spawn_claude_model"), "codex": cfg.get("spawn_codex_model")}
+            rec = usage.recommend(snaps, cfg, models=models, owner=owner, only_cli=only)
+        except Exception as e:  # never block a spawn on the usage read
+            rec = {"use": None, "line": "usage read failed: %s" % e}
+        if rec.get("use"):
+            route.update(cli=rec["cli"], account=rec["account"], routed=True, why=rec["line"], avoid=rec["avoid"])
+        else:
+            cli = only or "claude"
+            route.update(cli=cli, account=usage.default_account(s) if cli == "claude" else None,
+                         why="no usage-based choice (%s); default" % rec.get("line"))
+            print("agent-spawn: warning: " + route["why"], file=sys.stderr)
+    acct = usage.account(s, route["account"]) if route["cli"] == "claude" and route["account"] else {}
+    route["config_dir"] = usage.expand(acct.get("config_dir"))
+    if route["config_dir"]:
+        ok, why = usage.account_ready(acct)
+        if not ok:
+            die("Claude account %s is not ready: %s" % (route["account"], why))
+    return route
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-spawn", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    where = ap.add_mutually_exclusive_group(required=True)
+    where.add_argument("--repo", help="existing repo: name under config repos_root, or a path")
+    where.add_argument("--new-repo", help="create a GitHub repo of this name, cloned into config repos_root")
+    where.add_argument("--dir", help="existing directory; no worktree, no branch")
+    ap.add_argument("--branch", help="with --repo: branch to create (required)")
+    ap.add_argument("--base", help="with --repo: start point (default origin/main)")
+    ap.add_argument("--org", help="with --new-repo: GitHub owner (default: config github_owner)")
+    ap.add_argument("--public", action="store_true", help="with --new-repo: public instead of private")
+    ap.add_argument("--reuse", action="store_true", help="use an existing worktree/tmux session instead of failing")
+    ap.add_argument("--cli", choices=["claude", "codex"], help="default claude (or by usage, see --account)")
+    ap.add_argument("--account", help="Claude login from config usage.claude_accounts, codex, or auto (by usage)")
+    ap.add_argument("--model", help="default: config spawn_<cli>_model")
+    ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"],
+                    help="default: config spawn_<cli>_effort")
+    ap.add_argument("--name", help="session and tmux name (default: branch or repo name)")
+    ap.add_argument("--memory-max", help="memory cap for this agent, e.g. 48G or off (default: config agent_memory_max)")
+    ap.add_argument("--swap-max", help="swap cap for this agent (default: config agent_swap_max)")
+    ap.add_argument("--brief", help="file with the brief")
+    ap.add_argument("--brief-text", help="the brief as text")
+    ap.add_argument("--no-preamble", action="store_true", help="send the brief exactly as given")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+
+    brief = a.brief_text or (Path(a.brief).read_text() if a.brief else (sys.stdin.read() if not sys.stdin.isatty() else ""))
+    brief = brief.strip()
+    if not brief:
+        die("no brief: pass --brief FILE, --brief-text TEXT, or pipe it on stdin")
+
+    cfg = config.load()
+    root = repos_root(cfg)
+    plan = {}
+    try:
+        props = memcap.limits(cfg, a.memory_max, a.swap_max)
+    except ValueError as e:
+        die(str(e))
+    plan["memory_cap"] = memcap.describe(props)
+    if a.repo:
+        if not a.branch:
+            die("--repo needs --branch")
+        repo = Path(a.repo).expanduser()
+        if not repo.is_absolute() and not repo.exists():
+            repo = root / a.repo
+        repo = repo.resolve()
+        if not (repo / ".git").exists():
+            die("%s is not a git repository" % repo)
+        branch = slug(a.branch)
+        path = repo.parent / ("%s-%s" % (repo.name, branch.replace("/", "-")))
+        name = tmux_name(a.name or branch.replace("/", "-"))
+        plan.update(mode="worktree", repo=str(repo), branch=branch, path=str(path), name=name)
+    elif a.new_repo:
+        rname = slug(a.new_repo).replace("/", "-")
+        a.org = a.org or cfg.get("github_owner")
+        if not a.org:
+            die("--new-repo needs a GitHub owner: pass --org OWNER or set github_owner in %s" % config.CONFIG_PATH)
+        path = root / rname
+        name = tmux_name(a.name or rname)
+        plan.update(mode="new-repo", repo=str(path), branch="main", path=str(path), name=name,
+                    github="%s/%s" % (a.org, rname), visibility="public" if a.public else "private")
+    else:
+        path = Path(a.dir).expanduser().resolve()
+        if not path.is_dir():
+            die("%s is not a directory" % path)
+        name = tmux_name(a.name or path.name)
+        plan.update(mode="dir", path=str(path), name=name, branch=statuslog.git_facts(str(path))["branch"])
+
+    owner = a.org if a.new_repo else usage.repo_owner(plan["repo"] if a.repo else plan["path"])
+    route = choose_route(a, cfg, owner)
+    cli = route["cli"]
+    plan.update(cli=cli, account=route["account"], config_dir=route["config_dir"],
+                model=a.model or cfg.get("spawn_%s_model" % cli), effort=a.effort or cfg.get("spawn_%s_effort" % cli))
+    if route["routed"] or route["why"]:
+        plan["route"] = route["why"]
+
+    if a.dry_run:
+        plan["brief_chars"] = len(brief)
+        print(json.dumps(plan, indent=2))
+        return 0
+
+    if tmux_has(plan["name"]) and not a.reuse:
+        die("tmux session %r already exists (use --reuse or --name)" % plan["name"], 3)
+
+    # --- make the place
+    if plan["mode"] == "worktree":
+        if path.exists():
+            if not a.reuse:
+                die("%s already exists (use --reuse)" % path, 3)
+        else:
+            fetch = run(["git", "fetch", "origin", "--quiet"], cwd=str(repo), check=False, timeout=180)
+            if fetch.returncode != 0:
+                print("agent-spawn: warning: git fetch failed (%s); branching from local refs" % fetch.stderr.strip()[:120], file=sys.stderr)
+            base = pick_base(str(repo), a.base)
+            run(["git", "worktree", "prune"], cwd=str(repo), check=False)   # forget worktrees deleted by hand
+            if branch_exists(str(repo), branch):
+                run(["git", "worktree", "add", str(path), branch], cwd=str(repo))
+            else:
+                run(["git", "worktree", "add", "-b", branch, str(path), base], cwd=str(repo))
+            plan["base"] = base
+    elif plan["mode"] == "new-repo":
+        if path.exists():
+            if not a.reuse:
+                die("%s already exists (use --reuse)" % path, 3)
+        else:
+            gh = registry.find_bin("gh", ["/usr/bin/gh", "/opt/homebrew/bin/gh"]) or die("gh not found")
+            vis = "--public" if a.public else "--private"
+            run([gh, "repo", "create", plan["github"], vis, "--clone", "--add-readme",
+                 "--description", "Created by agent-spawn"], cwd=str(root), timeout=180)
+    plan["trusted"] = ensure_trust(plan["path"], claude_json_for(plan["config_dir"]))
+    if plan["config_dir"]:   # same auto memory as the default login for this repo
+        link = usage.link_memory(repo_root(plan["path"]), plan["config_dir"])
+        if link:
+            plan["memory_link"] = link
+
+    # --- the brief
+    BRIEF_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(BRIEF_DIR, 0o700)
+    brief_path = BRIEF_DIR / ("%s-%d.md" % (plan["name"], int(time.time())))
+    head = "" if a.no_preamble else preamble(plan["name"], plan["path"], plan.get("branch"), cli, cfg)
+    brief_path.write_text(head + brief + "\n")
+    os.chmod(brief_path, 0o600)
+    plan["brief_path"] = str(brief_path)
+
+    # --- launch
+    if tmux_has(plan["name"]):
+        plan["tmux"] = "existing"
+        plan["model"] = plan["effort"] = None  # the running session keeps its own; nothing was launched
+        plan["account"] = plan["config_dir"] = None
+        print("agent-spawn: tmux session %r exists; sending the brief as a message instead "
+              "(--model/--effort not applied)" % plan["name"], file=sys.stderr)
+        send = Path(__file__).resolve().parent / "agent-send"
+        r = run([sys.executable, str(send), "--from", "agent-spawn", plan["name"], brief_path.read_text()], check=False)
+        plan["delivery"] = (r.stdout + r.stderr).strip()
+    else:
+        if cli == "claude":
+            plan.update(launch_claude(plan["name"], plan["path"], brief_path, plan["model"], plan["effort"], props,
+                                      plan["config_dir"]))
+        else:
+            plan.update(launch_codex(plan["name"], plan["path"], brief_path, plan["model"], plan["effort"], props))
+        plan["tmux"] = plan["name"]
+
+    statuslog.append({"cli": cli, "session_id": plan.get("thread", ""), "name": plan["name"],
+                      "cwd": plan["path"], "branch": plan.get("branch", ""), "event": "spawn",
+                      "account": plan.get("account") or "", "text": "brief %s" % brief_path})
+    if a.json:
+        print(json.dumps(plan, indent=2))
+    else:
+        if plan["tmux"] == "existing":
+            how = "brief sent to the running session; model and effort unchanged"
+        else:
+            how = "model %s, effort %s" % (plan["model"] or "CLI default", plan["effort"] or "CLI default")
+            if cli == "claude" and plan.get("account"):
+                how += ", account %s" % plan["account"]
+        print("started %s %r (%s) in tmux %r at %s%s" % (cli, plan["name"], how, plan["tmux"], plan["path"],
+                                                      (" on branch " + plan["branch"]) if plan.get("branch") else ""))
+        if plan.get("route"):
+            print("route: " + plan["route"])
+        if plan.get("memory"):
+            print("memory: " + plan["memory"])
+        if plan.get("warning"):
+            print("warning: " + plan["warning"])
+        print("attach: tmux attach -t %s   (from another machine: ssh <this host> -t tmux attach -t %s)"
+              % (plan["name"], plan["name"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""agent-restart: restart, or update and restart, the desktop without losing the agents.
+
+    agent-restart plan [--json]                       what would happen: updates, every agent, what it's waiting on
+    agent-restart run [--update] [--wait-minutes 15] [--choice NAME=nudge|quiet|skip ...] [--dry-run] --yes
+    agent-restart status | cancel
+    agent-restart restore                             (the boot-time unit agent-restart-restore.service)
+    agent-restart test-cycle --only NAME[,NAME] [--choice NAME=..]  kill those agents' tmux and restore them: the path, no reboot
+
+run writes a manifest and starts a detached worker:
+  1. heads-up to agents mid-turn, then wait up to --wait-minutes for them to stop;
+  2. with --update: apt-get update, full-upgrade (stops before rebooting if apt fails), snap refresh;
+  3. email the owner (mailroom config owner_email), then reboot.
+At boot, restore brings every agent back in its tmux session, with the same conversation, login, model and effort.
+Quiet ones just come back. Nudged ones (default: those that were busy or on a background wait) get one note saying
+what they were doing and waiting on. It ends by emailing the owner a summary.
+Defaults: busy and background agents are nudged, the rest come back quietly. An agent runs it only after the owner
+says yes.
+"""
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentboard import restart  # noqa: E402
+
+
+def show_plan(p):
+    u = p["updates"]
+    print("Updates: %s pending (%s security); reboot %s%s; kernel %s -> %s; GPU %s" % (
+        u.get("total"), u.get("security"), "needed" if u.get("reboot_required") else "not needed",
+        (" since " + time.strftime("%d %b", time.localtime(u["reboot_since"]))) if u.get("reboot_since") else "",
+        u.get("kernel"), u.get("newest_kernel"), "ok" if u.get("gpu_ok") else "NOT ok: " + u.get("gpu_message", "")))
+    if u.get("highlights"):
+        print("  including: " + ", ".join(u["highlights"]))
+    if u.get("snaps"):
+        print("  snaps: " + ", ".join(u["snaps"]))
+    print("\nAgents (%d):" % len(p["agents"]))
+    for a in p["agents"]:
+        print("  %-10s %-6s %-36s -> %-6s %s" % (a["state"], a["cli"], a["display"][:36], a["choice"],
+                                                 ((a.get("last_note") or {}).get("text") or "")[:70]))
+        for w in a["waits"]:
+            print("      waiting on: " + (w.get("what") or w.get("command", ""))[:110])
+        for pr in a["processes"]:
+            print("      process (dies): %s" % pr["cmd"][:110])
+    if p["warnings"]:
+        print("\nWarnings:")
+        for w in p["warnings"]:
+            print("  - " + w)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-restart", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("plan")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("run")
+    p.add_argument("--update", action="store_true")
+    p.add_argument("--wait-minutes", type=int, default=15)
+    p.add_argument("--choice", action="append", default=[], help="NAME_OR_ID=nudge|quiet|skip")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--yes", action="store_true", help="really do it (the owner said yes)")
+    sub.add_parser("status")
+    sub.add_parser("cancel")
+    sub.add_parser("worker")
+    sub.add_parser("restore")
+    p = sub.add_parser("test-cycle")
+    p.add_argument("--only", required=True, help="comma-separated agent names: their tmux is killed and they are restored")
+    p.add_argument("--choice", action="append", default=[], help="NAME=nudge|quiet|skip")
+    a = ap.parse_args(argv)
+
+    if a.cmd == "plan":
+        pl = restart.plan()
+        print(json.dumps(pl, indent=1, default=str)) if a.json else show_plan(pl)
+        return 0
+    choices = {}
+    for c in getattr(a, "choice", []):
+        k, _, v = c.partition("=")
+        choices[k] = v
+    if a.cmd == "run":
+        if not a.dry_run and not a.yes:
+            print("agent-restart: this restarts the desktop; pass --yes once the owner has agreed (or --dry-run)",
+                  file=sys.stderr)
+            return 1
+        res = restart.start_run(a.update, a.wait_minutes, choices, dry_run=a.dry_run)
+        if a.dry_run and res.get("ok"):
+            print("Would: " + "; ".join(res["steps"]))
+            for x in res["manifest"]["agents"]:
+                print("  %-36s %-10s -> %s" % (x["display"][:36], x["state"], x["choice"]))
+            return 0
+        print(res.get("output") or res.get("error"))
+        return 0 if res.get("ok") else 1
+    if a.cmd == "status":
+        print(json.dumps(restart.status(), indent=1, default=str))
+        return 0
+    if a.cmd == "cancel":
+        res = restart.cancel()
+        print(res.get("output") or res.get("error"))
+        return 0 if res.get("ok") else 1
+    if a.cmd == "worker":
+        return restart.worker()
+    if a.cmd == "restore":
+        return restart.restore()
+    if a.cmd == "test-cycle":
+        return restart.test_cycle([n.strip() for n in a.only.split(",") if n.strip()], choices)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

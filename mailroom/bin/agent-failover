@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""agent-failover: move a Claude agent to another login when its own hits a usage limit mid-task, and back
+once that login has reset.
+
+    agent-failover                                   # watch forever (systemd/agent-failover.service)
+    agent-failover --once [--dry-run] [--json]       # one pass; --dry-run moves nothing, saves no state
+    agent-failover move NAME_OR_ID --to ACCOUNT [--prompt TEXT] [--dry-run]   # move one agent now
+    agent-failover status                            # agents it has moved: first login, current login, moves
+
+Every 20 s it reads the transcript tail of each live Claude agent. Claude Code records a plan limit there as a
+server-side rejection (rate_limit, quotaLimits.status "rejected", a reset time), and a model's own weekly bucket
+used up (Fable) as apiError "model_requires_usage_credits" ("You're out of usage credits"). Such an agent is moved
+to the first login in usage.order with headroom for the model it runs (agent-usage): its claude is stopped with
+SIGKILL (background jobs keep running), the transcript is copied to the other login, and the same session is
+resumed in the same tmux pane with a note to carry on. A background session (claude --bg) is stopped and resumed
+with the daemon's own commands instead. Mail replies still reach it: the session id does not change.
+Once the limit that moved it has reset, the agent goes back to its first login, but only while it is idle, and
+with no prompt. An idle agent on a login that bills extra usage moves to one with headroom the same way.
+Settings: config key "failover"; defaults and reasons in agentmail/failover.py.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import config, failover, registry, statuslog, usage  # noqa: E402
+
+BIN = Path(__file__).resolve().parent
+STATE_PATH = config.STATE_DIR / "failover.json"
+REBALANCE_SECONDS = 600
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
+
+
+def load_state():
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    os.replace(tmp, STATE_PATH)
+
+
+def trust():
+    """agent-spawn's own trust writer, for the login an agent moves to (its .claude.json)."""
+    loader = importlib.machinery.SourceFileLoader("agent_spawn", str(BIN / "agent-spawn"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    sp = importlib.util.module_from_spec(spec)
+    loader.exec_module(sp)
+    return lambda cwd, config_dir: sp.ensure_trust(cwd, sp.claude_json_for(config_dir))
+
+
+def sample(f):
+    """Live movable agents (each with the model it runs, when its transcript shows it), and the limits their
+    transcripts show."""
+    agents, limits, skipped = [], {}, {}
+    for s in registry.claude_sessions():
+        if not s["live"]:
+            continue
+        path = failover.transcript(s)
+        lines = failover.read_tail(path, f["tail_bytes"]) if path else []
+        hit = failover.limit_hit(lines)
+        s = dict(s, model=failover.session_model(lines))
+        pane, why = failover.movable(s)
+        if not pane:
+            if hit:
+                skipped[s["id"]] = (s, why, hit)
+            continue
+        agents.append(s)
+        if hit:
+            limits[s["id"]] = hit
+    return agents, limits, skipped
+
+
+def act(moves, notes, state, cfg, dry_run, now):
+    for m in moves:
+        sess = m["session"]
+        who = "%s (%s)" % (sess.get("name") or "-", sess["id"][:8])
+        ok, detail = failover.migrate(sess, m["to"], m["prompt"], cfg, trust=None if dry_run else trust(),
+                                      dry_run=dry_run, why=m["reason"])
+        log("%s %s: %s -> %s, %s: %s" % ("would move" if dry_run else ("moved" if ok else "FAILED to move"), who,
+                                         sess.get("account"), m["to"], m["reason"], detail))
+        if dry_run:
+            continue
+        statuslog.append({"cli": "claude", "session_id": sess["id"], "name": sess.get("name") or "",
+                          "cwd": sess.get("cwd") or "", "event": "failover", "account": m["to"],
+                          "text": "%s -> %s (%s)%s" % (sess.get("account"), m["to"], m["reason"],
+                                                       "" if ok else ": FAILED " + detail[:200])})
+        if ok:
+            state = failover.record(state, m, now)
+    for sid, resets, text in notes:
+        log("waiting: " + text)
+        if not dry_run:
+            statuslog.append({"cli": "claude", "session_id": sid, "event": "limit-wait", "text": text[:300]})
+            state.setdefault("sessions", {}).setdefault(sid, {})["stuck_until"] = resets
+    return state
+
+
+def one_pass(cfg, state, dry_run, last_rebalance, now):
+    f = failover.settings(cfg)
+    agents, limits, skipped = sample(f)
+    for sid, (s, why, hit) in skipped.items():
+        if (state.get("unmovable") or {}).get(sid) != failover.stuck_key(hit):
+            log("limit on %s (%s) but not moved: %s" % (s.get("name") or sid[:8], s.get("account"), why))
+            if not dry_run:
+                state.setdefault("unmovable", {})[sid] = failover.stuck_key(hit)
+    idle = [a for a in agents if a.get("status") == "idle"]
+    rebalance = f["switch_back"] and idle and now - last_rebalance >= REBALANCE_SECONDS
+    if not limits and not rebalance:
+        return state, [], last_rebalance
+    snaps = usage.snapshots(cfg)
+    moves, notes = failover.decide(agents, limits, snaps, state, cfg, now)
+    state = act(moves, notes, state, cfg, dry_run, now)
+    return state, moves, (now if rebalance else last_rebalance)
+
+
+def cmd_watch(a):
+    cfg = config.load()
+    f = failover.settings(cfg)
+    once = a.once or a.dry_run
+    last_rebalance = 0.0 if once else time.time() - REBALANCE_SECONDS + 60
+    if not f["enabled"] and not once:
+        log("disabled (config failover.enabled); idling")
+    while True:
+        try:
+            cfg = config.load()
+            f = failover.settings(cfg)
+            if f["enabled"] or once:
+                state = load_state()
+                new_state, moves, last_rebalance = one_pass(cfg, state, a.dry_run, last_rebalance, time.time())
+                if once and a.json:
+                    print(json.dumps([{"session": m["session"]["id"], "name": m["session"].get("name"),
+                                       "from": m["session"].get("account"), "to": m["to"], "reason": m["reason"]}
+                                      for m in moves], indent=1))
+                elif once and not moves:
+                    print("nothing to move")
+                if not a.dry_run and new_state != state:
+                    save_state(new_state)
+        except Exception as e:  # noqa: BLE001 - a watch must outlive one bad pass
+            log("error: %s: %s" % (type(e).__name__, e))
+            if once:
+                return 1
+        if once:
+            return 0
+        time.sleep(f["interval_seconds"])
+
+
+def cmd_move(a):
+    cfg = config.load()
+    s = usage.settings(cfg)
+    try:
+        cli, acct = usage.parse_target(a.to, s)
+    except ValueError as e:
+        print("agent-failover: %s" % e, file=sys.stderr)
+        return 1
+    if cli != "claude":
+        print("agent-failover: a Claude session can only move to another Claude login", file=sys.stderr)
+        return 1
+    sess, code, _ = registry.resolve(a.target, "claude")
+    if code != 0 or not sess.get("live"):
+        print("agent-failover: no live Claude session %r" % a.target, file=sys.stderr)
+        return 4
+    if sess.get("account") == acct:
+        print("agent-failover: %s is already on %s" % (a.target, acct), file=sys.stderr)
+        return 1
+    move = {"session": sess, "to": acct, "reason": "by hand", "prompt": a.prompt, "resets_at": None}
+    ok, detail = failover.migrate(sess, acct, a.prompt, cfg, trust=None if a.dry_run else trust(), dry_run=a.dry_run)
+    print(detail)
+    if ok and not a.dry_run:
+        save_state(failover.record(load_state(), move, time.time()))
+        statuslog.append({"cli": "claude", "session_id": sess["id"], "name": sess.get("name") or "",
+                          "cwd": sess.get("cwd") or "", "event": "failover", "account": acct,
+                          "text": "%s -> %s (by hand)" % (sess.get("account"), acct)})
+    return 0 if ok else 1
+
+
+def cmd_status(a):
+    st = load_state().get("sessions") or {}
+    if not st:
+        print("no agent has been moved")
+        return 0
+    for sid, e in sorted(st.items(), key=lambda kv: -max([m[0] for m in kv[1].get("moves", [])] or [0])):
+        last = e.get("moves", [])[-1:] or [[0, "", "", ""]]
+        print("%-30s %s  first login %-10s now %-10s last move %s: %s" % (
+            e.get("name") or "-", sid[:8], e.get("home") or "-", e.get("current") or "-",
+            time.strftime("%m-%d %H:%M", time.localtime(last[0][0])) if last[0][0] else "-", last[0][3]))
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["move"]:
+        ap = argparse.ArgumentParser(prog="agent-failover move")
+        ap.add_argument("target")
+        ap.add_argument("--to", required=True, help="Claude login from config usage.claude_accounts")
+        ap.add_argument("--prompt", help="message to resume it with (default: none, it waits for input)")
+        ap.add_argument("--dry-run", action="store_true")
+        return cmd_move(ap.parse_args(argv[1:]))
+    if argv[:1] == ["status"]:
+        return cmd_status(None)
+    ap = argparse.ArgumentParser(prog="agent-failover", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--once", action="store_true", help="one pass, then exit")
+    ap.add_argument("--dry-run", action="store_true", help="move nothing, save no state (implies --once)")
+    ap.add_argument("--json", action="store_true")
+    return cmd_watch(ap.parse_args(argv))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

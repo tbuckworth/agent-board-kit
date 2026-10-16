@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-status hook --cli codex", "timeout": 20}]}],
+    "Stop":         [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-status hook --cli codex", "timeout": 20}]}],
+    "SessionEnd":   [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-status hook --cli codex", "timeout": 3}]}]
+  }
+}

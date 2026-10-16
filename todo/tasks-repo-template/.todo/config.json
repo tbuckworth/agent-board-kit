@@ -1,0 +1,16 @@
+{
+  "groups": [
+    { "name": "Home", "sortOrder": 1 },
+    { "name": "Work", "sortOrder": 2 },
+    { "name": "Reading", "sortOrder": 3 }
+  ],
+  "listMetadata": [
+    { "listName": "tasks", "sortOrder": 0 },
+    { "listName": "to-buy", "groupName": "Home", "sortOrder": 0 },
+    { "listName": "chores", "groupName": "Home", "sortOrder": 1 },
+    { "listName": "project-x", "groupName": "Work", "sortOrder": 0 },
+    { "listName": "books", "groupName": "Reading", "sortOrder": 0 }
+  ],
+  "unratedGroups": ["Reading"],
+  "unratedLists": []
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=Agent mailroom: route Gmail replies to Claude Code and Codex sessions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{PYTHON}} {{KIT_DIR}}/mailroom/bin/agent-mailroom
+Restart=always
+RestartSec=20
+# SIGTERM only the daemon: its handler drains the current message, including agent-send
+# and orchestrator children. Remaining service processes are killed after the daemon
+# exits or the drain deadline expires, so it must wait for delivery before exiting.
+KillMode=mixed
+# An event can wait for the orchestrator lock, then make two 15-minute attempts.
+TimeoutStopSec=1h
+Environment=PYTHONUNBUFFERED=1
+# claude and codex live in ~/.local/bin; systemd --user does not read ~/.bashrc
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

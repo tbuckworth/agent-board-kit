@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""todo-desk: the desktop side of the Mac to-do app (see desk/todo_desk.py)."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "desk"))
+import todo_desk  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(todo_desk.main())

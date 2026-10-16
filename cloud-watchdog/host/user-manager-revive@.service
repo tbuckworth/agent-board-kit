@@ -1,0 +1,18 @@
+# Optional, root. Install in /etc/systemd/system; the instance name is your login name:
+#   sudo install -m 644 host/user-manager-revive@.service host/user-manager-revive@.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now user-manager-revive@$USER.timer
+#
+# Lingering (`loginctl enable-linger`) starts your systemd user manager at boot, but does not restart it if
+# it is killed (for example by a global out-of-memory kill). Every user service and timer (the mailroom,
+# cloud-watchdog, the board) then stays down until you next log in. This starts the manager again; while it
+# is running, `systemctl start` does nothing.
+[Unit]
+Description=Start the user manager of %i if it has died (lingering does not restart a killed one)
+ConditionPathExists=/var/lib/systemd/linger/%i
+
+[Service]
+Type=oneshot
+# --no-block: queue the start and return. If the manager hangs while starting (memory pressure again), waiting on
+# it would leave this oneshot running forever, and the timer never fires again while it is active.
+ExecStart=/bin/sh -c 'exec /bin/systemctl start --no-block "user@$$(id -u %i).service"'
+TimeoutStartSec=2min

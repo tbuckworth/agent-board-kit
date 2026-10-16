@@ -1,0 +1,13 @@
+[Unit]
+Description=todo-desk: start the agents the web to-do app asked for (status:agent-requested)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# PATH as a login shell has it: gh, agent-orchestrate (and what it runs: claude, agent-spawn, tmux) in ~/.local/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
+ExecStart={{PYTHON}} {{KIT_DIR}}/todo/bin/todo-desk dispatch
+# each assign starts agent-orchestrate in the background; it must outlive this run
+KillMode=process
+TimeoutStartSec=300

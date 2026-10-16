@@ -1,0 +1,16 @@
+[Unit]
+Description=agent-memwatch: warn the agents holding the most memory before the machine runs out
+
+[Service]
+Type=simple
+ExecStart={{PYTHON}} {{KIT_DIR}}/mailroom/bin/agent-memwatch
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+# agent-send and agent-mail find claude/codex in ~/.local/bin; systemd --user does not read ~/.bashrc
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Its own footprint is ~30 MB; it must never be part of the problem it watches.
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

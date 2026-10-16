@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""agent-board: the desktop side of the Mac agent board. Read-only except `act`.
+
+    agent-board snapshot [--pretty]     one JSON snapshot of every agent, mail, metrics, usage
+    agent-board stream [--interval 3]   JSON lines: a snapshot when anything changes (and every 30 s),
+                                        metrics every 5 s; reads {"cmd": ...} lines on stdin
+    agent-board act                     one validated action, JSON request on stdin (see agentboard/actions.py)
+
+The Mac app keeps `ssh desktop agent-board stream` open; the process exits when the connection
+drops (EOF on stdin, a broken pipe, or a write stalled for 2 minutes) and after --max-seconds.
+"""
+import argparse
+import hashlib
+import json
+import os
+import select
+import signal
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentboard import actions, collect, gmailread, restart, sources  # noqa: E402
+
+STALL_SECONDS = 120
+
+
+def make_gmail():
+    """The owner's read/unread state for the agents' mail: optional, on only when the board config names the owner's
+    Gmail OAuth file (gmail_credentials) and it exists. Else None, and the board shows "read-check off"."""
+    return gmailread.make()
+
+
+def emit(obj):
+    signal.alarm(STALL_SECONDS)          # a write blocked this long means the Mac went away: die
+    sys.stdout.write(json.dumps(obj, separators=(",", ":"), default=str) + "\n")
+    sys.stdout.flush()
+    signal.alarm(0)
+
+
+def fingerprint(snap):
+    keep = {"agents": [{k: v for k, v in a.items() if k not in ("reason", "fresh")} for a in snap["agents"]],
+            "mail": snap["mail"], "usage": snap.get("usage"), "timeline": snap["timeline"][:5],
+            "gmail": {k: v for k, v in (snap.get("gmail") or {}).items() if k != "checked_at"},
+            "worktrees": snap.get("worktrees"), "desktop": {k: v for k, v in (snap.get("desktop") or {}).items() if k != "checked"},
+            "restart": {k: v for k, v in (snap.get("restart") or {}).items() if k != "updated"}}
+    return hashlib.sha1(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def cmd_snapshot(a):
+    metrics = sources.Metrics(gpu=False)
+    usage = sources.Usage()
+    usage.refresh()
+    gmail = make_gmail()
+    wts = collect.WorktreeScan()
+    wts.maybe_refresh(sync=True)
+    desktop = collect.DesktopInfo()
+    desktop.refresh()
+    desktop.at = time.time()
+    col = collect.Collector(metrics=metrics, usage=usage, git=sources.GitCache(budget=1000),
+                            prs=sources.PullRequests(sync=True), gmail=gmail, worktrees=wts,
+                            desktop=desktop, restored=restart.restored_activity)
+    if gmail is not None:
+        col.agents(with_git=False)        # tells Gmail which mails the board cares about
+        gmail.refresh()                   # then one synchronous look-up, so this snapshot shows read state
+        gmail.at = time.time()            # and snapshot() does not start a second, background one
+    snap = col.snapshot()
+    metrics.cpu()
+    time.sleep(0.2)
+    snap["metrics"] = metrics.read()
+    print(json.dumps(snap, indent=2 if a.pretty else None, default=str))
+    return 0
+
+
+def cmd_stream(a):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    metrics = sources.Metrics(gpu=True)
+    usage = sources.Usage(interval=a.usage_interval)
+    col = collect.Collector(metrics=metrics, usage=usage, prs=sources.PullRequests(), gmail=make_gmail(),
+                            worktrees=collect.WorktreeScan(), desktop=collect.DesktopInfo(),
+                            restored=restart.restored_activity)
+    started = time.time()
+    last_fp, last_snap, last_metrics = None, 0, 0
+    emit({"type": "hello", "v": 1, "host": os.uname().nodename, "pid": os.getpid(), "interval": a.interval})
+    force = False
+    try:
+        while time.time() - started < a.max_seconds:
+            now = time.time()
+            try:
+                snap = col.snapshot(now)
+                fp = fingerprint(snap)
+                if force or fp != last_fp or now - last_snap >= 30:
+                    snap["metrics"] = metrics.read(now)
+                    emit(snap)
+                    last_fp, last_snap, last_metrics, force = fp, now, now, False
+                elif now - last_metrics >= 5:
+                    emit({"type": "metrics", "metrics": metrics.read(now), "usage": snap.get("usage")})
+                    last_metrics = now
+            except Exception as e:   # report and keep going; the app shows the error line
+                emit({"type": "error", "error": "%s: %s" % (type(e).__name__, e)})
+            ready, _, _ = select.select([sys.stdin], [], [], a.interval)
+            if ready:
+                line = sys.stdin.readline()
+                if not line:
+                    return 0                       # the Mac closed the connection
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("cmd") == "refresh_usage":
+                    usage.maybe_refresh(force=True)
+                    force = True
+                elif msg.get("cmd") == "refresh":            # ⌘R: everything fresh, usage from its own cache
+                    col.refresh()
+                    usage.kick()
+                    force = True
+    finally:
+        metrics.close()
+    return 0
+
+
+def cmd_act(a):
+    try:
+        req = json.loads(sys.stdin.read(65536) or "null")
+    except ValueError:
+        req = None
+    col = collect.Collector()
+    rows, _, _ = col.agents(with_git=False)
+    if isinstance(req, dict) and req.get("action") in ("restart_plan", "restart_run", "restart_cancel"):
+        res = actions.restart_action(req)
+    elif isinstance(req, dict) and req.get("action") == "orchestrate":
+        res = actions.orchestrate(req)
+    elif isinstance(req, dict) and req.get("action") == "wt_landed_check":
+        res = actions.landed_check(rows, sources.list_worktrees())
+    elif isinstance(req, dict) and req.get("action") == "wt_landed_cleanup":
+        res = actions.landed_cleanup(req, rows, sources.list_worktrees())
+    elif isinstance(req, dict) and str(req.get("action", "")).startswith("wt_"):
+        res = actions.perform_wt(req, rows, sources.list_worktrees())
+    else:
+        res = actions.perform(req, rows)
+    print(json.dumps(res))
+    return 0 if res.get("ok") else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-board", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("snapshot")
+    p.add_argument("--pretty", action="store_true")
+    p = sub.add_parser("stream")
+    p.add_argument("--interval", type=float, default=3.0)
+    p.add_argument("--usage-interval", type=float, default=300.0)
+    p.add_argument("--max-seconds", type=float, default=12 * 3600)
+    sub.add_parser("act")
+    a = ap.parse_args(argv)
+    return {"snapshot": cmd_snapshot, "stream": cmd_stream, "act": cmd_act}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

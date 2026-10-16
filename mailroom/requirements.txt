@@ -1,0 +1,7 @@
+# Only the Gmail layer (agentmail/gmail.py, used by agent-mail and agent-mailroom) and the one-time
+# consent script (agent_mail_auth.py) need these. Every other tool is Python 3.9+ standard library.
+google-api-python-client>=2.0     # Gmail API client (googleapiclient.discovery / errors)
+google-auth>=2.0                  # google.oauth2.credentials, token refresh
+google-auth-httplib2>=0.1         # transport googleapiclient uses with google-auth credentials
+requests>=2.25                    # google.auth.transport.requests.Request (token refresh)
+google-auth-oauthlib>=1.0         # agent_mail_auth.py only: the browser consent flow

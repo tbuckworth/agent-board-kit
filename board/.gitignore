@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+mac/.build/
+mac/build/
+*.app
+shots/

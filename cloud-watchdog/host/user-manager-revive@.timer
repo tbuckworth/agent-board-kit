@@ -1,0 +1,11 @@
+# Optional, root. See user-manager-revive@.service. Enable as user-manager-revive@<login name>.timer.
+[Unit]
+Description=Every 5 minutes, start the user manager of %i if it has died
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

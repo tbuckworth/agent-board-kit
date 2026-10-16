@@ -1,0 +1,15 @@
+[Unit]
+Description=cloud-watchdog check (paid cloud resources left running)
+OnFailure=cloud-watchdog-alert@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=8min
+# When the machine runs out of memory the kernel may kill one collector child as a bystander. Let the check
+# finish without that account (it counts as a failed collection) instead of systemd stopping the whole run.
+OOMPolicy=continue
+# A check peaks at ~160 MB. Cap a runaway CLI or response so the watchdog can never be what exhausts the machine.
+MemoryHigh=512M
+MemoryMax=1G
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={{PYTHON}} {{KIT_DIR}}/cloud-watchdog/bin/cloud-watch check

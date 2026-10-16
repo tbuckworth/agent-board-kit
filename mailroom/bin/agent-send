@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""agent-send: deliver a message to a Claude Code or Codex session on this machine.
+
+Registry code lives in agentmail/registry.py (shared with agent-mail, agent-status, agent-spawn).
+
+    agent-send [--from WHO] [--offline fail|resume] [--no-dangerous] TARGET MESSAGE...
+    agent-send TARGET < message.txt
+    agent-send --list [--json]
+    agent-send --dry-run TARGET MESSAGE...
+
+TARGET is a session name, a session/thread id, an unambiguous prefix of either, or the
+start of an unnamed session's title as --list shows it. The orchestrator's name (config
+"orchestrator") matches only a session named exactly that; with none live, the message runs
+one orchestrator event.
+Both CLIs' own registries are the address book:
+
+  Claude Code  ~/.claude/sessions/<pid>.json   (name, sessionId, cwd, status, inbox socket),
+               and each other Claude login's config dir (agentmail/registry.py claude_homes)
+  Codex        ~/.codex/thread-writer-locks/    (live thread ids)
+               ~/.codex/state_5.sqlite          (title, cwd per thread)
+               ~/.codex/session_index.jsonl     (thread names from /rename)
+
+Delivery routes, in order of preference:
+
+  Claude, live   one JSON line on the session's inbox socket. Delivered only if the
+                 receiving session has crossSessionInbound=accept, or is not in
+                 bypass-permissions mode; otherwise Claude Code holds it for approval
+                 for dialogExpiry (5 min default). A sender name cannot be forged on
+                 this path, so the message body starts with a "[from ...]" line.
+  Codex, live    `codex queue --thread <id> --message ...` (codex >= 0.149).
+  offline        with --offline resume: `claude --resume <id> --bg "..."` or a detached
+                 `codex exec resume <id> "..."` whose output goes to a log file. Claude resumes on
+                 the best login by usage (agent-spawn's rule, for the model it runs and its repo's
+                 owner), with the newest copy of its conversation copied there first: a login move
+                 leaves older copies behind (agentmail/failover.place_resume). Resumed
+                 dangerously (bypass permissions / full-access sandbox) by default, matching
+                 every other launch path in this toolkit; pass --no-dangerous to resume under
+                 normal permission prompts instead. A resumed agent runs in its own
+                 systemd scope, agent-NAME.scope, capped by config agent_memory_max and
+                 agent_swap_max (agentmail/memcap.py); Claude's background daemon is moved out
+                 of the caller's service (the mailroom) into claude-bg-daemon.scope.
+                 Default is --offline fail, exit 2, nothing sent.
+
+Exit codes: 0 sent/queued, 1 error, 2 target offline, 3 ambiguous target, 4 not found.
+Runs on Python 3.9+, no third-party packages.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import config, failover, memcap, registry  # noqa: E402
+from agentmail.registry import (all_sessions, claude_bin, claude_sessions, codex_bin,  # noqa: E402
+                                resolve, short)
+
+HOME = Path.home()
+LOG_DIR = HOME / ".local" / "state" / "agent-send"
+
+
+# ---------------------------------------------------------------- sender identity
+
+def default_from():
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        for s in claude_sessions():
+            if s["id"] == sid and s["name"]:
+                return "claude:%s" % s["name"]
+        return "claude:%s" % short(sid)
+    return "%s@%s" % (os.environ.get("USER") or "user", socket.gethostname().split(".")[0])
+
+
+def wrap(body, sender):
+    """Prefix the body with who sent it. The socket path strips sender identity
+    from external senders, and Codex queue has none, so say it in the text. If the
+    sender is a live session, say how to reply; if not, say there is no reply address
+    so the receiver does not waste a SendMessage on it."""
+    bare = sender.split(":", 1)[1] if sender.startswith(("claude:", "codex:")) else sender
+    live = [s for s in all_sessions() if s["live"] and s["name"] == bare]
+    if live:
+        return "[from %s via agent-send; reply with: agent-send %s '...']\n%s" % (sender, bare, body)
+    return "[from %s via agent-send; not a session, no reply address]\n%s" % (sender, body)
+
+
+# ---------------------------------------------------------------- delivery
+
+def send_claude_socket(sess, text):
+    payload = json.dumps({"type": "user", "message": {"role": "user", "content": text}})
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect(sess["socket"])
+        tok = os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN")
+        if tok and os.environ.get("CLAUDE_CODE_SESSION_ID") == sess["id"]:
+            s.sendall((json.dumps({"type": "auth", "token": tok}) + "\n").encode())
+        s.sendall((payload + "\n").encode())
+        s.settimeout(0.5)
+        try:
+            ack = s.recv(4096).decode(errors="replace").strip()
+        except Exception:
+            ack = ""
+    finally:
+        s.close()
+    return ack
+
+
+def queue_codex(sess, text):
+    cx = codex_bin()
+    if not cx:
+        raise RuntimeError("codex binary not found")
+    r = subprocess.run([cx, "queue", "--thread", sess["id"], "--message", text],
+                       capture_output=True, text=True, timeout=60)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode == 0 and "Queued message" in out:
+        return True, out
+    return False, out
+
+
+def agent_caps():
+    """(scope properties, None), or (None, why not): a bad size in config must not block a resume."""
+    try:
+        return memcap.limits(config.load()), None
+    except (ValueError, OSError) as e:
+        return None, "uncapped: %s" % e
+
+
+def spawn_trust(cwd, config_dir):
+    """agent-spawn's own trust writer, for the login a resume takes the conversation to (its .claude.json)."""
+    loader = importlib.machinery.SourceFileLoader("agent_spawn", str(Path(__file__).resolve().parent / "agent-spawn"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    sp = importlib.util.module_from_spec(spec)
+    loader.exec_module(sp)
+    return sp.ensure_trust(cwd, sp.claude_json_for(config_dir))
+
+
+def resume_place(sess, dry_run=False):
+    """(config_dir, note): the best login by usage, with the newest copy of the conversation there
+    (agentmail/failover.place_resume). Never blocks a resume: on an error, the login the session ran with."""
+    try:
+        return failover.place_resume(sess, config.load(), trust=spawn_trust, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        return sess.get("config_dir"), "login not chosen (%s: %s)" % (type(e).__name__, e)
+
+
+def resume_claude(sess, text, dangerous, accepted=None):
+    if sess["cwd"] and not os.path.isdir(sess["cwd"]):
+        return False, "original working folder no longer exists: %s; nothing started" % sess["cwd"]
+    cl = claude_bin()
+    if not cl:
+        raise RuntimeError("claude binary not found")
+    config_dir, where = resume_place(sess)
+    # under that login, in its folder; flags only where that login's daemon has not run it (else it starts a copy)
+    ok, out = failover.bg_resume(cl, sess, ["--dangerously-skip-permissions"] if dangerous else [], config_dir, text)
+    if where:
+        out = where + "; " + out
+    if ok:
+        if accepted:
+            accepted()
+        props, why = agent_caps()
+        def live_pid():  # the daemon may hand the resume to a spare: the registry knows which process took it
+            return next((s["pid"] for s in claude_sessions() if s["id"] == sess["id"] and s["live"]), None)
+        out += "; memory: " + (why or memcap.cap_bg_session(sess["id"], sess["name"] or short(sess["id"]), props,
+                                                            session_pid=live_pid))
+    return ok, out
+
+
+def resume_codex(sess, text, dangerous, accepted=None):
+    if sess["cwd"] and not os.path.isdir(sess["cwd"]):
+        return False, "original working folder no longer exists: %s; nothing started" % sess["cwd"]
+    cx = codex_bin()
+    if not cx:
+        raise RuntimeError("codex binary not found")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = LOG_DIR / ("codex-%s-%d.log" % (short(sess["id"]), int(time.time())))
+    cmd = [cx, "exec", "--skip-git-repo-check"]
+    if dangerous:
+        cmd += ["-s", "danger-full-access"]
+    cmd += ["resume", sess["id"], text]
+    cwd = sess["cwd"] if sess["cwd"] and os.path.isdir(sess["cwd"]) else None
+    with open(log, "ab") as fh:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                             cwd=cwd, start_new_session=True)
+    if accepted:
+        accepted()
+    props, why = agent_caps()
+    if why is None:
+        name = sess["name"] or short(sess["id"])
+        why = memcap.adopt(p.pid, name, props, "agent %s (resumed, codex exec)" % name)[1]
+    return True, "detached codex exec resume; log %s; memory: %s" % (log, why)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list(as_json, cli):
+    sessions = all_sessions(cli)
+    if as_json:
+        print(json.dumps(sessions, indent=2))
+        return 0
+    rows = [(s["cli"], s["name"] or ("(" + (s.get("title") or "untitled")[:28] + ")"),
+             "live" if s["live"] else "-", s["status"] or "", short(s["id"]), s["cwd"])
+            for s in sessions if s["live"] or s["cli"] == "claude"]
+    if not rows:
+        print("no sessions found")
+        return 0
+    w = [max(len(str(r[i])) for r in rows) for i in range(5)]
+    print("%-*s  %-*s  %-*s  %-*s  %-*s  %s" % (w[0], "CLI", w[1], "NAME", w[2], "LIVE", w[3], "STATUS", w[4], "ID", "CWD"))
+    for r in rows:
+        print("%-*s  %-*s  %-*s  %-*s  %-*s  %s" % (w[0], r[0], w[1], r[1], w[2], r[2], w[3], r[3], w[4], r[4], r[5]))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-send", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__)
+    ap.add_argument("target", nargs="?", help="session name, id, or unambiguous prefix")
+    ap.add_argument("message", nargs="*", help="message text (or pipe it on stdin)")
+    ap.add_argument("--from", dest="sender", help="who this is from (default: calling session or user@host)")
+    ap.add_argument("--cli", choices=["claude", "codex"], help="restrict lookup to one CLI")
+    ap.add_argument("--offline", choices=["fail", "resume"], default="fail",
+                    help="what to do when the target is not live (default fail)")
+    ap.add_argument("--dangerous", action=argparse.BooleanOptionalAction, default=True,
+                    help="with --offline resume: bypass permissions / full-access sandbox (default: on)")
+    ap.add_argument("--raw", action="store_true", help="send the message without the [from ...] line")
+    ap.add_argument("--receipt", help=argparse.SUPPRESS)
+    ap.add_argument("--exact-id", action="store_true", help="match only the full session UUID, never names or prefixes")
+    ap.add_argument("--list", action="store_true", help="print the address book")
+    ap.add_argument("--json", action="store_true", help="with --list: JSON output")
+    ap.add_argument("--dry-run", action="store_true", help="resolve and report, send nothing")
+    a = ap.parse_args(argv)
+
+    if a.list:
+        return cmd_list(a.json, a.cli)
+    if not a.target:
+        ap.print_usage()
+        return 1
+
+    body = " ".join(a.message).strip()
+    if not body and not sys.stdin.isatty():
+        body = sys.stdin.read().strip()
+    if not body:
+        print("agent-send: empty message", file=sys.stderr)
+        return 1
+
+    if a.exact_id:
+        sess, code, cands = registry.by_id(all_sessions(a.cli), a.target)
+        if code == 4 and a.cli in (None, "claude"):
+            gone = registry.claude_transcript_session(a.target)
+            if gone:
+                sess, code, cands = gone, 0, [gone]
+    else:
+        sess, code, cands = resolve(a.target, a.cli)
+    if code == 4 or (code == 0 and not sess["live"]):
+        # the orchestrator has no long-lived session: a message to it runs one event
+        try:
+            from agentmail import config as _cfg, orchestrate as _orc
+            cfg = _cfg.load()
+        except Exception:
+            cfg = None
+        orch = (cfg or {}).get("orchestrator") or "orchestrator"
+        if cfg and a.target.lower() == orch.lower() and cfg.get("orchestrator_mode", "exec") == "exec":
+            text = body if a.raw else wrap(body, a.sender or default_from())
+            if a.dry_run:
+                print("would run the orchestrator once with:\n---\n" + text)
+                return 0
+            info = _orc.run_event("[message from %s via agent-send]\n%s" % (a.sender or default_from(), body) if a.raw else text,
+                                  "peer", cfg)
+            if info["ok"]:
+                print("orchestrator ran: $%s, %s turns, %ss\n%s" % (info["cost"], info["turns"], info["duration_s"], info["result"][:600]))
+                return 0
+            print("agent-send: orchestrator run failed: %s" % info["error"], file=sys.stderr)
+            return 1
+    if code == 3:
+        print("agent-send: '%s' is ambiguous:" % a.target, file=sys.stderr)
+        for s in cands:
+            print("  %-6s %-40s %s  %s" % (s["cli"], s["name"] or "(unnamed)", short(s["id"]), s["cwd"]), file=sys.stderr)
+        return 3
+    if code == 4:
+        print("agent-send: no session matches '%s' (try --list)" % a.target, file=sys.stderr)
+        return 4
+
+    text = body if a.raw else wrap(body, a.sender or default_from())
+    label = "%s %s [%s] %s" % (sess["cli"], sess["name"] or "(unnamed)", short(sess["id"]), "live" if sess["live"] else "offline")
+
+    def accepted():
+        if a.receipt:
+            import hashlib
+            path = Path(a.receipt)
+            tmp = path.with_suffix(".tmp")
+            try:
+                with open(tmp, "w", opener=lambda p, flags: os.open(p, flags, 0o600)) as fh:
+                    json.dump({"target": a.target, "sha256": hashlib.sha256(body.encode()).hexdigest()}, fh)
+                os.replace(tmp, path)
+            except OSError as e:
+                # Failure to save a receipt must never turn an accepted message into
+                # a failed send. The normal exit code still confirms acceptance.
+                print("agent-send: could not save delivery receipt: %s" % e, file=sys.stderr)
+
+    if a.dry_run:
+        print("would send to", label)
+        route = ("socket " + str(sess.get("socket"))) if sess["cli"] == "claude" and sess["live"] \
+            else "codex queue" if sess["live"] else ("resume" if a.offline == "resume" else "fail (offline)")
+        if route == "resume" and sess["cli"] == "claude":
+            route += " " + (resume_place(sess, dry_run=True)[1] or "on the login it ran with")
+        print("route:", route)
+        print("---"); print(text)
+        return 0
+
+    try:
+        if sess["cli"] == "claude" and sess["live"]:
+            ack = send_claude_socket(sess, text)
+            accepted()
+            print("sent to %s via inbox socket%s" % (label, (" (" + ack + ")") if ack else ""))
+            return 0
+        if sess["cli"] == "codex" and sess["live"]:
+            ok, out = queue_codex(sess, text)
+            if ok:
+                accepted()
+                print("queued for %s: %s" % (label, out))
+                return 0
+            if "No active session" in out:
+                sess["live"] = False
+                label = label.replace("live", "offline")
+            else:
+                print("agent-send: codex queue failed for %s: %s" % (label, out), file=sys.stderr)
+                return 1
+        # offline
+        if a.offline == "fail":
+            print("agent-send: %s is not live; nothing sent (use --offline resume)" % label, file=sys.stderr)
+            return 2
+        resume = resume_claude if sess["cli"] == "claude" else resume_codex
+        options = {"accepted": accepted} if a.receipt else {}
+        ok, out = resume(sess, text, a.dangerous, **options)
+        if ok:
+            print("resumed %s: %s" % (label, out))
+            return 0
+        print("agent-send: resume failed for %s: %s" % (label, out), file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+        print("agent-send: delivery to %s failed: %s" % (label, e), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

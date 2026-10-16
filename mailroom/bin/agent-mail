@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""agent-mail: send email from the agents account so that replies route back to you.
+
+    agent-mail send --to ADDR [--cc ADDR] --subject S [--body-file F] [--html F]
+                    [--session NAME_OR_ID] [--cli claude|codex] [--unrouted]   # body on stdin otherwise
+    agent-mail reply INBOUND_ID [--body-file F] [--html F]           # body on stdin otherwise
+    agent-mail sent [--limit N]
+    agent-mail inbox [--held] [--limit N]
+    agent-mail show INBOUND_ID
+    agent-mail release INBOUND_ID TARGET       # deliver a held mail to a session by name/id
+    agent-mail rerun INBOUND_ID                # run the orchestrator again on a held/failed mail
+    agent-mail status
+
+Inside a Claude Code session the sending session is found from CLAUDE_CODE_SESSION_ID.
+Inside Codex there is no such variable: pass --session with the name you gave /rename or
+the thread uuid (see `agent-send --list`).
+
+The routing map is written BEFORE the mail leaves, so the mailroom can always route the
+reply. Each session gets a stable reply tag; the mail carries it in Reply-To
+(agents+TAG@...), in the subject as [#TAG], and in an X-Agent-Mailroom header.
+
+Every mail is multipart/alternative: the plain text as given, plus an HTML part. Without
+--html the HTML is rendered from the text (paragraphs, bullet and numbered lists, fenced code,
+**bold**, `code`); --html FILE supplies it instead.
+"""
+import argparse
+import contextlib
+import hashlib
+import io
+import json
+import os
+import sys
+import uuid
+from email.message import EmailMessage
+from email.utils import formataddr
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import config, deliver, gmail, remote, routing  # noqa: E402
+from agentmail.compose import text_to_html  # noqa: E402
+from agentmail.store import Store  # noqa: E402
+
+
+def die(msg, code=1):
+    print("agent-mail: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def read_body(path):
+    if path:
+        return Path(path).read_text()
+    if sys.stdin.isatty():
+        die("no body: pass --body-file or pipe the text on stdin")
+    return sys.stdin.read()
+
+
+def orchestrator_pseudo(cfg):
+    return {"cli": "orchestrator", "id": "orchestrator", "name": cfg.get("orchestrator", "orchestrator"),
+            "cwd": os.path.expanduser(cfg.get("orchestrator_dir") or config.DEFAULTS["orchestrator_dir"]), "live": True}
+
+
+def resolve_session(spec, cli_hint):
+    cfg = config.load()
+    if spec is None and os.environ.get("AGENT_ORCHESTRATOR") == "1":
+        return orchestrator_pseudo(cfg)
+    sessions = deliver.registry()
+    if spec == cfg.get("orchestrator", "orchestrator") and not any(s["name"] == spec and s["live"] for s in sessions):
+        return orchestrator_pseudo(cfg)
+    if spec is None:
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if not sid:
+            die("not inside a Claude session and no --session given. Codex: pass --session "
+                "<name from /rename or thread uuid>; see `agent-send --list`.")
+        for s in sessions:
+            if s["id"] == sid:
+                return s
+        return {"cli": "claude", "id": sid, "name": "", "cwd": os.getcwd(), "live": True}
+    cands = [s for s in sessions
+             if (not cli_hint or s["cli"] == cli_hint)
+             and (s["name"] == spec or s["id"] == spec or (len(spec) >= 6 and s["id"].startswith(spec)))]
+    live = [s for s in cands if s["live"]] or cands
+    if len({s["id"] for s in live}) == 1:
+        return live[0]
+    if not live:
+        die("no session matches --session %r (see `agent-send --list`)" % spec, 4)
+    die("--session %r is ambiguous: %s" % (spec, ", ".join("%s %s [%s]" % (s["cli"], s["name"], s["id"][:8]) for s in live)), 3)
+
+
+def _local_host():
+    return config.load().get("host_id") or "desktop"
+
+
+def session_label(sess):
+    if sess["cli"] == "orchestrator":
+        return "orchestrator"
+    name = sess.get("name") or sess.get("session_name") or ""
+    sid = sess.get("id") or sess.get("session_id") or ""
+    host = sess.get("host") or sess.get("origin_host")
+    return (name[:40] if name else sid[:8]) + " (%s%s)" % (sess["cli"], "@" + host if host and host != _local_host() else "")
+
+
+def compose(cfg, from_label, to, cc, subject, text, html_body=None, reply_to_tag=None,
+            in_reply_to=None, references=None):
+    """One multipart/alternative message: the text as given, plus html_body or HTML rendered from the text."""
+    account = config.require_account(cfg)
+    msg = EmailMessage()
+    msg["From"] = formataddr(("%s (%s)" % (cfg["from_name"], from_label), account))
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    msg["Subject"] = subject
+    if reply_to_tag:
+        msg["Reply-To"] = formataddr((cfg["from_name"], routing.tagged_address(account, reply_to_tag)))
+        msg["X-Agent-Mailroom"] = reply_to_tag
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = references or in_reply_to
+    msg.set_content(text)
+    msg.add_alternative(html_body or text_to_html(text), subtype="html")
+    return msg
+
+
+def check_send_enabled(cfg):
+    if not cfg.get("send_enabled", True):
+        o = config.owner_name(cfg)
+        die("sending is disabled on this machine (config send_enabled=false): the mailroom runs on the "
+            "desktop and cannot route replies to sessions here. Send from a desktop session, or use "
+            "%s personal Gmail tools if the mail is to be sent as %s." % (config.owner_possessive(cfg), o))
+    if not cfg.get("mail_proxy"):
+        try:
+            config.require_account(cfg)
+        except config.ConfigError as e:
+            die(str(e))
+
+
+def do_send(a):
+    cfg = config.load()
+    check_send_enabled(cfg)
+    if a.unrouted and os.environ.get("SSH_CONNECTION"):
+        die("unrouted SSH sends lose the originating session. Run agent-mail locally on the Mac "
+            "with --session so the supported proxy preserves ownership.")
+    st = Store()
+    text = read_body(a.body_file)
+    html_body = Path(a.html).read_text() if a.html else getattr(a, "html_body", None)
+    svc = gmail.service()
+    if a.unrouted:
+        msg = compose(cfg, "mailroom", a.to, a.cc, a.subject, text, html_body)
+        res = gmail.send_raw(svc, msg.as_bytes())
+        meta = gmail.get_metadata(svc, res["id"], ["Message-ID"])
+        st.record_sent("", res["id"], res["threadId"], gmail.headers(meta).get("message-id"), a.to, a.subject)
+        print("sent to %s | subject %r | thread %s | unrouted (replies go to the orchestrator)" % (a.to, a.subject, res["threadId"]))
+        return 0
+    sess = getattr(a, "origin", None) or resolve_session(a.session, a.cli)
+    row = st.session_for(sess["cli"], sess["id"], sess.get("name", ""), sess.get("cwd", ""),
+                         sess.get("host", cfg["host_id"]))
+    tag = row["tag"]
+    subject = routing.tag_subject(a.subject, tag)
+    msg = compose(cfg, session_label(sess), a.to, a.cc, subject, text, html_body, reply_to_tag=tag)
+    res = gmail.send_raw(svc, msg.as_bytes())
+    meta = gmail.get_metadata(svc, res["id"], ["Message-ID"])
+    mid = gmail.headers(meta).get("message-id")
+    st.record_sent(tag, res["id"], res["threadId"], mid, a.to, subject)
+    print("sent to %s | subject %r | thread %s | tag %s | from %s"
+          % (a.to, subject, res["threadId"], tag, session_label(sess)))
+    return 0
+
+
+def do_reply(a):
+    cfg = config.load()
+    check_send_enabled(cfg)
+    st = Store()
+    inb = st.inbound(a.inbound_id)
+    if not inb:
+        die("no inbound mail with id %s (see `agent-mail inbox`)" % a.inbound_id, 4)
+    row = st.session_by_tag(inb["matched_tag"]) if inb["matched_tag"] else None
+    origin = getattr(a, "origin", None)
+    if origin and (row is None or (row["origin_host"], row["cli"], row["session_id"]) !=
+                   (origin["host"], origin["cli"], origin["id"])):
+        die("reply is not owned by this origin session; ask %s for an explicit handoff" % config.owner_name(cfg))
+    if row is None:
+        sess = resolve_session(a.session, a.cli)
+        row = st.session_for(sess["cli"], sess["id"], sess.get("name", ""), sess.get("cwd", ""), cfg["host_id"])
+    tag = row["tag"]
+    text = read_body(a.body_file)
+    html_body = Path(a.html).read_text() if a.html else getattr(a, "html_body", None)
+    subject = inb["subject"] or ""
+    if not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+    subject = routing.tag_subject(subject, tag)
+    label = session_label(dict(row))
+    msg = compose(cfg, label, inb["from_addr"], None, subject, text, html_body, reply_to_tag=tag,
+                  in_reply_to=inb["message_id"], references=inb["message_id"])
+    svc = gmail.service()
+    res = gmail.send_raw(svc, msg.as_bytes(), thread_id=inb["thread_id"])
+    meta = gmail.get_metadata(svc, res["id"], ["Message-ID"])
+    mid = gmail.headers(meta).get("message-id")
+    st.record_sent(tag, res["id"], res["threadId"], mid, inb["from_addr"], subject, in_reply_to_inbound=inb["id"])
+    print("replied to %s | subject %r | thread %s | from %s" % (inb["from_addr"], subject, res["threadId"], label))
+    return 0
+
+
+def do_sent(a):
+    host = _local_host()
+    for r in Store().list_sent(a.limit):
+        print("%s  %-6s %-28s -> %-30s %s" % (
+            _ts(r["sent_at"]), (r["cli"] or "?") + ("@" + r["origin_host"] if r["origin_host"] and r["origin_host"] != host else ""), (r["session_name"] or (r["session_id"] or "")[:8])[:28],
+            r["to_addr"], r["subject"]))
+    return 0
+
+
+def do_inbox(a):
+    rows = Store().list_inbound("held" if a.held else None, a.limit)
+    if not rows:
+        print("nothing held" if a.held else "no inbound mail seen yet")
+        return 0
+    for r in rows:
+        print("%-4d %s  %-9s %-14s %-30s %s" % (
+            r["id"], _ts(r["received_at"]), r["action"] or "", (r["match_rule"] or "-"),
+            r["from_addr"], (r["subject"] or "")[:60]))
+        if r["detail"]:
+            print("     %s" % r["detail"])
+    return 0
+
+
+def do_show(a):
+    r = Store().inbound(a.inbound_id)
+    if not r:
+        die("no inbound mail with id %s" % a.inbound_id, 4)
+    for k in r.keys():
+        if k != "body":
+            print("%-14s %s" % (k, r[k]))
+    print("body:\n" + (r["body"] or ""))
+    return 0
+
+
+def do_release(a):
+    cfg = config.load()
+    st = Store()
+    inb = st.inbound(a.inbound_id)
+    if not inb:
+        die("no inbound mail with id %s" % a.inbound_id, 4)
+    if a.target == "origin":
+        row = st.session_by_tag(inb["matched_tag"]) if inb["matched_tag"] else None
+        if row is None:
+            die("no recorded origin; recover ownership before releasing")
+        sess = {"cli": row["cli"], "id": row["session_id"], "name": row["session_name"]}
+    elif getattr(a, "host", None) and a.host != cfg["host_id"]:
+        if a.cli not in ("claude", "codex"):
+            die("remote handoff requires --cli and a full session UUID")
+        try:
+            sid = str(uuid.UUID(a.target))
+            sess = remote.call(cfg, a.host, {"op": "lookup", "cli": a.cli, "session_id": sid})
+        except (ValueError, remote.RemoteError) as e:
+            die(str(e))
+        row = st.session_for(sess["cli"], sess["id"], sess["name"], sess["cwd"], a.host)
+    else:
+        sess = resolve_session(a.target, a.cli)
+        row = st.session_for(sess["cli"], sess["id"], sess.get("name", ""), sess.get("cwd", ""), cfg["host_id"])
+    if sess["cli"] == "orchestrator":
+        return do_rerun(a)
+    tier = routing.sender_tier(inb["from_addr"], cfg)
+    if tier is None or (inb["detail"] or "").startswith("DKIM check failed"):
+        die("cannot release mail from an unverified sender")
+    if tier == "collaborator":
+        collab = cfg["collaborators"][inb["from_addr"]]
+        text = routing.collaborator_text(inb["id"], inb["from_name"], inb["from_addr"], collab.get("owner"), inb["subject"],
+                                         inb["body"] or "", owner_name=config.owner_name(cfg))
+    else:
+        text = routing.inbound_text(inb["id"], inb["from_name"], inb["from_addr"], inb["subject"], inb["body"] or "")
+    rc, out = deliver.deliver_session(row, text, cfg)
+    if rc != 0:
+        die("delivery failed (%d): %s" % (rc, out), rc)
+    import time
+    st.update_inbound(inb["id"], action="queued" if row["origin_host"] != cfg["host_id"] else "delivered", detail="released by hand: " + out,
+                      matched_tag=row["tag"], match_rule="manual", released_to=session_label(sess),
+                      released_at=int(time.time()))
+    try:
+        svc = gmail.service()
+        gmail.modify(svc, inb["gmail_id"], add=[gmail.ensure_label(svc, cfg["labels"]["delivered"])],
+                     remove=[gmail.ensure_label(svc, cfg["labels"]["held"]), "UNREAD"])
+    except Exception as e:  # labels are cosmetic
+        print("warning: could not relabel: %s" % e, file=sys.stderr)
+    print("released %d to %s: %s" % (inb["id"], session_label(sess), out))
+    return 0
+
+
+def do_proxy(a, cfg):
+    """Resolve on the origin machine, then send data to the central mailroom."""
+    operation = a.cmd
+    fields = {k: getattr(a, k) for k in ("to", "cc", "subject", "inbound_id", "limit", "held")
+              if hasattr(a, k)}
+    if operation == "receipt":
+        fields["request_id"] = a.request_id
+    payload = {"op": "mail", "action": operation, "args": fields}
+    if operation in ("send", "reply"):
+        if getattr(a, "unrouted", False):
+            die("proxy mail requires an origin session; --unrouted is not supported")
+        sess = resolve_session(a.session, a.cli)
+        payload["origin"] = remote.identity(dict(sess, host=cfg["host_id"]))
+        payload["text"] = read_body(a.body_file)
+        payload["html"] = Path(a.html).read_text() if a.html else None
+        payload["request_id"] = getattr(a, "request_id", None) or str(uuid.uuid4())
+        print("proxy request %s (receipt: agent-mail receipt %s)" %
+              (payload["request_id"], payload["request_id"]), file=sys.stderr)
+    try:
+        result = remote.call(cfg, cfg["mail_proxy"], payload, timeout=60)
+    except remote.RemoteError as e:
+        die(str(e))
+    print(result, end="" if result.endswith("\n") else "\n")
+    return 0
+
+
+def rpc_mail(request, cfg):
+    if cfg.get("mail_proxy") or not cfg.get("send_enabled"):
+        raise ValueError("this machine is not a central mailroom")
+    action = request.get("action")
+    handlers = {"send": do_send, "reply": do_reply, "inbox": do_inbox,
+                "show": do_show, "sent": do_sent, "receipt": do_receipt}
+    if action not in handlers:
+        raise ValueError("unsupported proxy mail action")
+    fields = request.get("args", {})
+    allowed = {"to", "cc", "subject", "inbound_id", "limit", "held", "request_id"}
+    if not isinstance(fields, dict) or set(fields) - allowed:
+        raise ValueError("invalid proxy arguments")
+    a = argparse.Namespace(body_file=None, html=None, session=None, cli=None, cc=None,
+                           unrouted=False, limit=50, held=False)
+    a.__dict__.update(fields)
+    st = Store()
+    rid = None
+    if action in ("send", "reply"):
+        a.origin = remote.identity(request.get("origin"))
+        if a.origin["host"] != request["source_host"]:
+            raise ValueError("origin host does not match source host")
+        rid = str(uuid.UUID(request["request_id"]))
+        fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        st.con.execute("begin immediate")
+        old = st.con.execute("select * from proxy_requests where request_id=?", (rid,)).fetchone()
+        if old:
+            st.con.execute("rollback")
+            if old["fingerprint"] != fingerprint:
+                raise ValueError("request ID was already used for different content")
+            if old["status"] == "complete":
+                return old["result"]
+            raise ValueError("request %s has an uncertain/in-progress outcome; inspect sent mail before retrying" % rid)
+        st.con.execute("insert into proxy_requests values(?,?,?,?)", (rid, fingerprint, "pending", None))
+        st.con.execute("commit")
+    out = io.StringIO()
+    old_stdin = sys.stdin
+    try:
+        sys.stdin = io.StringIO(request.get("text", ""))
+        # HTML travels as content, never a remote filename.
+        a.html_body = request.get("html")
+        with contextlib.redirect_stdout(out):
+            handlers[action](a)
+    finally:
+        sys.stdin = old_stdin
+    result = out.getvalue()
+    if rid:
+        st.con.execute("update proxy_requests set status='complete',result=? where request_id=?", (result, rid))
+    return result
+
+
+def do_rpc(a):
+    cfg = config.load()
+    response = {"protocol": remote.PROTOCOL, "ok": False}
+    try:
+        wire = sys.stdin.read(remote.MAX_REQUEST + 1)
+        if len(wire.encode()) > remote.MAX_REQUEST:
+            raise ValueError("request exceeds 2 MiB")
+        req = json.loads(wire)
+        if req.get("protocol") != remote.PROTOCOL or req.get("destination_host") != cfg["host_id"]:
+            raise ValueError("protocol or destination host mismatch")
+        if req.get("source_host") not in cfg["remote_hosts"]:
+            raise ValueError("source host is not a configured peer")
+        op = req.get("op")
+        if op == "ping":
+            result = {"host": cfg["host_id"], "protocol": remote.PROTOCOL}
+        elif op == "mail":
+            result = rpc_mail(req, cfg)
+        elif op == "deliver":
+            if cfg.get("mail_proxy") != req["source_host"]:
+                raise ValueError("only the configured central mailroom may deliver")
+            sid = str(uuid.UUID(req["session_id"]))
+            if req["cli"] not in ("claude", "codex"):
+                raise ValueError("invalid CLI")
+            rc, detail = deliver.deliver(req["cli"], sid, req["text"], resume=False, dangerous=False, timeout=20)
+            result = {"code": rc, "detail": detail}
+        elif op == "search":
+            from agentmail import recovery
+            result = recovery.search(req["queries"], cfg)
+        elif op == "lookup":
+            from agentmail import registry
+            sid = str(uuid.UUID(req["session_id"]))
+            if req["cli"] not in ("claude", "codex"):
+                raise ValueError("invalid CLI")
+            sess, code, _ = registry.by_id(registry.all_sessions(req["cli"]), sid)
+            if code:
+                raise ValueError("exact session is not uniquely present in the registry")
+            result = {k: sess.get(k) for k in ("cli", "id", "name", "cwd", "live")}
+        else:
+            raise ValueError("unsupported RPC operation")
+        response.update(ok=True, result=result)
+    except (Exception, SystemExit) as e:
+        response["error"] = str(e) or type(e).__name__
+    print(json.dumps(response))
+    return 0
+
+
+def do_receipt(a):
+    rid = str(uuid.UUID(a.request_id))
+    row = Store().con.execute("select status,result from proxy_requests where request_id=?", (rid,)).fetchone()
+    print(json.dumps(dict(row)) if row else "request not recorded on the mailroom host")
+    return 0
+
+
+def do_recover(a):
+    from agentmail import recovery
+    cfg, st = config.load(), Store()
+    inb = st.inbound(a.inbound_id)
+    if inb is None:
+        die("unknown inbound mail")
+    result = recovery.recover(st, cfg, inb, queries=a.query, refresh=a.refresh)
+    svc = gmail.service()
+    gmail.modify(svc, inb["gmail_id"], add=[gmail.ensure_label(svc, cfg["labels"]["held"])],
+                 remove=[gmail.ensure_label(svc, cfg["labels"]["delivered"])])
+    recovery.notify(svc, st, cfg, st.inbound(a.inbound_id))
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def do_search_local(a):
+    from agentmail import recovery
+    print(json.dumps(recovery.search(json.loads(sys.stdin.read(remote.MAX_REQUEST)), config.load())))
+    return 0
+
+
+def do_rerun(a):
+    cfg = config.load()
+    st = Store()
+    inb = st.inbound(a.inbound_id)
+    if not inb:
+        die("no inbound mail with id %s" % a.inbound_id, 4)
+    from agentmail import orchestrate
+    tier = routing.sender_tier(inb["from_addr"], cfg) or "unknown"
+    collab = cfg["collaborators"].get(inb["from_addr"], {})
+    thread_txt = ""
+    if inb["thread_id"]:
+        try:
+            svc = gmail.service()
+            thread_txt = routing.thread_context(gmail.thread_messages(svc, inb["thread_id"]), cfg["account"], cfg["collaborators"])
+        except Exception as e:
+            print("warning: no thread context: %s" % e, file=sys.stderr)
+    text = routing.orchestrator_event(inb["id"], tier, collab.get("name") or inb["from_name"], inb["from_addr"],
+                                      collab.get("owner"), inb["subject"], inb["body"] or "", thread_txt,
+                                      owner_name=config.owner_name(cfg))
+    info = orchestrate.run_event(text, "rerun", cfg)
+    current = st.inbound(inb["id"])
+    if current["match_rule"] == "manual" and current["action"] in ("delivered", "queued"):
+        print("explicit handoff retained")
+        return 0
+    unresolved = current["recovery_json"] and current["action"] == "held"
+    st.update_inbound(inb["id"], action="delivered" if info["ok"] and not unresolved else "held", match_rule="orchestrator",
+                      detail="rerun: $%s, %s turns%s" % (info["cost"], info["turns"], "" if info["ok"] else "; ERROR " + info["error"][:300]))
+    if info["ok"] and not unresolved:
+        try:
+            svc = gmail.service()
+            gmail.modify(svc, inb["gmail_id"], add=[gmail.ensure_label(svc, cfg["labels"]["delivered"])],
+                         remove=[gmail.ensure_label(svc, cfg["labels"]["held"]), "UNREAD"])
+        except Exception as e:
+            print("warning: could not relabel: %s" % e, file=sys.stderr)
+    print(("ok" if info["ok"] else "FAILED") + " · $%s · %s turns\n%s" % (info["cost"], info["turns"], info["result"] if info["ok"] else info["error"]))
+    return 0 if info["ok"] else 1
+
+
+def do_status(a):
+    import fcntl
+    cfg = config.load()
+    st = Store()
+    print("account       %s" % (cfg["account"] or "NOT SET (config `account`)"))
+    print("owner         %s <%s>" % (config.owner_name(cfg), config.owner_email(cfg) or "no owner_email/allowlist"))
+    print("allowlist     %s" % ", ".join(cfg["allowlist"]))
+    print("db            %s" % config.DB_PATH)
+    running = False
+    try:
+        fh = open(config.LOCK_PATH, "a+")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            running = True
+        fh.close()
+    except OSError:
+        pass
+    print("daemon        %s" % ("running (lock held)" if running else "not running"))
+    print("history_id    %s" % st.get_meta("history_id", "-"))
+    print("last_poll     %s" % _ts(st.get_meta("last_poll")))
+    print("counts        %s" % json.dumps(st.counts()))
+    print("orchestrator  mode=%s model=%s effort=%s dir=%s" % (cfg.get("orchestrator_mode"), cfg.get("orchestrator_model"),
+                                                              cfg.get("orchestrator_effort"), cfg.get("orchestrator_dir")))
+    try:
+        from agentmail import orchestrate
+        runs = orchestrate.recent_runs(100000)
+        cost = sum(r["cost"] for r in runs if isinstance(r.get("cost"), (int, float)))
+        print("orch. runs    %d, $%.2f total, last: %s" % (len(runs), cost, ("ok" if runs[-1]["ok"] else "FAILED") if runs else "-"))
+    except Exception:
+        pass
+    print("collaborators %s" % (", ".join("%s (%s)" % (k, v.get("name", "?")) for k, v in cfg["collaborators"].items()) or "none"))
+    print("require_dkim  %s" % cfg.get("require_dkim"))
+    try:
+        p = gmail.profile(gmail.service())
+        print("mailbox       %s, %s messages, historyId %s" % (p["emailAddress"], p["messagesTotal"], p["historyId"]))
+    except Exception as e:
+        print("mailbox       ERROR %s" % e)
+    return 0
+
+
+def _ts(v):
+    import datetime
+    try:
+        return datetime.datetime.fromtimestamp(int(float(v))).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "-"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-mail", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("send", help="send a new email")
+    p.add_argument("--to", required=True)
+    p.add_argument("--cc")
+    p.add_argument("--subject", required=True)
+    p.add_argument("--body-file")
+    p.add_argument("--html", help="HTML alternative body file (default: rendered from the text body)")
+    p.add_argument("--session", help="sending session name or id (default: this Claude session)")
+    p.add_argument("--request-id", help="reuse a proxy request UUID only when checking an uncertain send")
+    p.add_argument("--cli", choices=["claude", "codex"])
+    p.add_argument("--unrouted", action="store_true",
+                   help="no session, no reply tag; replies land at the orchestrator (for reports and alerts)")
+    p.set_defaults(fn=do_send)
+
+    p = sub.add_parser("reply", help="reply in-thread to an inbound mail")
+    p.add_argument("inbound_id", type=int)
+    p.add_argument("--body-file")
+    p.add_argument("--html", help="HTML alternative body file (default: rendered from the text body)")
+    p.add_argument("--session")
+    p.add_argument("--request-id", help="proxy request UUID")
+    p.add_argument("--cli", choices=["claude", "codex"])
+    p.set_defaults(fn=do_reply)
+
+    p = sub.add_parser("sent", help="list outbound mail")
+    p.add_argument("--limit", type=int, default=30)
+    p.set_defaults(fn=do_sent)
+
+    p = sub.add_parser("inbox", help="list inbound mail the mailroom has seen")
+    p.add_argument("--held", action="store_true")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(fn=do_inbox)
+
+    p = sub.add_parser("show", help="show one inbound mail")
+    p.add_argument("inbound_id", type=int)
+    p.set_defaults(fn=do_show)
+
+    p = sub.add_parser("release", help="deliver a held mail to a session")
+    p.add_argument("inbound_id", type=int)
+    p.add_argument("target")
+    p.add_argument("--cli", choices=["claude", "codex"])
+    p.add_argument("--host", help="explicit remote handoff (requires --cli and full UUID); 'origin' reuses recorded host")
+    p.set_defaults(fn=do_release)
+
+    p = sub.add_parser("rerun", help="run the orchestrator again on a held or failed inbound mail")
+    p.add_argument("inbound_id", type=int)
+    p.set_defaults(fn=do_rerun)
+
+    p = sub.add_parser("status", help="mailroom status")
+    p.set_defaults(fn=do_status)
+
+    p = sub.add_parser("rpc", help=argparse.SUPPRESS)
+    p.set_defaults(fn=do_rpc)
+
+    p = sub.add_parser("search-local", help=argparse.SUPPRESS)
+    p.set_defaults(fn=do_search_local)
+
+    p = sub.add_parser("receipt", help="inspect the outcome of a proxy send without resending")
+    p.add_argument("request_id")
+    p.set_defaults(fn=do_receipt)
+
+    p = sub.add_parser("recover", help="read-only search (this machine, then recovery_hosts) for an unowned reply")
+    p.add_argument("inbound_id", type=int)
+    p.add_argument("--query", action="append", help="additional literal artifact ID or exact title")
+    p.add_argument("--refresh", action="store_true", help="explicitly repeat a previously saved search")
+    p.set_defaults(fn=do_recover)
+
+    a = ap.parse_args(argv)
+    cfg = config.load()
+    if cfg.get("mail_proxy") and a.cmd != "rpc":
+        if a.cmd not in ("send", "reply", "sent", "inbox", "show", "receipt"):
+            die("run this administrative command on the desktop")
+        return do_proxy(a, cfg)
+    try:
+        return a.fn(a)
+    except gmail.NoToken as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

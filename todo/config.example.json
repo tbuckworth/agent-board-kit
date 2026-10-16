@@ -1,0 +1,7 @@
+{
+  "repo": "example-user/tasks",
+  "owner_name": "Alex",
+  "owner_email": "owner@example.com",
+  "repos_root": "~/code",
+  "general_repo": "~/code/general"
+}

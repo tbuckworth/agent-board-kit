@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""agent-memwatch: warn the agents holding the most memory before the machine runs out.
+
+    agent-memwatch                               # run forever (systemd/agent-memwatch.service)
+    agent-memwatch --once [--dry-run] [--json]   # one sample; --dry-run sends nothing and saves no state
+
+Every 15 s it reads /proc/meminfo and charges each process's anonymous memory plus swap to the Claude or Codex
+session it descends from (registry.all_sessions, the address book agent-send uses).
+- At 80% of RAM in use it messages the agents holding most of it, via agent-send.
+- At 90%, or with swap half full, it messages them again, urgently, and emails the owner the table.
+- An agent whose own agent-NAME.scope is at 90% of its MemoryMax is told before the cap kills its batch.
+At most one message per agent and level per 30 min, one email per hour; everything re-arms below 75%.
+Settings: config key "memwatch" (~/.config/agent-mail/config.json); defaults and reasons in agentmail/memwatch.py.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import config, memwatch, registry  # noqa: E402
+
+BIN = Path(__file__).resolve().parent
+STATE_PATH = config.STATE_DIR / "memwatch.json"
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
+
+
+def load_state():
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, STATE_PATH)
+
+
+def sample():
+    u = memwatch.usage(memwatch.meminfo())
+    procs = memwatch.processes()
+    sessions = registry.all_sessions()
+    own = memwatch.owners(procs, memwatch.session_pids(sessions, procs), sessions)
+    caps = []
+    for g in own:
+        for cg in sorted(g["cgroups"]) if g["session"] else ():
+            leaf = cg.rsplit("/", 1)[-1]
+            if leaf.startswith("agent-") and leaf.endswith(".scope"):
+                cur, mx = memwatch.cgroup_limits(cg)
+                if cur is not None and mx:
+                    caps.append((g, cur, mx))
+    return u, own, caps
+
+
+def act(actions, cfg):
+    for a in actions:
+        if a[0] == "ping":
+            g, lvl, text = a[1], a[2], a[3]
+            r = subprocess.run([sys.executable, str(BIN / "agent-send"), "--from", "agent-memwatch", g["session"]["id"], text],
+                               capture_output=True, text=True, timeout=60)
+            log("ping %s (%s, level %s): exit %s %s" % (g["label"], memwatch.gb(g["mem"]), lvl, r.returncode,
+                                                         (r.stdout + r.stderr).strip()[-160:]))
+        else:
+            to = cfg.get("alert_to") or config.owner_email(cfg)
+            if not to:
+                continue
+            r = subprocess.run([sys.executable, str(BIN / "agent-mail"), "send", "--unrouted", "--to", to,
+                                "--subject", "[agent-memwatch] " + a[1]], input=a[2],
+                               capture_output=True, text=True, timeout=120)
+            log("email %r: exit %s %s" % (a[1], r.returncode, (r.stdout + r.stderr).strip()[-160:]))
+
+
+def report(u, own, caps, actions, as_json):
+    if as_json:
+        print(json.dumps({"usage": u, "level": memwatch.level(u, memwatch.settings(config.load())),
+                          "owners": [{"label": g["label"], "session": (g["session"] or {}).get("id"), "mem": g["mem"],
+                                      "top": g["top"]} for g in own[:15]],
+                          "caps": [{"label": g["label"], "current": c, "max": m} for g, c, m in caps],
+                          "actions": [a[0] if a[0] == "email" else "ping %s level %s" % (a[1]["label"], a[2])
+                                      for a in actions]}, indent=1))
+        return
+    print(memwatch.headline(u))
+    print(memwatch.table(own, 12))
+    for g, c, m in caps:
+        print("cap: %s at %s of %s" % (g["label"], memwatch.gb(c), memwatch.gb(m)))
+    for a in actions:
+        print("would " + ("email %s: " % config.owner_name() + a[1] if a[0] == "email" else "message %s (level %s):\n  %s" % (
+            a[1]["label"], a[2], a[3])))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-memwatch", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--once", action="store_true", help="one sample, then exit")
+    ap.add_argument("--dry-run", action="store_true", help="send nothing, save no state (implies --once)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--interval", type=float, help="seconds between samples (default: config)")
+    a = ap.parse_args(argv)
+    cfg = config.load()
+    s = memwatch.settings(cfg)
+    once = a.once or a.dry_run
+    last_level = None
+    while True:
+        try:
+            u, own, caps = sample()
+            state = load_state()
+            actions, new_state = memwatch.decide(state, u, own, caps, s, time.time())
+            lvl = memwatch.level(u, s)
+            if once:
+                report(u, own, caps, actions, a.json)
+            elif lvl != last_level and (lvl or last_level):
+                log("level %s: %s" % (lvl, memwatch.headline(u)))
+            last_level = lvl
+            if not a.dry_run:
+                act(actions, cfg)
+                if new_state != state:
+                    save_state(new_state)
+        except Exception as e:  # noqa: BLE001 - a watch must outlive one bad sample
+            log("error: %s: %s" % (type(e).__name__, e))
+            if once:
+                return 1
+        if once:
+            return 0
+        time.sleep(a.interval or s["interval_seconds"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

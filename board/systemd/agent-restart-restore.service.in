@@ -1,0 +1,15 @@
+[Unit]
+Description=agent-board: bring the agents back after an agent-restart reboot
+After=default.target
+
+[Service]
+Type=oneshot
+# PATH as a login shell has it: claude, codex, tmux, agent-send and agent-mail in ~/.local/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
+ExecStart={{PYTHON}} {{KIT_DIR}}/board/bin/agent-restart restore
+# the agents it starts must outlive it (their tmux server is also moved out of this unit's cgroup)
+KillMode=process
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

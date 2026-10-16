@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-board-kit: run a team of coding agents from your inbox</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f4f6;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f3f4f6;">
+<tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:680px;background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2933;font-size:15px;line-height:1.55;">
+
+<!-- header -->
+<tr><td style="padding:28px 32px 20px 32px;border-bottom:3px solid #2f6f62;">
+  <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#2f6f62;font-weight:600;">Setup kit</div>
+  <div style="font-size:26px;font-weight:700;margin:4px 0 6px 0;color:#111827;">agent-board-kit</div>
+  <div style="font-size:16px;color:#4b5563;">Run a team of Claude Code and Codex agents on an always-on Linux machine, and manage them from your inbox, a Mac menu-bar board and a GitHub to-do list.</div>
+</td></tr>
+
+<!-- intro -->
+<tr><td style="padding:22px 32px 6px 32px;">
+  <p style="margin:0 0 12px 0;">This is a self-contained, installable copy of an agent setup that is in daily use. Everything specific to the original owner (names, addresses, accounts, machines, paths) has been taken out and replaced by <b>one config file you fill in</b>. The repository holds the code, an installer with a health check, templates for the agents' instructions, and step-by-step setup guides.</p>
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:16px 0 8px 0;"><tr>
+    <td style="background:#2f6f62;border-radius:6px;">
+      <a href="https://github.com/tbuckworth/agent-board-kit" style="display:inline-block;padding:11px 20px;color:#ffffff;text-decoration:none;font-weight:600;">Open the repository &rarr;</a>
+    </td>
+  </tr></table>
+  <p style="margin:6px 0 0 0;font-size:13px;color:#6b7280;">github.com/tbuckworth/agent-board-kit &middot; start with <b>README.md</b>, then <b>docs/</b> in order.</p>
+</td></tr>
+
+<!-- what you get -->
+<tr><td style="padding:18px 32px 4px 32px;">
+  <h2 style="font-size:18px;margin:0 0 10px 0;color:#111827;">What you get</h2>
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+    <tr><td valign="top" style="padding:6px 10px 6px 0;width:22px;color:#2f6f62;font-weight:700;">&#9993;</td>
+        <td style="padding:6px 0;"><b>Email your agents.</b> Every agent mails you from one shared Gmail account. Reply from any device and your reply lands in the exact session that wrote to you, even hours later. Mail no agent owns goes to an <b>orchestrator</b> that starts, relays to and closes agents for you.</td></tr>
+    <tr><td valign="top" style="padding:6px 10px 6px 0;color:#2f6f62;font-weight:700;">&#9881;</td>
+        <td style="padding:6px 0;"><b>One branch, one worktree, one tmux session per agent.</b> <code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#f3f4f6;padding:1px 5px;border-radius:4px;">agent-spawn</code> sets it all up (with a memory cap) and launches Claude Code or Codex with a brief; <code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#f3f4f6;padding:1px 5px;border-radius:4px;">agent-close</code> cleans up, but only once the work is landed.</td></tr>
+    <tr><td valign="top" style="padding:6px 10px 6px 0;color:#2f6f62;font-weight:700;">&#9638;</td>
+        <td style="padding:6px 0;"><b>The agent board.</b> A Mac menu-bar app: every session as a tile coloured by state (busy, waiting on you, blocked, idle, offline), git progress toward main, plan usage, machine load, and right-click actions (message, close, resume, switch model or login).</td></tr>
+    <tr><td valign="top" style="padding:6px 10px 6px 0;color:#2f6f62;font-weight:700;">&#10003;</td>
+        <td style="padding:6px 0;"><b>A to-do list agents can work on.</b> Tasks are issues in a private GitHub repo, edited from a web app or a Mac app. <b>Assign to agent</b> starts an agent on a task; it reports back on the issue and by email.</td></tr>
+    <tr><td valign="top" style="padding:6px 10px 6px 0;color:#2f6f62;font-weight:700;">&#8635;</td>
+        <td style="padding:6px 0;"><b>Free status tracking.</b> Hooks log every turn and agents add one-line milestones; ask "what are the agents up to?" by email for an HTML report.</td></tr>
+  </table>
+</td></tr>
+
+<!-- how it works -->
+<tr><td style="padding:18px 32px 4px 32px;">
+  <h2 style="font-size:18px;margin:0 0 10px 0;color:#111827;">How it fits together</h2>
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e5e7eb;border-radius:8px;">
+    <tr><td style="padding:12px 14px;font-size:14px;">
+      <ol style="margin:0;padding-left:20px;">
+        <li style="margin:3px 0;">You email the agents' Gmail address, or reply to an agent's mail.</li>
+        <li style="margin:3px 0;">The <b>mailroom</b> daemon on the Linux machine polls Gmail every 30 s. It only accepts mail from <b>your</b> address with a valid DKIM signature; everything else is held.</li>
+        <li style="margin:3px 0;">A reply goes to the session that sent the original mail (matched by thread, a per-session tag and plus-address). Anything else goes to the orchestrator: one fresh <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">claude -p</code> run with its brief and a small memory file.</li>
+        <li style="margin:3px 0;">Agents work in their own worktrees and tmux sessions, write status notes, open PRs, and mail you when they are done or blocked.</li>
+        <li style="margin:3px 0;">The Mac apps talk to the Linux machine over one SSH connection; nothing listens on a port.</li>
+      </ol>
+    </td></tr>
+  </table>
+</td></tr>
+
+<!-- what you need -->
+<tr><td style="padding:18px 32px 4px 32px;">
+  <h2 style="font-size:18px;margin:0 0 10px 0;color:#111827;">What you need</h2>
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;font-size:14px;">
+    <tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;width:38%;"><b>An always-on Linux machine</b></td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">Ubuntu 22.04/24.04 with systemd; 32&nbsp;GB RAM is comfortable. A desktop, home server or cloud VM.</td></tr>
+    <tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;"><b>A new Gmail account</b></td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">Just for the agents, e.g. <i>yourname.agents@gmail.com</i>.</td></tr>
+    <tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;"><b>A Google Cloud project</b></td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">Free. Gmail API on, one "Desktop app" OAuth client. 15 minutes, guided.</td></tr>
+    <tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;"><b>GitHub</b></td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;"><code style="font-family:Menlo,Consolas,monospace;font-size:13px;">gh</code> logged in; a private <i>tasks</i> repo for the to-do list.</td></tr>
+    <tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;"><b>Claude Code</b></td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">A Claude plan or API key. Codex is optional; agents can run on either.</td></tr>
+    <tr><td style="padding:7px 10px;"><b>A Mac (optional)</b></td><td style="padding:7px 10px;">For the menu-bar board and to-do app (macOS 13+, Command Line Tools). Tailscale makes the SSH link easy.</td></tr>
+  </table>
+</td></tr>
+
+<!-- quick start -->
+<tr><td style="padding:18px 32px 4px 32px;">
+  <h2 style="font-size:18px;margin:0 0 10px 0;color:#111827;">Quick start</h2>
+  <p style="margin:0 0 10px 0;font-size:14px;">First, once: create the agents' Gmail account, a Google Cloud project with the Gmail API and its OAuth client file (<a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/02-agent-gmail.md" style="color:#2f6f62;">docs/02</a>, steps 1&ndash;3), and a private to-do repo (<code style="font-family:Menlo,Consolas,monospace;font-size:13px;">gh repo create you/tasks --private</code>). Then, on the Linux machine:</p>
+  <div style="background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-family:Menlo,Consolas,'Courier New',monospace;font-size:12.5px;line-height:1.6;white-space:pre-wrap;">git clone https://github.com/tbuckworth/agent-board-kit ~/code/agent-board-kit
+cd ~/code/agent-board-kit
+./install.sh                     <span style="color:#9ca3af;"># creates kit.env</span>
+nano ~/.config/agent-kit/kit.env <span style="color:#9ca3af;"># fill in your values</span>
+./install.sh                     <span style="color:#9ca3af;"># installs (starts nothing)</span>
+agent-mail-auth                  <span style="color:#9ca3af;"># Gmail consent, once</span>
+./install.sh --start --labels    <span style="color:#9ca3af;"># start mailroom, make labels</span>
+loginctl enable-linger $USER     <span style="color:#9ca3af;"># keep services up</span>
+kit doctor --online              <span style="color:#9ca3af;"># all green?</span></div>
+  <p style="margin:10px 0 0 0;font-size:14px;">Then email the agents' address from your own: <i>"Start an agent in my general repo that lists the five largest files and emails me the result."</i> Reply to its mail and the agent gets your reply.</p>
+</td></tr>
+
+<!-- step by step -->
+<tr><td style="padding:18px 32px 4px 32px;">
+  <h2 style="font-size:18px;margin:0 0 10px 0;color:#111827;">Step by step</h2>
+  <p style="margin:0 0 8px 0;font-size:14px;color:#4b5563;">Each step has its own guide in the repository's <b>docs/</b> folder.</p>
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="font-size:14px;">
+    <tr><td valign="top" style="padding:7px 12px 7px 0;width:28px;"><div style="background:#2f6f62;color:#fff;border-radius:50%;width:24px;height:24px;line-height:24px;text-align:center;font-weight:700;font-size:13px;">1</div></td>
+        <td style="padding:7px 0;"><b>Prerequisites.</b> Install git, tmux, python3-venv, the GitHub CLI and Claude Code on the Linux machine; <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">gh auth login</code>; log in to Claude Code. <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/01-prerequisites.md" style="color:#2f6f62;">docs/01-prerequisites.md</a></td></tr>
+    <tr><td valign="top" style="padding:7px 12px 7px 0;"><div style="background:#2f6f62;color:#fff;border-radius:50%;width:24px;height:24px;line-height:24px;text-align:center;font-weight:700;font-size:13px;">2</div></td>
+        <td style="padding:7px 0;"><b>The agents' Gmail.</b> Create the account; in Google Cloud enable the Gmail API, set up the consent screen (External), add the <i>gmail.modify</i> scope, <b>publish the app</b> (a "Testing" app's tokens expire every 7 days), create a Desktop OAuth client and save its JSON as <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">~/.config/agent-mail/credentials.json</code>. <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/02-agent-gmail.md" style="color:#2f6f62;">docs/02-agent-gmail.md</a></td></tr>
+    <tr><td valign="top" style="padding:7px 12px 7px 0;"><div style="background:#2f6f62;color:#fff;border-radius:50%;width:24px;height:24px;line-height:24px;text-align:center;font-weight:700;font-size:13px;">3</div></td>
+        <td style="padding:7px 0;"><b>Install.</b> Clone, fill in <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">kit.env</code>, run <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">./install.sh</code> (idempotent, <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">--dry-run</code> shows every change and backups are kept), give Gmail consent with <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">agent-mail-auth</code> (works over SSH on a headless box), then <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">./install.sh --start</code> and <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">loginctl enable-linger $USER</code>. <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/03-install.md" style="color:#2f6f62;">docs/03-install.md</a></td></tr>
+    <tr><td valign="top" style="padding:7px 12px 7px 0;"><div style="background:#2f6f62;color:#fff;border-radius:50%;width:24px;height:24px;line-height:24px;text-align:center;font-weight:700;font-size:13px;">4</div></td>
+        <td style="padding:7px 0;"><b>Claude Code and Codex.</b> The installer adds status hooks, <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">crossSessionInbound: accept</code> and the agents' global instructions. Optional: a second Claude login with routing by remaining usage and automatic failover. <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/04-claude-and-codex.md" style="color:#2f6f62;">docs/04-claude-and-codex.md</a></td></tr>
+    <tr><td valign="top" style="padding:7px 12px 7px 0;"><div style="background:#2f6f62;color:#fff;border-radius:50%;width:24px;height:24px;line-height:24px;text-align:center;font-weight:700;font-size:13px;">5</div></td>
+        <td style="padding:7px 0;"><b>Daily use.</b> Email commands, <code style="font-family:Menlo,Consolas,monospace;font-size:13px;">agent-spawn</code>, tmux and worktree conventions, status reports, closing agents. <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/05-daily-use.md" style="color:#2f6f62;">docs/05-daily-use.md</a></td></tr>
+    <tr><td valign="top" style="padding:7px 12px 7px 0;"><div style="background:#2f6f62;color:#fff;border-radius:50%;width:24px;height:24px;line-height:24px;text-align:center;font-weight:700;font-size:13px;">6</div></td>
+        <td style="padding:7px 0;"><b>To-do list.</b> Create a private <i>tasks</i> repo, create its labels (<code style="font-family:Menlo,Consolas,monospace;font-size:13px;">--labels</code>), host the web app anywhere static (it keeps a fine-grained GitHub token in your browser only), optionally build the Mac app. <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/06-todo.md" style="color:#2f6f62;">docs/06-todo.md</a></td></tr>
+    <tr><td valign="top" style="padding:7px 12px 7px 0;"><div style="background:#2f6f62;color:#fff;border-radius:50%;width:24px;height:24px;line-height:24px;text-align:center;font-weight:700;font-size:13px;">7</div></td>
+        <td style="padding:7px 0;"><b>The Mac.</b> An SSH alias to the Linux machine, then build and install the agent board and to-do apps on the Mac itself (SwiftPM, no Xcode). Mac Claude/Codex sessions can mail through the Linux machine too. <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/07-mac.md" style="color:#2f6f62;">docs/07-mac.md</a></td></tr>
+    <tr><td valign="top" style="padding:7px 12px 7px 0;"><div style="background:#b45309;color:#fff;border-radius:50%;width:24px;height:24px;line-height:24px;text-align:center;font-weight:700;font-size:13px;">!</div></td>
+        <td style="padding:7px 0;"><b>Read the security model first.</b> Agents run without permission prompts, and email can start them. Only your address with a DKIM pass is trusted; use a dedicated machine or user if you can. <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/08-security.md" style="color:#2f6f62;">docs/08-security.md</a> &middot; problems: <a href="https://github.com/tbuckworth/agent-board-kit/blob/main/docs/09-troubleshooting.md" style="color:#2f6f62;">docs/09-troubleshooting.md</a></td></tr>
+  </table>
+</td></tr>
+
+<!-- core vs optional -->
+<tr><td style="padding:18px 32px 4px 32px;">
+  <h2 style="font-size:18px;margin:0 0 10px 0;color:#111827;">Core and optional parts</h2>
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;font-size:14px;">
+    <tr style="background:#f9fafb;"><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;font-weight:600;">Core</td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">mailroom and agent commands, orchestrator, global agent instructions and hooks, agent board, to-do list with Assign to agent</td></tr>
+    <tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;font-weight:600;">Optional</td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">several Claude logins with usage routing and failover; per-agent memory caps and RAM warnings; restart-and-resume after OS updates; collaborators' agents as a second, guarded sender tier; Mac sessions mailing through the Linux machine; <b>cloud-watchdog</b> for paid GPU/cloud resources agents launch</td></tr>
+    <tr><td style="padding:7px 10px;font-weight:600;">Linux only</td><td style="padding:7px 10px;">the server side uses systemd and /proc. The Mac is a client; running the mailroom on macOS is untested.</td></tr>
+  </table>
+</td></tr>
+
+<!-- footer -->
+<tr><td style="padding:22px 32px 28px 32px;">
+  <p style="margin:0;font-size:13px;color:#6b7280;border-top:1px solid #e5e7eb;padding-top:14px;">Everything personal lives in <code style="font-family:Menlo,Consolas,monospace;font-size:12px;">~/.config/agent-kit/kit.env</code>; tokens stay in mode-600 files on your machine. Updating is <code style="font-family:Menlo,Consolas,monospace;font-size:12px;">git pull &amp;&amp; ./install.sh</code>. <code style="font-family:Menlo,Consolas,monospace;font-size:12px;">kit doctor</code> checks the whole installation and prints the fix for anything that fails.</p>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>

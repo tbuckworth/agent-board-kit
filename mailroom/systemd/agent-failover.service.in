@@ -1,0 +1,18 @@
+[Unit]
+Description=agent-failover: move Claude agents to another login when theirs hits a usage limit, and back after it resets
+
+[Service]
+Type=simple
+ExecStart={{PYTHON}} {{KIT_DIR}}/mailroom/bin/agent-failover
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+# claude, codex, tmux and agent-* live in ~/.local/bin; systemd --user does not read ~/.bashrc
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# It only reads transcript tails and occasionally plan usage; it must never be part of a memory problem.
+MemoryMax=256M
+# A restart must not take the agents it relaunched with it: they run in their own tmux panes and scopes.
+KillMode=process
+
+[Install]
+WantedBy=default.target
