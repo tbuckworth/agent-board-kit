@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """agent-mail: send email from the agents account so that replies route back to you.
 
-    agent-mail send --to ADDR [--cc ADDR] --subject S [--body-file F] [--html F]
+    agent-mail send --to ADDR [--cc ADDR] --subject S [--body-file F] [--html F] [--image NAME=PNG ...]
                     [--session NAME_OR_ID] [--cli claude|codex] [--unrouted]   # body on stdin otherwise
-    agent-mail reply INBOUND_ID [--body-file F] [--html F]           # body on stdin otherwise
+    agent-mail reply INBOUND_ID [--body-file F] [--html F] [--image NAME=PNG ...]   # body on stdin otherwise
+    agent-mail guide                           # how to write mail to the owner; read it before a results mail
+    agent-mail withdraw                        # drop your mail that the pre-send review sent back
     agent-mail sent [--limit N]
     agent-mail inbox [--held] [--limit N]
     agent-mail show INBOUND_ID
@@ -22,21 +24,35 @@ reply. Each session gets a stable reply tag; the mail carries it in Reply-To
 Every mail is multipart/alternative: the plain text as given, plus an HTML part. Without
 --html the HTML is rendered from the text (paragraphs, bullet and numbered lists, fenced code,
 **bold**, `code`); --html FILE supplies it instead.
+
+Mail to the owner (and, by default, to collaborators and anyone else) is reviewed before it leaves
+(agentmail/review.py): a model with no context reads it as its reader would and, once per mail, sends it
+back with concrete fixes (NOT SENT, exit 3). Fix it and run the command again; the next mail always goes.
+--no-review "why" skips the review. A mail that contains a credential is held every time.
+
+Plots, screenshots and GIFs go inline with --image NAME=PATH (repeatable; PNG, JPEG, GIF or WebP).
+Place one in your HTML with <img src="cid:NAME" alt="what it shows" style="max-width:100%">; an image
+the HTML does not reference is shown at the end of the mail. Never use data: URIs (Gmail strips them)
+or links to files on this machine (the reader is often on a phone).
 """
 import argparse
+import base64
 import contextlib
 import hashlib
 import io
 import json
+import mimetypes
 import os
+import re
 import sys
+import time
 import uuid
 from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import config, deliver, gmail, remote, routing  # noqa: E402
+from agentmail import config, deliver, gmail, remote, review, routing  # noqa: E402
 from agentmail.compose import text_to_html  # noqa: E402
 from agentmail.store import Store  # noqa: E402
 
@@ -99,9 +115,92 @@ def session_label(sess):
     return (name[:40] if name else sid[:8]) + " (%s%s)" % (sess["cli"], "@" + host if host and host != _local_host() else "")
 
 
+IMAGE_TYPES = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpeg"), (b"GIF87a", "gif"), (b"GIF89a", "gif"))
+MAX_IMAGES_BYTES = 20 * 1024 * 1024
+
+
+def image_subtype(data):
+    for magic, sub in IMAGE_TYPES:
+        if data.startswith(magic):
+            return sub
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def load_images(specs):
+    """--image NAME=PATH values as [(name, bytes)], checked: unique names, real image files, size cap."""
+    out, total = [], 0
+    for spec in specs or ():
+        name, sep, path = spec.partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name):
+            die("--image wants NAME=PATH with NAME made of letters, digits, _ . - (got %r)" % spec)
+        if any(n == name for n, _ in out):
+            die("--image name %r given twice" % name)
+        try:
+            data = Path(os.path.expanduser(path)).read_bytes()
+        except OSError as e:
+            die("--image %s: %s" % (name, e))
+        if not image_subtype(data):
+            die("--image %s: %s is not a PNG, JPEG, GIF or WebP file" % (name, path))
+        total += len(data)
+        out.append((name, data))
+    if total > MAX_IMAGES_BYTES:
+        die("images total %.1f MB; keep them under %d MB (Gmail's limit is 25 MB)" % (total / 1e6, MAX_IMAGES_BYTES >> 20))
+    return out
+
+
+def load_files(paths):
+    """--attach PATH values as [(filename, bytes)] for ordinary attachments (PDF, zip, CSV...)."""
+    out = []
+    for path in paths or ():
+        f = Path(os.path.expanduser(path))
+        try:
+            out.append((f.name, f.read_bytes()))
+        except OSError as e:
+            die("--attach %s: %s" % (path, e))
+    if sum(len(d) for _, d in out) > MAX_IMAGES_BYTES:
+        die("attachments total over %d MB; share a Drive link instead" % (MAX_IMAGES_BYTES >> 20))
+    return out
+
+
+def b64(items):
+    return [{"name": n, "data": base64.b64encode(d).decode()} for n, d in items or ()]
+
+
+def unb64(items):
+    return [(i["name"], base64.b64decode(i["data"])) for i in items or ()]
+
+
+def outgoing(a):
+    """Body, HTML, inline images and attachments of a send/reply, from the flags or a proxied request."""
+    text = read_body(a.body_file)
+    html_body = Path(a.html).read_text() if a.html else getattr(a, "html_body", None)
+    images = getattr(a, "images_data", None) or load_images(getattr(a, "image", None))
+    files = getattr(a, "files_data", None) or load_files(getattr(a, "attach", None))
+    if sum(len(d) for _, d in images + files) > MAX_IMAGES_BYTES:
+        die("images and attachments total over %d MB" % (MAX_IMAGES_BYTES >> 20))
+    return text, html_body, images, files
+
+
+def transmit(cfg, st, svc, row, to, cc, subject, text, html_body, images, files, inb=None):
+    """Compose, send and record one routed mail from the session behind `row`. Returns the Gmail result
+    and the real Message-ID."""
+    msg = compose(cfg, session_label(dict(row)), to, cc, subject, text, html_body, reply_to_tag=row["tag"],
+                  in_reply_to=inb["message_id"] if inb else None, references=inb["message_id"] if inb else None,
+                  images=images, files=files)
+    res = gmail.send_raw(svc, msg.as_bytes(), thread_id=inb["thread_id"] if inb else None)
+    meta = gmail.get_metadata(svc, res["id"], ["Message-ID"])
+    mid = gmail.headers(meta).get("message-id")
+    st.record_sent(row["tag"], res["id"], res["threadId"], mid, to, subject,
+                   in_reply_to_inbound=inb["id"] if inb else None)
+    return res, mid
+
+
 def compose(cfg, from_label, to, cc, subject, text, html_body=None, reply_to_tag=None,
-            in_reply_to=None, references=None):
-    """One multipart/alternative message: the text as given, plus html_body or HTML rendered from the text."""
+            in_reply_to=None, references=None, images=(), files=()):
+    """One multipart/alternative message: the text as given, plus html_body or HTML rendered from the text.
+    Images ride as multipart/related parts of the HTML, each with Content-ID <NAME>."""
     account = config.require_account(cfg)
     msg = EmailMessage()
     msg["From"] = formataddr(("%s (%s)" % (cfg["from_name"], from_label), account))
@@ -116,7 +215,24 @@ def compose(cfg, from_label, to, cc, subject, text, html_body=None, reply_to_tag
         msg["In-Reply-To"] = in_reply_to
         msg["References"] = references or in_reply_to
     msg.set_content(text)
-    msg.add_alternative(html_body or text_to_html(text), subtype="html")
+    html_body = html_body or text_to_html(text)
+    unplaced = [n for n, _ in images if not re.search(r"""cid:%s["'\s>]""" % re.escape(n), html_body)]
+    if unplaced:
+        tail = "".join('<p><img src="cid:%s" alt="%s" style="max-width:100%%;height:auto"></p>\n' % (n, n)
+                       for n in unplaced)
+        i = html_body.lower().rfind("</body>")
+        html_body = html_body[:i] + tail + html_body[i:] if i >= 0 else html_body + tail
+    msg.add_alternative(html_body, subtype="html")
+    if images:
+        html_part = msg.get_payload()[1]
+        for name, data in images:
+            html_part.add_related(data, maintype="image", subtype=image_subtype(data), cid="<%s>" % name,
+                                  filename="%s.%s" % (name, image_subtype(data).replace("jpeg", "jpg")),
+                                  disposition="inline")
+    for name, data in files:
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        maintype, subtype = ctype.split("/", 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
     return msg
 
 
@@ -140,11 +256,10 @@ def do_send(a):
         die("unrouted SSH sends lose the originating session. Run agent-mail locally on the Mac "
             "with --session so the supported proxy preserves ownership.")
     st = Store()
-    text = read_body(a.body_file)
-    html_body = Path(a.html).read_text() if a.html else getattr(a, "html_body", None)
-    svc = gmail.service()
+    text, html_body, images, files = outgoing(a)
     if a.unrouted:
-        msg = compose(cfg, "mailroom", a.to, a.cc, a.subject, text, html_body)
+        svc = gmail.service()
+        msg = compose(cfg, "mailroom", a.to, a.cc, a.subject, text, html_body, images=images, files=files)
         res = gmail.send_raw(svc, msg.as_bytes())
         meta = gmail.get_metadata(svc, res["id"], ["Message-ID"])
         st.record_sent("", res["id"], res["threadId"], gmail.headers(meta).get("message-id"), a.to, a.subject)
@@ -154,15 +269,29 @@ def do_send(a):
     row = st.session_for(sess["cli"], sess["id"], sess.get("name", ""), sess.get("cwd", ""),
                          sess.get("host", cfg["host_id"]))
     tag = row["tag"]
+    rid, stop, tips = review.gate(cfg, st, tag, [a.to, a.cc], a.subject, text, html_body, images,
+                            no_review=getattr(a, "no_review", None),
+                            draft={"op": "send", "to": a.to, "cc": a.cc, "subject": a.subject, "text": text,
+                                   "html": html_body, "images": b64(images), "files": b64(files)})
+    if stop:
+        print(stop)
+        return 3
     subject = routing.tag_subject(a.subject, tag)
-    msg = compose(cfg, session_label(sess), a.to, a.cc, subject, text, html_body, reply_to_tag=tag)
-    res = gmail.send_raw(svc, msg.as_bytes())
-    meta = gmail.get_metadata(svc, res["id"], ["Message-ID"])
-    mid = gmail.headers(meta).get("message-id")
-    st.record_sent(tag, res["id"], res["threadId"], mid, a.to, subject)
+    res, mid = transmit(cfg, st, gmail.service(), row, a.to, a.cc, subject, text, html_body, images, files)
+    if rid:
+        st.review_sent(rid, mid)
     print("sent to %s | subject %r | thread %s | tag %s | from %s"
-          % (a.to, subject, res["threadId"], tag, session_label(sess)))
+          % (a.to, subject, res["threadId"], tag, session_label(dict(row))))
+    if tips:
+        print(tips)
     return 0
+
+
+def reply_subject(inb, tag):
+    subject = inb["subject"] or ""
+    if not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+    return routing.tag_subject(subject, tag)
 
 
 def do_reply(a):
@@ -181,21 +310,79 @@ def do_reply(a):
         sess = resolve_session(a.session, a.cli)
         row = st.session_for(sess["cli"], sess["id"], sess.get("name", ""), sess.get("cwd", ""), cfg["host_id"])
     tag = row["tag"]
-    text = read_body(a.body_file)
-    html_body = Path(a.html).read_text() if a.html else getattr(a, "html_body", None)
-    subject = inb["subject"] or ""
-    if not subject.lower().startswith("re:"):
-        subject = "Re: " + subject
-    subject = routing.tag_subject(subject, tag)
-    label = session_label(dict(row))
-    msg = compose(cfg, label, inb["from_addr"], None, subject, text, html_body, reply_to_tag=tag,
-                  in_reply_to=inb["message_id"], references=inb["message_id"])
-    svc = gmail.service()
-    res = gmail.send_raw(svc, msg.as_bytes(), thread_id=inb["thread_id"])
-    meta = gmail.get_metadata(svc, res["id"], ["Message-ID"])
-    mid = gmail.headers(meta).get("message-id")
-    st.record_sent(tag, res["id"], res["threadId"], mid, inb["from_addr"], subject, in_reply_to_inbound=inb["id"])
-    print("replied to %s | subject %r | thread %s | from %s" % (inb["from_addr"], subject, res["threadId"], label))
+    text, html_body, images, files = outgoing(a)
+    subject = reply_subject(inb, tag)
+    rid, stop, tips = review.gate(cfg, st, tag, [inb["from_addr"]], inb["subject"] or "", text, html_body, images,
+                            no_review=getattr(a, "no_review", None),
+                            draft={"op": "reply", "inbound_id": inb["id"], "text": text, "html": html_body,
+                                   "images": b64(images), "files": b64(files)})
+    if stop:
+        print(stop)
+        return 3
+    res, mid = transmit(cfg, st, gmail.service(), row, inb["from_addr"], None, subject, text, html_body,
+                        images, files, inb=inb)
+    if rid:
+        st.review_sent(rid, mid)
+    print("replied to %s | subject %r | thread %s | from %s"
+          % (inb["from_addr"], subject, res["threadId"], session_label(dict(row))))
+    if tips:
+        print(tips)
+    return 0
+
+
+def do_guide(a):
+    print(review.RULES_PATH.read_text().replace("{{OWNER_NAME}}", config.owner_name(config.load())), end="")
+    return 0
+
+
+def own_tag(a, cfg, st):
+    sess = getattr(a, "origin", None) or resolve_session(a.session, a.cli)
+    return st.session_for(sess["cli"], sess["id"], sess.get("name", ""), sess.get("cwd", ""),
+                          sess.get("host", cfg["host_id"]))["tag"]
+
+
+def do_withdraw(a):
+    """Drop this session's mail that the review sent back, so the mailroom does not send it later."""
+    cfg, st = config.load(), Store()
+    tag = own_tag(a, cfg, st)
+    last = st.held_draft(tag)
+    if last is None:
+        print("nothing to withdraw: no mail from this session is waiting on a revision")
+        return 0
+    st.con.execute("update reviews set draft=null where id=?", (last["id"],))
+    st.record_review(tag, last["round"], "withdrawn", last["subject"], kind=last["kind"], audience=last["audience"])
+    print("withdrawn: %r will not be sent" % last["subject"])
+    return 0
+
+
+def do_flush_drafts(a):
+    """Send, unchanged, every held draft whose session neither revised nor withdrew it in time (the daemon
+    runs this). The mail says so at the top."""
+    cfg, st = config.load(), Store()
+    s = review.settings(cfg)
+    stale = st.stale_drafts(time.time() - 60 * s["fallback_minutes"])
+    svc = gmail.service() if stale else None
+    for r in stale:
+        d = json.loads(r["draft"])
+        row = st.session_by_tag(r["tag"])
+        inb = st.inbound(d["inbound_id"]) if d.get("op") == "reply" else None
+        if row is None or (d.get("op") == "reply" and inb is None):
+            st.con.execute("update reviews set draft=null where id=?", (r["id"],))
+            continue
+        text, html_body = d["text"], d.get("html")
+        if (r["audience"] or "owner") == "owner":  # the note is for the owner; anyone else just gets the mail
+            note = review.EXPIRED_NOTE % s["fallback_minutes"]
+            text, html_body = note + "\n\n" + text, review.prepend_note(html_body, note)
+        if inb:
+            to, cc, subject = inb["from_addr"], None, reply_subject(inb, r["tag"])
+        else:
+            to, cc, subject = d["to"], d.get("cc"), routing.tag_subject(d["subject"], r["tag"])
+        res, mid = transmit(cfg, st, svc, row, to, cc, subject, text, html_body, unb64(d.get("images")),
+                            unb64(d.get("files")), inb=inb)
+        rid = st.record_review(r["tag"], r["round"], "expired", r["subject"], kind=r["kind"], audience=r["audience"])
+        st.review_sent(rid, mid)
+        print("sent held draft %r from %s unchanged (no revision in %d min)"
+              % (r["subject"], session_label(dict(row)), s["fallback_minutes"]))
     return 0
 
 
@@ -287,11 +474,13 @@ def do_release(a):
 def do_proxy(a, cfg):
     """Resolve on the origin machine, then send data to the central mailroom."""
     operation = a.cmd
-    fields = {k: getattr(a, k) for k in ("to", "cc", "subject", "inbound_id", "limit", "held")
+    fields = {k: getattr(a, k) for k in ("to", "cc", "subject", "inbound_id", "limit", "held", "no_review")
               if hasattr(a, k)}
     if operation == "receipt":
         fields["request_id"] = a.request_id
     payload = {"op": "mail", "action": operation, "args": fields}
+    if operation == "withdraw":
+        payload["origin"] = remote.identity(dict(resolve_session(a.session, a.cli), host=cfg["host_id"]))
     if operation in ("send", "reply"):
         if getattr(a, "unrouted", False):
             die("proxy mail requires an origin session; --unrouted is not supported")
@@ -299,6 +488,8 @@ def do_proxy(a, cfg):
         payload["origin"] = remote.identity(dict(sess, host=cfg["host_id"]))
         payload["text"] = read_body(a.body_file)
         payload["html"] = Path(a.html).read_text() if a.html else None
+        payload["images"] = b64(load_images(getattr(a, "image", None)))
+        payload["files"] = b64(load_files(getattr(a, "attach", None)))
         payload["request_id"] = getattr(a, "request_id", None) or str(uuid.uuid4())
         print("proxy request %s (receipt: agent-mail receipt %s)" %
               (payload["request_id"], payload["request_id"]), file=sys.stderr)
@@ -307,7 +498,7 @@ def do_proxy(a, cfg):
     except remote.RemoteError as e:
         die(str(e))
     print(result, end="" if result.endswith("\n") else "\n")
-    return 0
+    return 3 if result.startswith(review.NOT_SENT) else 0
 
 
 def rpc_mail(request, cfg):
@@ -315,11 +506,11 @@ def rpc_mail(request, cfg):
         raise ValueError("this machine is not a central mailroom")
     action = request.get("action")
     handlers = {"send": do_send, "reply": do_reply, "inbox": do_inbox,
-                "show": do_show, "sent": do_sent, "receipt": do_receipt}
+                "show": do_show, "sent": do_sent, "receipt": do_receipt, "withdraw": do_withdraw}
     if action not in handlers:
         raise ValueError("unsupported proxy mail action")
     fields = request.get("args", {})
-    allowed = {"to", "cc", "subject", "inbound_id", "limit", "held", "request_id"}
+    allowed = {"to", "cc", "subject", "inbound_id", "limit", "held", "request_id", "no_review"}
     if not isinstance(fields, dict) or set(fields) - allowed:
         raise ValueError("invalid proxy arguments")
     a = argparse.Namespace(body_file=None, html=None, session=None, cli=None, cc=None,
@@ -327,6 +518,10 @@ def rpc_mail(request, cfg):
     a.__dict__.update(fields)
     st = Store()
     rid = None
+    if action == "withdraw":
+        a.origin = remote.identity(request.get("origin"))
+        if a.origin["host"] != request["source_host"]:
+            raise ValueError("origin host does not match source host")
     if action in ("send", "reply"):
         a.origin = remote.identity(request.get("origin"))
         if a.origin["host"] != request["source_host"]:
@@ -350,6 +545,11 @@ def rpc_mail(request, cfg):
         sys.stdin = io.StringIO(request.get("text", ""))
         # HTML travels as content, never a remote filename.
         a.html_body = request.get("html")
+        a.images_data = unb64(request.get("images"))
+        for name, data in a.images_data:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) or not image_subtype(data):
+                raise ValueError("invalid proxied image")
+        a.files_data = [(Path(n).name, d) for n, d in unb64(request.get("files"))]
         with contextlib.redirect_stdout(out):
             handlers[action](a)
     finally:
@@ -533,6 +733,11 @@ def main(argv=None):
     p.add_argument("--subject", required=True)
     p.add_argument("--body-file")
     p.add_argument("--html", help="HTML alternative body file (default: rendered from the text body)")
+    p.add_argument("--image", action="append", metavar="NAME=PATH",
+                   help="inline image (PNG/JPEG/GIF/WebP); place it with <img src=\"cid:NAME\">, else it goes at the end")
+    p.add_argument("--attach", action="append", metavar="PATH", help="ordinary attachment (PDF, zip, CSV...)")
+    p.add_argument("--no-review", metavar="WHY",
+                   help="skip the pre-send review (urgent, or you disagree with its pushback)")
     p.add_argument("--session", help="sending session name or id (default: this Claude session)")
     p.add_argument("--request-id", help="reuse a proxy request UUID only when checking an uncertain send")
     p.add_argument("--cli", choices=["claude", "codex"])
@@ -544,10 +749,26 @@ def main(argv=None):
     p.add_argument("inbound_id", type=int)
     p.add_argument("--body-file")
     p.add_argument("--html", help="HTML alternative body file (default: rendered from the text body)")
+    p.add_argument("--image", action="append", metavar="NAME=PATH",
+                   help="inline image (PNG/JPEG/GIF/WebP); place it with <img src=\"cid:NAME\">, else it goes at the end")
+    p.add_argument("--attach", action="append", metavar="PATH", help="ordinary attachment (PDF, zip, CSV...)")
+    p.add_argument("--no-review", metavar="WHY",
+                   help="skip the pre-send review (urgent, or you disagree with its pushback)")
     p.add_argument("--session")
     p.add_argument("--request-id", help="proxy request UUID")
     p.add_argument("--cli", choices=["claude", "codex"])
     p.set_defaults(fn=do_reply)
+
+    p = sub.add_parser("guide", help="how to write mail to the owner (the rules the pre-send review checks)")
+    p.set_defaults(fn=do_guide)
+
+    p = sub.add_parser("withdraw", help="drop your mail that the pre-send review sent back, so it is never sent")
+    p.add_argument("--session")
+    p.add_argument("--cli", choices=["claude", "codex"])
+    p.set_defaults(fn=do_withdraw)
+
+    p = sub.add_parser("flush-drafts", help=argparse.SUPPRESS)
+    p.set_defaults(fn=do_flush_drafts)
 
     p = sub.add_parser("sent", help="list outbound mail")
     p.add_argument("--limit", type=int, default=30)
@@ -594,8 +815,8 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     cfg = config.load()
-    if cfg.get("mail_proxy") and a.cmd != "rpc":
-        if a.cmd not in ("send", "reply", "sent", "inbox", "show", "receipt"):
+    if cfg.get("mail_proxy") and a.cmd not in ("rpc", "guide"):
+        if a.cmd not in ("send", "reply", "sent", "inbox", "show", "receipt", "withdraw"):
             die("run this administrative command on the desktop")
         return do_proxy(a, cfg)
     try:

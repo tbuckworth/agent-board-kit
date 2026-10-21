@@ -11,8 +11,12 @@ The last four fall back to the mailroom's ~/.config/agent-mail/config.json.
     todo-desk serve                         JSON lines on stdin and stdout (the protocol is below)
     todo-desk snapshot [--full] [--pretty]  sync the cache and print it
     todo-desk message N [--text T]          print the orchestrator message for task N (sends nothing)
-    todo-desk assign N [--text T] [--again] assign task N to an agent from the command line
-    todo-desk dispatch [--dry-run]          start agents the web app asked for (cron, every 2 min)
+    todo-desk assign N [--text T] [--again] [--to SESSION]
+                                            assign task N to a new agent, or send it to a running one
+    todo-desk dispatch [--dry-run]          start agents the web app asked for (cron, every 2 min),
+                                            then publish-agents
+    todo-desk agents [--pretty]             the agent board's running agents, as the to-do apps list them
+    todo-desk publish-agents [--force]      write them to .todo/agents.json for the web app, if changed
     todo-desk config                        print the settings in effect (no GitHub call); exit 2 if "repo" is unset
 
 Requests carry an "id" that the reply repeats; the helper answers them one at a time, in order:
@@ -30,8 +34,14 @@ Requests carry an "id" that the reply repeats; the helper answers them one at a 
     {"cmd": "config", "ops": [{"op": "add_list"|"remove_list"|"set_group"|"add_group"|"remove_group", ...}]}
     {"cmd": "delete_list", "list"}          its tasks move to "tasks", and it leaves the config
     {"cmd": "comments", "number"}
-    {"cmd": "assign_preview", "number", "text"}
-    {"cmd": "assign", "number", "text", "again": bool}
+    {"cmd": "assign_preview", "number", "text", "to"?: SESSION}
+                                            the orchestrator message, or with "to" the message that agent is sent
+    {"cmd": "assign", "number", "text", "again": bool, "to"?: SESSION}
+                                            with "to", the task goes straight into that running agent (agent-send)
+                                            and the issue gets a "started" marker; without it the orchestrator
+                                            starts a new agent
+    {"cmd": "agents"}                       {"agents": [{id, cli, name, state, folder, note, active, group}],
+                                            "generated"}: the board's live agents, the ones wanting the owner first
     {"cmd": "set_parent", "number", "parent": N|null}
                                             put the task in group N (a GitHub sub-issue of N, replacing any other
                                             parent) or take it out of its group (null), adding or removing the
@@ -95,7 +105,10 @@ MARK_RE = re.compile(r"<!--\s*todo-agent:(assigned|started|done|blocked|failed)\
 # comment starting with the request marker. `todo-desk dispatch` turns each request into a normal assign.
 # The marker is not a MARK_RE kind.
 REQUESTED_LABEL = "status:agent-requested"
-REQUEST_RE = re.compile(r"\A\s*<!--\s*todo-agent-request\s*-->")
+# `to=<session id>` sends the task to that running agent instead of starting a new one
+UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+REQUEST_RE = re.compile(r"\A\s*<!--\s*todo-agent-request(?:\s+to=(?P<to>%s))?\s*-->" % UUID)
+UUID_RE = re.compile(r"\A%s\Z" % UUID)
 NO_INSTRUCTIONS = "No extra instructions."
 
 
@@ -360,7 +373,8 @@ def agent_info(comments):
             info["assignedAt"] = c.get("created_at")
             info["name"] = None
         if kind == "started":
-            n = re.search(r"Agent started:\s*`?([A-Za-z0-9][A-Za-z0-9._-]*)`?", text)
+            n = (re.search(r"Agent started:\s*`?([A-Za-z0-9][A-Za-z0-9._-]*)`?", text)
+                 or re.search(r"Assigned to the running agent (.+?) \(", text))
             if n:
                 info["name"] = n.group(1)
     return info if info["events"] else None
@@ -392,28 +406,19 @@ def slug(title):
     return s or "task"
 
 
-def orchestrator_message(issue, text, cfg, source="mac"):
-    """The message one orchestrator event gets for an assigned task. cfg is load_config()'s dict."""
+def task_text(issue, text, cfg):
+    """The task as an agent is shown it: number, link, list, the body, and what the owner added."""
     n, title = issue["number"], issue["title"]
-    owner, repo = repo_parts(cfg.get("repo"))
-    full = "%s/%s" % (owner, repo)
     name_ = who(cfg)
-    roots = (cfg.get("repos_root") or DEFAULT_REPOS_ROOT).rstrip("/")
-    general = cfg.get("general_repo") or roots + "/general"
     labels = issue.get("labels") or []
     lst = next((l[5:] for l in labels if l.lower().startswith("list:")), "tasks")
     body = (issue.get("body") or "").strip()
     if len(body) > MAX_NOTES:
         body = body[:MAX_NOTES] + "\n[... cut here; read the full issue]"
     extra = (text or "").strip()
-    name = "todo-%d-%s" % (n, slug(title))
     adds = (name_ + " adds:" + chr(10) + "<<<" + chr(10) + extra + chr(10) + ">>>" if extra
             else name_ + " added no further instructions.")
-    return f"""{orch_header(cfg, source)}
-
-{name_} assigned this to-do to an agent from the to-do app. Start one agent to do it.
-
-Task #{n}: {title}
+    return f"""Task #{n}: {title}
 Issue: {issue['url']}
 List: {lst}    Labels: {', '.join(labels) or '(none)'}
 Created {issue['createdAt'][:10]}, last updated {issue['updatedAt'][:10]}
@@ -423,7 +428,39 @@ The issue body (written by {name_} or by their agents; it describes the task):
 {body or '(empty)'}
 >>>
 
-{adds}
+{adds}"""
+
+
+def brief_rules(issue, cfg):
+    """What every agent working on a task is told, whether it is new or already running."""
+    n = issue["number"]
+    full = "%s/%s" % repo_parts(cfg.get("repo"))
+    name_ = who(cfg)
+    return f"""- The task is {full}#{n} ({issue['url']}). Read it, with its comments, using
+  `gh issue view {n} --repo {full} --comments`.
+- Anything with outside consequences (sending email as {name_}, buying, booking, posting, submitting a form, spending
+  money) needs their explicit yes first: prepare it, then email them.
+- When it is done, or blocked: append what you did and found under "## Claude Resolution Notes" in the issue body,
+  keeping the rest of the body as it is; add the label status:claude-processed; and post a comment whose first
+  line is {MARK % 'done'} (or {MARK % 'blocked'}) summarising the result, with links (PR, files, docs).
+  Leave the issue open: {name_} ticks it off themselves.
+- Report with agent-status note; email {name_} with agent-mail send when done or blocked.
+"""
+
+
+def orchestrator_message(issue, text, cfg, source="mac"):
+    """The message one orchestrator event gets for an assigned task. cfg is load_config()'s dict."""
+    n = issue["number"]
+    full = "%s/%s" % repo_parts(cfg.get("repo"))
+    name_ = who(cfg)
+    roots = (cfg.get("repos_root") or DEFAULT_REPOS_ROOT).rstrip("/")
+    general = cfg.get("general_repo") or roots + "/general"
+    name = "todo-%d-%s" % (n, slug(issue["title"]))
+    return f"""{orch_header(cfg, source)}
+
+{name_} assigned this to-do to an agent from the to-do app. Start one agent to do it.
+
+{task_text(issue, text, cfg)}
 
 How to start it:
 - Repo: if the task clearly belongs to an existing repo under {roots}, start the agent there on a new branch off
@@ -438,16 +475,164 @@ How to start it:
 - If you cannot start it, comment on the issue with a body starting {MARK % 'failed'} that says why, and email {name_}.
 
 Put this in the agent's brief, after the task itself:
-- The task is {full}#{n} ({issue['url']}). Read it, with its comments, using
-  `gh issue view {n} --repo {full} --comments`.
-- Anything with outside consequences (sending email as {name_}, buying, booking, posting, submitting a form, spending
-  money) needs their explicit yes first: prepare it, then email them.
-- When it is done, or blocked: append what you did and found under "## Claude Resolution Notes" in the issue body,
-  keeping the rest of the body as it is; add the label status:claude-processed; and post a comment whose first
-  line is {MARK % 'done'} (or {MARK % 'blocked'}) summarising the result, with links (PR, files, docs).
-  Leave the issue open: {name_} ticks it off themselves.
-- Report with agent-status note; email {name_} with agent-mail send when done or blocked.
+{brief_rules(issue, cfg)}"""
+
+
+def running_header(cfg, source="mac"):
+    """The first line of a task sent straight into a running agent: who it is from, and through what."""
+    return "[relayed from %s via the to-do app (%s)]" % (who(cfg), SOURCES[source][1])
+
+
+def running_agent_message(issue, text, cfg, source="mac"):
+    """The task, sent straight into an agent that is already running (Assign to a running agent)."""
+    name_, email = who(cfg), (cfg or {}).get("owner_email")
+    answer = ("agent-mail send --to %s" % email) if email else "agent-mail send"
+    return f"""{running_header(cfg, source)}
+
+{name_} assigned you a to-do from the to-do app.
+
+{task_text(issue, text, cfg)}
+
+{name_} chose you for this task, alongside what you are doing. Fit it in sensibly: finish or checkpoint your current
+step first unless they say it's urgent.
+
+{brief_rules(issue, cfg)}
+(Sent from the to-do app, not by email: there is no thread to reply in. Answer {name_} with {answer} if needed.)
 """
+
+
+# ------------------------------------------------------------------ the agent board's running agents
+# The Mac board's tile groups, if the board stores them on the desktop (the kit's board does not yet): with them,
+# each running agent in the to-do apps' picker shows its group; without them, "group" is null.
+BOARD_GROUPS = HOME / ".local/state/agent-board/groups.json"
+STATE_ORDER = ("waiting", "blocked", "idle", "background", "busy", "stale")
+PUBLISH_EVERY = 300                # seconds between agents.json writes when only states or notes changed
+AGENTS_PATH = ".todo/agents.json"
+
+
+def find_agent_board():
+    """The board's command: on PATH, else the installer's wrapper in ~/.local/bin."""
+    exe = shutil.which("agent-board") or str(HOME / ".local/bin/agent-board")
+    return exe if os.path.exists(exe) else None
+
+
+# The board's own agent rows, without git, PRs or metrics: a few seconds, where `agent-board snapshot` takes much
+# longer, too slow for the dispatch timer every 2 minutes. Gmail's read state is kept when the board has it turned
+# on (as `agent-board snapshot` gets it): without it, an agent whose mail the owner has read would show as waiting on
+# them. Run in a child process (with the board's own python), so the board's code never loads into this one.
+BOARD_ROWS = """import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from agentboard import collect, gmailread
+gmail = gmailread.make()
+col = collect.Collector(gmail=gmail)
+if gmail is not None:
+    col.agents(with_git=False)
+    gmail.refresh()
+    gmail.at = time.time()
+print(json.dumps({"agents": col.agents(with_git=False)[0]}, default=str))
+"""
+
+
+KIT_BOARD = Path(__file__).resolve().parent.parent.parent / "board"     # todo/desk/ -> the kit's board/ component
+
+
+def board_root(exe=None):
+    """The directory holding the board's `agentboard` package: the kit's board/ next to todo/, else the checkout the
+    agent-board command lives in (when it is a symlink to the script rather than the installer's wrapper)."""
+    cands = [KIT_BOARD] + ([Path(os.path.realpath(exe)).parent.parent] if exe else [])
+    return next((str(c) for c in cands if (c / "agentboard" / "__init__.py").exists()), None)
+
+
+def board_snapshot():
+    """{"agents": [the board's rows]}: the same list and states the agent board shows."""
+    exe = find_agent_board()
+    root = board_root(exe)
+    cmds = ([[sys.executable, "-c", BOARD_ROWS, root]] if root else []) + ([[exe, "snapshot"]] if exe else [])
+    if not cmds:                                      # the full snapshot is the fallback
+        raise ValueError("agent-board is not installed on the desktop")
+    err = "no output"
+    for cmd in cmds:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            err = str(e)
+            continue
+        if out.returncode == 0:
+            try:
+                return json.loads(out.stdout)
+            except ValueError:
+                err = "not JSON"
+                continue
+        err = (out.stderr or out.stdout).strip()[-300:]
+    raise ValueError("could not read the agent board: %s" % err)
+
+
+def board_groups(stored):
+    """{session id: "Group" or "Group / Sub-group"} from the board's stored groups (see BOARD_GROUPS)."""
+    out = {}
+    for g in (stored or {}).get("groups") or []:
+        for m in g.get("members") or []:
+            out[m] = g.get("name")
+        for sub in g.get("subgroups") or []:
+            for m in sub.get("members") or []:
+                out[m] = "%s / %s" % (g.get("name"), sub.get("name"))
+    return out
+
+
+def read_board_groups():
+    try:
+        return board_groups(json.loads(BOARD_GROUPS.read_text()))
+    except (OSError, ValueError):
+        return {}
+
+
+def iso_from_ts(ts):
+    if not ts:
+        return None
+    return dt.datetime.fromtimestamp(float(ts), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def agent_records(snapshot, groups=None):
+    """The board's running agents as the to-do apps show them: the ones that most want the owner first (waiting on
+    them, blocked, idle...), then the most recently active."""
+    groups = groups or {}
+    out = []
+    for a in (snapshot or {}).get("agents") or []:
+        if not a.get("live") or a.get("state") not in STATE_ORDER or not UUID_RE.match(a.get("id") or ""):
+            continue
+        folder = os.path.basename((a.get("cwd") or "").rstrip("/"))
+        note = re.sub(r"\s+", " ", (a.get("last_note") or {}).get("text") or "").strip()
+        out.append({"id": a["id"], "cli": a.get("cli") or "claude",
+                    "name": a.get("display") or a.get("name") or folder or a["id"][:8],
+                    "state": a["state"], "folder": folder,
+                    "note": note[:159] + "…" if len(note) > 160 else note,
+                    "active": iso_from_ts(a.get("last_activity")), "group": groups.get(a["id"])})
+    out.sort(key=lambda r: r["active"] or "", reverse=True)
+    out.sort(key=lambda r: STATE_ORDER.index(r["state"]))
+    return out
+
+
+def should_publish(records, last, now):
+    """Write agents.json? Not when nothing but `active` changed. When only states or notes did, at most every
+    PUBLISH_EVERY seconds; at once when an agent came or went. `last` is what was kept after the previous write."""
+    key = [{k: v for k, v in r.items() if k != "active"} for r in records]
+    if last and key == last.get("key"):
+        return False
+    ids = sorted(r["id"] for r in records)
+    return not (last and ids == last.get("ids") and now - last.get("at", 0) < PUBLISH_EVERY)
+
+
+def send_to_agent(cli, sid, text):
+    """agent-send with the full id and the raw message. Not --exact-id: that refuses when a dead login-move leftover
+    shares the id, while plain resolution picks the live one (agent-board's actions.py does the same)."""
+    exe = shutil.which("agent-send") or str(HOME / ".local/bin/agent-send")
+    if not os.path.exists(exe):
+        return 127, "agent-send not found"
+    try:
+        out = subprocess.run([exe, "--raw", "--cli", cli, sid], input=text, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return out.returncode, (out.stdout + out.stderr).strip()
 
 
 def find_orchestrate():
@@ -466,13 +651,15 @@ def audit(entry):
 
 # ------------------------------------------------------------------ the cache and every GitHub operation
 class Desk:
-    def __init__(self, gh=None, cache_path=CACHE_PATH, popen=None, config=None):
+    def __init__(self, gh=None, cache_path=CACHE_PATH, popen=None, config=None, board=None, send=None):
         self.cfg = config if config is not None else load_config()
         self.owner, self.repo = repo_parts(self.cfg.get("repo"))     # before gh: a missing repo is the clearer error
         self.full_name = "%s/%s" % (self.owner, self.repo)
         self.gh = gh or GitHub()
         self.path = Path(cache_path)
         self.popen = popen or subprocess.Popen
+        self.board = board or board_snapshot          # () -> the agent board's snapshot
+        self.send = send or send_to_agent             # (cli, session id, text) -> (exit code, output)
         self.labels = None              # name.lower() -> name
         self.data = {"version": VERSION, "repo": self.full_name, "synced_at": None, "issues": {}, "config": None,
                      "config_sha": None, "config_etag": None, "agents": {}, "full_synced_at": None, "pruned": {}}
@@ -810,16 +997,68 @@ query($owner: String!, $repo: String!, $n: Int!) {
         return moved, cfg
 
     # -- assign to an agent
-    def assign_preview(self, number, text):
+    def assign_preview(self, number, text, to=None, source="mac"):
         issue = self.data["issues"].get(str(number)) or self.fresh(number)
-        return orchestrator_message(issue, text, self.cfg)
+        if to:
+            return running_agent_message(issue, text, self.cfg, source)
+        return orchestrator_message(issue, text, self.cfg, source)
 
-    def assign(self, number, text, again=False, source="mac"):
+    # -- the agent board's running agents (Assign to a running agent)
+    def agents(self):
+        return {"agents": agent_records(self.board(), read_board_groups()), "generated": now_iso()}
+
+    def running_agent(self, sid):
+        """The board's record for a running agent, or ValueError naming it."""
+        if not isinstance(sid, str) or not UUID_RE.match(sid):
+            raise ValueError("not an agent's session id")
+        snap = self.board()
+        rec = next((r for r in agent_records(snap, read_board_groups()) if r["id"] == sid), None)
+        if rec is None:
+            known = next((a for a in (snap or {}).get("agents") or [] if a.get("id") == sid), None)
+            name = (known or {}).get("display") or (known or {}).get("name") or "that agent (%s)" % sid[:8]
+            raise ValueError("%s is no longer running" % name)
+        return rec
+
+    def publish_agents(self, force=False, now=None):
+        """Write the running agents to .todo/agents.json for the web app, which can't reach the board.
+        Only when something changed (see should_publish). Returns True if it wrote."""
+        now = time.time() if now is None else now
+        records = agent_records(self.board(), read_board_groups())
+        path = STATE_DIR / "agents-published.json"
+        try:
+            last = json.loads(path.read_text())
+        except (OSError, ValueError):
+            last = None
+        if last and (last.get("repo") or self.full_name).lower() != self.full_name.lower():
+            last = None                                 # written for another tasks repo
+        if not force and not should_publish(records, last, now):
+            return False
+        where = "/repos/%s/%s/contents/%s" % (self.owner, self.repo, AGENTS_PATH)
+        try:
+            sha = (self.gh.rest("GET", where) or {}).get("sha")
+        except GitHubError as e:
+            if getattr(e, "status", None) != 404:
+                raise
+            sha = None
+        doc = {"v": 1, "updated": now_iso(), "agents": records}
+        put = {"message": "Agents list (todo-desk)",
+               "content": base64.b64encode((json.dumps(doc, indent=2) + "\n").encode()).decode()}
+        if sha:
+            put["sha"] = sha
+        self.gh.rest("PUT", where, put)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"at": now, "repo": self.full_name, "ids": sorted(r["id"] for r in records),
+                                    "key": [{k: v for k, v in r.items() if k != "active"} for r in records]}))
+        return True
+
+    def assign(self, number, text, again=False, source="mac", to=None):
         if not isinstance(number, int) or number <= 0:
             raise ValueError("no such task")
         text = text or ""
         if not isinstance(text, str) or len(text) > MAX_TEXT or "\x00" in text:
             raise ValueError("the instructions are too long or not text")
+        if to:
+            return self.assign_running(number, text, again, source, to)
         exe = find_orchestrate()
         if not exe:
             raise ValueError("agent-orchestrate is not installed on the desktop")
@@ -882,6 +1121,52 @@ query($owner: String!, $repo: String!, $n: Int!) {
             issue = self.store(self.fresh(number))
             return issue, comment.get("html_url"), str(log)
 
+    def assign_running(self, number, text, again, source, to):
+        """Send the task into an agent that is already running on the board, instead of starting one."""
+        agent = self.running_agent(to)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STATE_DIR / "assign.lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            cur = self.fresh(number)
+            if cur["state"] != "OPEN":
+                raise ValueError("#%d is completed; reopen it first" % number)
+            if ASSIGNED_LABEL in cur["labels"] and not again:
+                raise ValueError("#%d is already assigned to an agent; use Assign again to start another" % number)
+            self.ensure_labels([ASSIGNED_LABEL])
+            had_label = ASSIGNED_LABEL in cur["labels"]
+            self.gh.rest("POST", "/repos/%s/%s/issues/%d/labels" % (self.owner, self.repo, number), {"labels": [ASSIGNED_LABEL]})
+
+            def unlabel():
+                if not had_label:
+                    try:
+                        self.gh.rest("DELETE", "/repos/%s/%s/issues/%d/labels/%s"
+                                     % (self.owner, self.repo, number, urllib.parse.quote(ASSIGNED_LABEL, safe="")))
+                    except GitHubError:
+                        pass
+            where = SOURCES[source][0]
+            when = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+            said = "\n".join("> " + l for l in text.strip().split("\n")) if text.strip() else NO_INSTRUCTIONS
+            try:
+                comment = self.gh.rest("POST", "/repos/%s/%s/issues/%d/comments" % (self.owner, self.repo, number), {
+                    "body": "%s\nAssigned to the running agent %s (%s) from %s at %s.\n\n%s's instructions:\n%s"
+                            % (MARK % "started", agent["name"], agent["folder"] or "-", where, when,
+                               self.cfg.get("owner_name") or "The owner", said)})
+            except GitHubError:
+                unlabel()
+                raise
+            code, out = self.send(agent["cli"], agent["id"], running_agent_message(cur, text, self.cfg, source))
+            if code != 0:
+                err = "agent-send failed (%s): %s" % (code, out[-300:] or "no output")
+                self.gh.rest("POST", "/repos/%s/%s/issues/%d/comments" % (self.owner, self.repo, number),
+                             {"body": "%s\nThe task was not sent to %s: %s" % (MARK % "failed", agent["name"], err)})
+                unlabel()
+                audit({"action": "assign", "number": number, "ok": False, "to": agent["id"], "error": err})
+                raise ValueError(err)
+            audit({"action": "assign", "number": number, "ok": True, "chars": len(text), "to": agent["id"],
+                   "name": agent["name"], "again": bool(again), "source": source})
+            issue = self.store(self.fresh(number))
+            return issue, comment.get("html_url"), ""
+
     def dispatch(self, dry_run=False):
         """Turn each open `status:agent-requested` issue into an assign. Only a request comment written by the
         token's own account (the owner's) counts. The label comes off before the agent starts, so a request is
@@ -907,6 +1192,7 @@ query($owner: String!, $repo: String!, $n: Int!) {
                 asks = [c for c in got if REQUEST_RE.match(c.get("body") or "")
                         and ((c.get("user") or {}).get("login") or "").lower() == me]
                 text = REQUEST_RE.sub("", asks[-1]["body"]).strip() if asks else None
+                to = REQUEST_RE.match(asks[-1]["body"]).group("to") if asks else None
                 if text == NO_INSTRUCTIONS:
                     text = ""
                 if dry_run:
@@ -927,12 +1213,15 @@ query($owner: String!, $repo: String!, $n: Int!) {
                     out.append((n, "no request comment"))
                     continue
                 try:
-                    self.assign(n, text[:MAX_TEXT], again=ASSIGNED_LABEL in labels, source="app")
-                    out.append((n, "assigned"))
+                    self.assign(n, text[:MAX_TEXT], again=ASSIGNED_LABEL in labels, source="app", to=to)
+                    out.append((n, "sent to a running agent" if to else "assigned"))
                 except ValueError as e:
-                    if not str(e).startswith(("agent-orchestrate exited", "could not start agent-orchestrate")):
+                    # assign has already said why on the issue when the launch or the send itself failed
+                    if not str(e).startswith(("agent-orchestrate exited", "could not start agent-orchestrate",
+                                              "agent-send failed")):
                         self.gh.rest("POST", "/repos/%s/%s/issues/%d/comments" % (self.owner, self.repo, n), {
-                            "body": "%s\nThe agent was not started: %s" % (MARK % "failed", e)})
+                            "body": "%s\n%s: %s" % (MARK % "failed", "The task was not sent" if to
+                                                     else "The agent was not started", e)})
                     audit({"action": "dispatch", "number": n, "ok": False, "error": str(e)})
                     out.append((n, "failed: %s" % e))
             return out
@@ -1056,10 +1345,13 @@ class Server:
         if cmd == "comment":
             return {"url": d.comment(int(req["number"]), req.get("body"))}
         if cmd == "assign_preview":
-            return {"message": d.assign_preview(int(req["number"]), req.get("text") or "")}
+            return {"message": d.assign_preview(int(req["number"]), req.get("text") or "", req.get("to") or None)}
         if cmd == "assign":
-            issue, url, log = d.assign(int(req["number"]), req.get("text") or "", bool(req.get("again")))
+            issue, url, log = d.assign(int(req["number"]), req.get("text") or "", bool(req.get("again")),
+                                       to=req.get("to") or None)
             return {"issue": issue, "comment": url, "log": log}
+        if cmd == "agents":
+            return d.agents()
         if cmd == "ping":
             return {"pong": True}
         raise ValueError("unknown command %r" % (cmd,))
@@ -1144,8 +1436,13 @@ def main(argv=None):
     p.add_argument("number", type=int)
     p.add_argument("--text", default="")
     p.add_argument("--again", action="store_true")
+    p.add_argument("--to", help="a running agent's session id: send it the task instead of starting an agent")
     p = sub.add_parser("dispatch")
     p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("agents")
+    p.add_argument("--pretty", action="store_true")
+    p = sub.add_parser("publish-agents")
+    p.add_argument("--force", action="store_true", help="write even if nothing changed")
     sub.add_parser("config")
     a = ap.parse_args(argv)
     if a.cmd == "config":
@@ -1178,11 +1475,23 @@ def main(argv=None):
         print(desk.assign_preview(a.number, a.text))
         return 0
     if a.cmd == "assign":
-        issue, url, log = desk.assign(a.number, a.text, a.again)
-        print("assigned #%d: %s (log %s)" % (a.number, url, log))
+        issue, url, log = desk.assign(a.number, a.text, a.again, to=a.to)
+        print("assigned #%d: %s%s" % (a.number, url, " (log %s)" % log if log else ""))
         return 0
     if a.cmd == "dispatch":
         for n, outcome in desk.dispatch(dry_run=a.dry_run):
             print("%s #%d: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), n, outcome))
+        if not a.dry_run:
+            try:                                          # the web app's list of agents; never fails dispatch
+                if desk.publish_agents():
+                    print("%s published the agents list" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            except Exception as e:                        # noqa: BLE001
+                print("%s agents list not published: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), e))
+        return 0
+    if a.cmd == "agents":
+        print(json.dumps(desk.agents(), indent=2 if a.pretty else None))
+        return 0
+    if a.cmd == "publish-agents":
+        print("published" if desk.publish_agents(force=a.force) else "unchanged; nothing written")
         return 0
     return 1

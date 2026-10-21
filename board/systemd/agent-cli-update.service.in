@@ -1,0 +1,9 @@
+[Unit]
+Description=agent-board: update Codex and Claude Code (agent-cli-update)
+
+[Service]
+Type=oneshot
+# PATH as a login shell has it: claude and codex are usually in ~/.local/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
+ExecStart={{PYTHON}} {{KIT_DIR}}/board/bin/agent-cli-update
+TimeoutStartSec=1500

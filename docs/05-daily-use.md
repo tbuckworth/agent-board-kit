@@ -14,6 +14,17 @@
 Only mail from `OWNER_EMAIL` with a DKIM pass is acted on. Everything else is held for you
 (`agent-mail inbox --held`).
 
+**Agent mail is reviewed before it reaches you.** A cheap model with no context (Haiku, run through your
+own Claude login) reads each agent mail of 120 words or more as you would see it. When you would have to
+reply "what does this mean?" or "where's the plot?", it sends the mail back to the agent once, with
+concrete fixes. Mail to collaborators and to other people is checked for clarity: purpose first, no
+unexplained labels, nothing that must not leave. A mail that contains an API key or token is never
+sent. Agents read the rules with `agent-mail guide`, and put plots inline with `--image`. Tune the
+review in the mailroom config's `review` block: `"mode": "shadow"` only records, and `owner_context`
+tells the reviewer what you already know. Edit the rules themselves in `mailroom/agentmail/email_rules.md`
+and `review_prompt.md`. Details: `mailroom/README.md`, "Pre-send review of agent mail". The board shows
+mail that was sent back and not yet re-sent.
+
 ## Conventions agents follow
 
 - **One agent, one branch, one worktree, one tmux session.** `agent-spawn --repo REPO --branch NAME`
@@ -79,5 +90,5 @@ agent-orchestrate --runs             # orchestrator runs: cost, turns, outcome
 | agents | Claude Code / Codex in tmux sessions, each in its own memory-capped scope |
 | `agent-memwatch` | systemd user service: warns the biggest agents at 80% RAM, emails you at 90% |
 | `agent-restart-restore` | runs once after a reboot that `agent-restart` started, resumes agents |
-| `todo-desk dispatch` | systemd timer every 2 min: turns web/phone "assign" requests into orchestrator events |
+| `todo-desk dispatch` | systemd timer every 2 min: turns web/phone "assign" requests into orchestrator events or messages to a running agent, and publishes the running agents for the web app |
 | `agent-board stream` | started by the Mac app over ssh, exits when the connection drops |

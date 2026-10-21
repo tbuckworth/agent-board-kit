@@ -4,6 +4,8 @@ sessions  one row per (cli, session_id) with its reply tag
 sent      one row per outbound mail: Gmail id, thread id, real Message-ID, tag
 inbound   one row per inbound mail the mailroom looked at, with what it did
 meta      history_id, last_poll, ...
+reviews   one row per pre-send review decision (agentmail/review.py); verdict is pass, revise, skipped,
+          override, error, withdrawn or expired; sent_message_id is set once that mail went out
 """
 import os
 import sqlite3
@@ -53,6 +55,24 @@ create index if not exists sent_thread_id on sent(thread_id);
 create table if not exists proxy_requests(
   request_id text primary key, fingerprint text not null,
   status text not null, result text);
+create table if not exists reviews(
+  id integer primary key,
+  tag text not null,
+  created_at integer not null,
+  round integer not null,
+  verdict text not null,
+  subject text,
+  kind text,
+  sent_message_id text,
+  reasons text,
+  fixes text,
+  words integer,
+  model text,
+  seconds real,
+  cost real,
+  draft text,
+  audience text);
+create index if not exists reviews_created_at on reviews(created_at);
 """
 
 
@@ -91,6 +111,10 @@ class Store:
                 self.con.execute("alter table inbound add column %s %s" % (col, typ))
             except sqlite3.OperationalError:
                 pass  # already there
+        try:  # owner, collaborator or other; null (rows from before the column existed) means owner
+            self.con.execute("alter table reviews add column audience text")
+        except sqlite3.OperationalError:
+            pass
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -162,6 +186,46 @@ class Store:
             "insert into sent(tag, gmail_id, thread_id, message_id, to_addr, subject, sent_at, in_reply_to_inbound) "
             "values(?,?,?,?,?,?,?,?)",
             (tag, gmail_id, thread_id, message_id, to_addr, subject, int(time.time()), in_reply_to_inbound))
+
+    # reviews
+    def record_review(self, tag, round_, verdict, subject, kind=None, reasons=None, fixes=None, words=None,
+                      model=None, seconds=None, cost=None, draft=None, audience=None):
+        cur = self.con.execute(
+            "insert into reviews(tag, created_at, round, verdict, subject, kind, reasons, fixes, words, model, "
+            "seconds, cost, draft, audience) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tag, int(time.time()), round_, verdict, subject, kind, reasons, fixes, words, model, seconds, cost, draft,
+             audience))
+        return cur.lastrowid
+
+    # A tag holds at most one draft per audience (owner/collaborator/other; null, on rows from before the column
+    # existed, means owner).
+    AUD = "coalesce(audience, 'owner')"
+
+    def latest_review(self, tag, audience=None):
+        if audience is None:
+            return self.con.execute("select * from reviews where tag=? order by id desc limit 1", (tag,)).fetchone()
+        return self.con.execute("select * from reviews where tag=? and %s=? order by id desc limit 1" % self.AUD,
+                                (tag, audience)).fetchone()
+
+    def held_draft(self, tag):
+        """The newest draft this tag still has waiting on a revision, whoever it is to."""
+        return self.con.execute("select * from reviews where tag=? and verdict='revise' and draft is not null "
+                                "order by id desc limit 1", (tag,)).fetchone()
+
+    def review_sent(self, review_id, message_id):
+        """The reviewed mail went out: link it, and settle any draft this tag still had held for the same audience."""
+        row = self.con.execute("select tag, %s as aud from reviews where id=?" % self.AUD, (review_id,)).fetchone()
+        self.con.execute("update reviews set sent_message_id=? where id=?", (message_id, review_id))
+        if row:
+            self.con.execute("update reviews set draft=null where tag=? and %s=? and draft is not null and id<?"
+                             % self.AUD, (row["tag"], row["aud"], review_id))
+
+    def stale_drafts(self, before_ts):
+        """Held drafts (verdict revise) whose session neither re-sent nor withdrew them before before_ts."""
+        return self.con.execute(
+            "select r.* from reviews r where r.verdict='revise' and r.draft is not null and r.created_at<? "
+            "and r.id=(select max(id) from reviews x where x.tag=r.tag and coalesce(x.audience, 'owner')="
+            "coalesce(r.audience, 'owner')) order by r.id", (int(before_ts),)).fetchall()
 
     def list_sent(self, limit=30):
         return self.con.execute(

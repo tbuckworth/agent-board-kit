@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -141,9 +142,24 @@ class Orchestrate(unittest.TestCase):
         finally:
             orchestrate.registry.find_bin = orig
         self.assertEqual(cmd[:4], ["/usr/bin/bws", "run", "--project-id", "proj-123"])
-        self.assertIn('ANTHROPIC_API_KEY="$AGENTS_ANTHROPIC_API_KEY" exec "$@"', cmd)
-        self.assertEqual(cmd[-2:], ["claude", "-p"])
+        # bws joins its arguments into one sh -c script, so the whole command is one quoted argument
+        self.assertEqual(cmd[4:], ["--", 'ANTHROPIC_API_KEY="$AGENTS_ANTHROPIC_API_KEY" exec claude -p'])
         self.assertFalse(orchestrate.fallback_available(dict(cfg, orchestrator_fallback_secret="")))
+
+    def test_fallback_script_runs_the_command_with_its_arguments(self):
+        d = tempfile.mkdtemp()
+        Path(d, "project-id").write_text("proj-123\n")
+        cfg = dict(CFG, orchestrator_fallback_secret="AGENTS_ANTHROPIC_API_KEY", bws_project_file=str(Path(d, "project-id")))
+        orig = orchestrate.registry.find_bin
+        orchestrate.registry.find_bin = lambda name, extra: "/usr/bin/bws" if name == "bws" else orig(name, extra)
+        try:
+            cmd = orchestrate.fallback_command(cfg, ["printf", "[%s]", "a b", "x (y)\nz", "it's"])
+        finally:
+            orchestrate.registry.find_bin = orig
+        # what bws does with it: sh -c "<arguments joined by spaces>", the secret in the environment
+        r = subprocess.run(["sh", "-c", " ".join(cmd[5:])], capture_output=True, text=True,
+                           env=dict(os.environ, AGENTS_ANTHROPIC_API_KEY="k"))
+        self.assertEqual(r.stdout, "[a b][x (y)\nz][it's]")
 
     def test_looks_like_auth_or_limit(self):
         self.assertTrue(orchestrate.looks_like_auth_or_limit("You've hit your usage limit"))

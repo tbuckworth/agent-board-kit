@@ -2,7 +2,7 @@
 // index.html does not register it, so as shipped it does nothing (only the browser's HTTP cache applies). If you
 // register it for offline use, bump CACHE_NAME on every deploy and keep STATIC_ASSETS in step with the files.
 
-const CACHE_NAME = 'todo-v11';
+const CACHE_NAME = 'todo-v12';
 const STATIC_ASSETS = [
   './',
   './index.html',
@@ -26,8 +26,6 @@ const STATIC_ASSETS = [
   './js/bulk.js',
   './js/groups.js',
   './js/actions.js',
-  './js/groups.js',
-  './js/bulk.js',
   './js/views/home.js',
   './js/views/group.js',
   './js/views/list.js',
@@ -47,7 +45,8 @@ const STATIC_ASSETS = [
   './js/components/focus-section.js',
   './js/components/select-list.js',
   './js/components/assign-dialog.js',
-  './js/components/select-list.js',
+  './js/components/agent-picker.js',
+  './js/agents.js',
   './fonts/inter-regular.woff2',
   './fonts/inter-medium.woff2',
   './fonts/inter-semibold.woff2',

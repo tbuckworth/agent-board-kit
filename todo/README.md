@@ -11,11 +11,12 @@ someone, and where an agent is with it. Three things read and write it:
   edits made offline.
 - **`todo-desk`** (`bin/todo-desk`, `desk/todo_desk.py`, Python stdlib): the desktop helper. It serves the Mac app,
   starts agents for tasks ("Assign to agent"), and every 2 minutes turns agent requests from the web app into
-  assignments (`todo-desk dispatch`).
+  assignments and publishes the list of running agents for the web app (`todo-desk dispatch`).
 
-"Assign to agent" hands a task to the kit's orchestrator (`agent-orchestrate`, from `mailroom/`), which starts
-one agent for it with `agent-spawn`. The agent reports back on the issue, so the apps show its progress, and
-by email.
+"Assign to agent" either hands a task to the kit's orchestrator (`agent-orchestrate`, from `mailroom/`), which
+starts one new agent for it with `agent-spawn`, or sends it straight into an agent that is already running, picked
+from the agent board's list (`agent-send`, from `mailroom/`). Either way the agent reports back on the issue, so
+the apps show its progress, and by email.
 
 ```text
  browser / phone ── HTTPS + PAT ──────────────────────────────►  GitHub Issues: OWNER/tasks
@@ -24,9 +25,11 @@ by email.
                                                               ▼    │
                                       desktop: todo-desk ── gh auth token
                                          │  assign / dispatch (timer, every 2 min)
-                                         ▼
-                                agent-orchestrate ──► agent-spawn ──► an agent (comments on the issue,
-                                                                       emails the owner)
+                       ┌─────────────────┴──────────────────┐
+                       ▼ a new agent                        ▼ a running agent (from the agent board's list)
+                agent-orchestrate ──► agent-spawn       agent-send --raw SESSION
+                       └──────────────► an agent ◄──────────┘
+                                 (comments on the issue, emails the owner)
 ```
 
 ## What is in this folder
@@ -80,7 +83,7 @@ by email.
 | `priority:high`, `priority:medium`, `priority:low` | legacy priority; the Mac app's editor sets it, the web app's editor removes it | Mac |
 | `source:app`, `source:claude`, `source:import` | where the task came from (`source:app` is added to tasks made in an app) | all clients, agents |
 | `status:agent-requested` | the web app asked for an agent | web writes, `todo-desk dispatch` removes |
-| `status:agent-assigned` | an agent was started on it | `todo-desk` |
+| `status:agent-assigned` | an agent was started on it, or it was sent to a running agent | `todo-desk` |
 | `status:claude-processed` | an agent has worked on it | agents |
 | `status:waiting` | waiting on someone; the body's first line says who (`Waiting on: <who>`). Greyed and sorted last until its follow-up date | web, Mac, agents |
 | `follow-up:YYYY-MM-DD` | when to chase a waiting task (one per task); from that day it shows as "Follow up with <who>" | web, Mac |
@@ -156,6 +159,7 @@ On the always-on Linux machine ("the desktop"):
    todo-desk snapshot --pretty | head      # syncs and prints what the Mac app would receive
    todo-desk message 12 --text "test"      # the orchestrator message for task #12; sends nothing
    todo-desk dispatch --dry-run            # which web requests would start an agent; changes nothing
+   todo-desk agents --pretty               # the running agents the apps offer (reads the agent board)
    ```
 
 5. Start `todo-desk dispatch` every 2 minutes, either as a systemd user timer (the installer renders
@@ -177,7 +181,8 @@ On the always-on Linux machine ("the desktop"):
    */2 * * * * todo-desk dispatch >> $HOME/.local/state/todo-desk/dispatch.log 2>&1
    ```
 
-   Only needed for the web app's "Assign to agent"; the Mac app assigns directly.
+   Only needed for the web app's "Assign to agent" (and its list of running agents, which each dispatch run
+   refreshes); the Mac app assigns directly.
 
 Environment variables the helper reads: `TODO_REPO`, `TODO_DESK_CONFIG_DIR` (default `~/.config/todo-desk`),
 `AGENT_MAIL_CONFIG_DIR` (default `~/.config/agent-mail`), `TODO_DESK_CACHE` (default
@@ -223,8 +228,8 @@ settings (folded groups, the tag filter, Triage snoozes), and the IndexedDB data
 **What it does.** Lists and groups, search, add/edit/complete/archive/delete, checklists, Claude notes,
 importance/urgency/due dates, tags (with an only/hide filter), waiting on someone (with a follow-up date),
 multi-select with bulk actions and groups of tasks, Triage (one task at a time,
-with snoozes and a "This week" set of at most five), and Assign to agent (as a request; see below). Reads are
-cached in IndexedDB; writes need the network.
+with snoozes and a "This week" set of at most five), and Assign to agent (as a request, to a new agent or to one
+already running; see below). Reads are cached in IndexedDB; writes need the network.
 
 `web/sw.js` (a service worker) is shipped but not registered by `index.html`. If you register it for offline
 use, bump its `CACHE_NAME` on every change; `web/tests/sw.test.js` checks its file list.
@@ -278,6 +283,12 @@ rm -rf /Applications/ToDo.app ~/Library/Application\ Support/ToDo; defaults dele
 
 ## Assign to agent, end to end
 
+Every Assign dialog (Mac and web) offers two choices:
+
+- **New agent**: the orchestrator starts a fresh agent for the task (the rest of this section).
+- **A running agent**: the task goes straight into an agent that is already running on the desktop, picked from
+  the agent board's list. See [Assign to a running agent](#assign-to-a-running-agent) below.
+
 From the **Mac app** (⇧⌘A, or Agent in the selection bar):
 
 1. The sheet takes optional instructions and previews the exact orchestrator message
@@ -313,14 +324,68 @@ comment `<!-- todo-agent:done -->` (or `<!-- todo-agent:blocked -->`) with a sum
 open for you to close; report with `agent-status note` and email you.
 
 The **Mac app** reads the marker comments: an assigned task shows the agent's status (assigned, started, done,
-blocked, failed) and name, and it lists them under "With agents". The web app shows only the label state
-(`status:agent-requested` / `status:agent-assigned`). Keep the marker format exactly:
-`<!-- todo-agent:assigned|started|done|blocked|failed -->` and `<!-- todo-agent-request -->`, on the comment's
-first line.
+blocked, failed) and name, and it lists them under "With agents". The **web app**'s task view shows the first line
+of the newest marker comment (or "Agent requested" while the request waits for dispatch). Keep the marker format
+exactly: `<!-- todo-agent:assigned|started|done|blocked|failed -->`, `<!-- todo-agent-request -->` and
+`<!-- todo-agent-request to=SESSION_ID -->`, on the comment's first line.
 
 Assign to agent needs the desktop reachable at that moment (the Mac never queues it), `agent-orchestrate` on the
 desktop (`~/.local/bin` or `PATH`), and `gh` on the desktop able to comment on the tasks repo (the orchestrator
 and the agent use it too).
+
+### Assign to a running agent
+
+Use it when an agent that is already running is the right one for a task: it has the context, or it works in the
+task's repo. The agent gets the task as a message in its session and fits it in around what it is doing.
+
+**The list of agents** is the agent board's: the live Claude and Codex sessions `board/` sees on the desktop, in
+the board's states and colours. Those that most want you come first (waiting on you, blocked, idle, waiting on a
+background command, busy, idle for hours), then the most recently active. Each row shows the agent's name, state,
+folder, last status note and, when the board provides one, its group. The search box matches every word against
+name, folder, group and note.
+
+- The **Mac app** asks the desktop for the list when you choose "A running agent" (`{"cmd": "agents"}`; the
+  refresh button asks again).
+- The **web app** cannot reach the desktop, so the desktop publishes the list as `.todo/agents.json` in the tasks
+  repo, and the page reads it with its PAT (Contents: Read). `todo-desk dispatch` does this after each run
+  (`todo-desk publish-agents`): at once when an agent starts or stops, at most every 5 minutes when only states or
+  notes change, never for activity times alone. Each write is a commit, "Agents list (todo-desk)". The file holds
+  agent names, folder names and last status notes, one more reason to keep the tasks repo private. The picker
+  says how old the list is ("List as of ...").
+
+**What happens when you send it:**
+
+1. Mac: the sheet previews the exact message the agent is sent and calls `assign` with `"to": SESSION_ID`.
+   Web: the browser posts a comment whose first line is `<!-- todo-agent-request to=SESSION_ID -->` and adds
+   `status:agent-requested`; within 2 minutes `todo-desk dispatch` picks it up (only from the desktop's own `gh`
+   account, as for a new agent) and runs the same assign.
+2. `todo-desk` reads the agent board again and refuses if that agent is no longer running ("NAME is no longer
+   running"), if the task is closed, or if it already has `status:agent-assigned` (unless assigning again).
+3. It adds `status:agent-assigned` and comments `<!-- todo-agent:started -->` then
+   `Assigned to the running agent NAME (FOLDER) from <app> at <time>.`, with your instructions quoted. The apps
+   show NAME as the task's agent.
+4. It runs `agent-send --raw --cli claude|codex SESSION_ID` with the message on stdin, so it reaches that exact
+   session. If `agent-send` fails, it comments `<!-- todo-agent:failed -->` with the reason and removes the label.
+
+**The message** starts with `[relayed from <owner_name> via the to-do app (...)]`, then the task as the
+orchestrator would see it (number, link, list, labels, body, your instructions), a line asking the agent to
+finish or checkpoint its current step first unless you say it is urgent, and the same rules as a new agent's
+brief (read the issue, ask before outside consequences, report with the `done`/`blocked` marker, leave the issue
+open, email you). The agent answers by email; there is no thread to reply in.
+
+**From the command line on the desktop:**
+
+```bash
+todo-desk agents --pretty                          # the list, with session ids
+todo-desk assign 42 --to SESSION_ID --text "..."   # send task #42 to that agent
+todo-desk publish-agents --force                   # write .todo/agents.json now
+```
+
+**It needs**, on the desktop: the agent board (`board/`; `todo-desk` uses the kit's `board/` folder next to
+`todo/`, else the `agent-board` command on `PATH` or in `~/.local/bin`, whose full `agent-board snapshot` is the
+slower fallback), and `agent-send` (`mailroom/`, on `PATH` or in `~/.local/bin`) able to reach the session, which
+is what `agent-send --list` shows. Reading the list takes a few seconds; with the board's Gmail read-check on, it
+also checks which agent mail you have read, as the board does.
 
 ## Rules for agents working on tasks
 
@@ -351,8 +416,8 @@ These belong in the global agent instructions the kit installs, so every agent f
 
 ```bash
 cd todo
-HOME=$(mktemp -d) python3 -m unittest discover -s desk/tests    # the helper: 51 tests, no network, fake GitHub
-node --test web/tests/*.test.js                                 # the web app: 49 tests (Node 18+, no npm install)
+HOME=$(mktemp -d) python3 -m unittest discover -s desk/tests    # the helper: 61 tests, no network, fake GitHub
+node --test web/tests/*.test.js                                 # the web app: 58 tests (Node 18+, no npm install)
 ./setup-labels.sh --dry-run alex-gh/tasks                  # prints the gh commands only
 ```
 
@@ -378,10 +443,19 @@ The Mac app has no tests that run off a Mac; `ToDo --selftest` covers its model 
   means the request was written by a different GitHub account from the desktop's `gh` login.
 - **Assign fails with "agent-orchestrate exited"**: read the log named in the error
   (`~/.local/state/todo-desk/orchestrate-N-*.log`); the mailroom's README covers `agent-orchestrate`.
+- **"A running agent" shows "could not read the agent board"**: the board is not installed on the desktop, or it
+  fails; `todo-desk agents --pretty` on the desktop shows the error, and `agent-board snapshot --pretty` the
+  board's own view.
+- **The web app says "No list of running agents yet"**: no dispatch run has published `.todo/agents.json`; check
+  the timer or cron line, or run `todo-desk publish-agents --force`. An old "List as of" time means dispatch has
+  stopped running, or the desktop's `gh` cannot write the repo's contents.
+- **"NAME is no longer running"** or **"agent-send failed"**: the agent ended, or `agent-send` cannot reach it;
+  `agent-send --list` on the desktop shows who can be reached. Pick another agent or New agent.
 - **Changed the tasks repo**: the helper ignores a cache written for another repo and does a full sync. On the
   Mac, quit ToDo and delete `~/Library/Application Support/ToDo/cache.json`; the web app clears its cache itself.
 - **Edit conflicts in the Mac app**: a banner offers Keep mine (overwrite) or Keep GitHub's (drop the edit).
 
 State on the desktop: `~/.cache/todo-desk/cache.json` (the issue cache), `~/.cache/todo-desk/done-ops.json`
 (queued Mac edits already applied, so a retry is not applied twice), `~/.local/state/todo-desk/actions.jsonl`
-(assign and dispatch audit log) and `orchestrate-*.log`. All can be deleted; the next sync rebuilds the cache.
+(assign and dispatch audit log), `orchestrate-*.log`, and `agents-published.json` (what was last written to
+`.todo/agents.json`). All can be deleted; the next sync rebuilds the cache.

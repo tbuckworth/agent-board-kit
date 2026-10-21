@@ -702,5 +702,202 @@ class Identity(unittest.TestCase):
         self.assertEqual(td.Desk(gh=object(), cache_path=cache, config=CFG).data["issues"], {"2": {"number": 2}})
 
 
+A1 = "d21ff850-e1bb-46d1-8d0a-c5bc8842af30"
+A2 = "01a11bf1-5b48-7651-b12c-140cb15c777e"
+A3 = "c007cb1b-4d4f-43ef-96eb-23c485a4fa22"
+GONE = "c7bfd808-0000-0000-0000-000000000000"
+SNAPSHOT = {"agents": [
+    {"id": A1, "cli": "claude", "display": "importance-urgency reply", "state": "busy", "live": True,
+     "cwd": "/home/alex/code/to-do-x/", "last_activity": 1792160000.0,
+     "last_note": {"ts": 1, "text": "note one\nwith a line break " + "x" * 200}},
+    {"id": A2, "cli": "codex", "name": "docs-cleanup", "state": "idle", "live": True, "cwd": "/p/docs",
+     "last_activity": 1792150000.0, "last_note": None},
+    {"id": A3, "cli": "claude", "display": "older idle", "state": "idle", "live": True, "cwd": "/p/inv",
+     "last_activity": 1792140000.0},
+    {"id": GONE, "cli": "claude", "display": "gone", "state": "offline", "live": False, "cwd": "/p/gone"},
+    {"id": "not-a-uuid", "cli": "claude", "display": "odd", "state": "idle", "live": True, "cwd": "/p/odd"},
+]}
+
+
+class RunningAgents(unittest.TestCase):
+    """Assign a task to an agent already running on the board."""
+
+    def setUp(self):
+        self.orig_groups, td.BOARD_GROUPS = td.BOARD_GROUPS, Path(tempfile.mkdtemp()) / "none.json"
+
+    def tearDown(self):
+        td.BOARD_GROUPS = self.orig_groups
+
+    def issue(self, **kw):
+        return Assign.issue(self, **kw)
+
+    def test_request_marker_with_and_without_an_agent(self):
+        self.assertIsNone(td.REQUEST_RE.match("<!-- todo-agent-request -->\n\ngo").group("to"))
+        m = td.REQUEST_RE.match("<!-- todo-agent-request to=%s -->\n\ngo" % A2)
+        self.assertEqual(m.group("to"), A2)
+        self.assertEqual(td.REQUEST_RE.sub("", "<!-- todo-agent-request to=%s -->\n\ngo" % A2).strip(), "go")
+        self.assertIsNone(td.REQUEST_RE.match("<!-- todo-agent-request to=rm-rf -->"))
+
+    def test_records_live_only_sorted_and_trimmed(self):
+        recs = td.agent_records(SNAPSHOT, td.board_groups({"groups": [
+            {"name": "Work", "members": [A3], "subgroups": [{"name": "Docs", "members": [A2]}]}]}))
+        self.assertEqual([r["id"] for r in recs], [A2, A3, A1])     # idle (newest first), then busy
+        one = recs[2]
+        self.assertEqual(one["name"], "importance-urgency reply")
+        self.assertEqual(one["folder"], "to-do-x")
+        self.assertEqual(len(one["note"]), 160)
+        self.assertNotIn("\n", one["note"])
+        self.assertEqual(one["active"], "2026-10-16T14:13:20Z")
+        self.assertEqual(recs[0]["group"], "Work / Docs")
+        self.assertEqual(recs[1]["group"], "Work")
+        self.assertIsNone(one["group"])
+        self.assertEqual(recs[0]["name"], "docs-cleanup")
+        self.assertEqual(recs[0]["note"], "")
+        self.assertEqual(set(recs[0]), {"id", "cli", "name", "state", "folder", "note", "active", "group"})
+
+    def test_publish_only_on_change_and_throttled(self):
+        recs = td.agent_records(SNAPSHOT)
+        self.assertTrue(td.should_publish(recs, None, 1000))
+        last = {"at": 1000, "ids": sorted(r["id"] for r in recs),
+                "key": [{k: v for k, v in r.items() if k != "active"} for r in recs]}
+        moved = [dict(r, active="2030-01-01T00:00:00Z") for r in recs]
+        self.assertFalse(td.should_publish(moved, last, 5000))      # only activity: never
+        busy = [dict(r, state="busy") for r in recs]
+        self.assertFalse(td.should_publish(busy, last, 1100))       # a state, within 5 minutes
+        self.assertTrue(td.should_publish(busy, last, 1000 + td.PUBLISH_EVERY))
+        self.assertTrue(td.should_publish(recs[:2], last, 1001))   # an agent went: at once
+
+    def make(self, sent, code=0, issue=None):
+        tmp = tempfile.mkdtemp()
+        td.STATE_DIR = Path(tmp) / "state"
+        gh = RequestGitHub(issue or self.issue())
+
+        def send(cli, sid, text):
+            sent.append((cli, sid, text))
+            return code, "" if code == 0 else "no such session"
+        desk = td.Desk(gh=gh, cache_path=Path(tmp) / "cache.json", popen=lambda *a, **k: self.fail("orchestrator"),
+                       config=CFG, board=lambda: SNAPSHOT, send=send)
+        return desk, gh
+
+    def test_assign_to_a_running_agent(self):
+        sent = []
+        desk, gh = self.make(sent)
+        issue, url, log = desk.assign(9, "after your current step", to=A2)
+        self.assertIn(td.ASSIGNED_LABEL, issue["labels"])
+        body = gh.comments[0]["body"]
+        self.assertTrue(body.startswith("<!-- todo-agent:started -->\nAssigned to the running agent docs-cleanup (docs)"))
+        self.assertIn("from the Mac to-do app", body)
+        self.assertIn("Alex's instructions:\n> after your current step", body)
+        self.assertEqual(issue["agent"]["status"], "started")
+        self.assertEqual(issue["agent"]["name"], "docs-cleanup")
+        cli, sid, text = sent[0]
+        self.assertEqual((cli, sid), ("codex", A2))
+        self.assertTrue(text.startswith("[relayed from Alex via the to-do app (the Mac app, over SSH)]"))
+        self.assertIn("Task #9: Look into e-bikes", text)
+        self.assertIn("gh issue view 9 --repo example-user/tasks --comments", text)
+        self.assertIn("Answer Alex with agent-mail send --to owner@example.com", text)
+        self.assertIn("after your current step", text)
+        self.assertIn("finish or checkpoint your current", text)
+        self.assertIn("<!-- todo-agent:done -->", text)
+        self.assertNotIn("agent-spawn", text)
+        self.assertEqual(log, "")
+        with self.assertRaises(ValueError):                     # already assigned
+            desk.assign(9, "", to=A2)
+
+    def test_gone_agent_refused_and_failed_send_rolls_back(self):
+        sent = []
+        desk, gh = self.make(sent)
+        with self.assertRaisesRegex(ValueError, "gone is no longer running"):
+            desk.assign(9, "", to=GONE)
+        with self.assertRaisesRegex(ValueError, "no longer running"):
+            desk.assign(9, "", to="11111111-2222-3333-4444-555555555555")
+        self.assertEqual(gh.comments, [])
+        desk, gh = self.make(sent, code=1)
+        with self.assertRaisesRegex(ValueError, "agent-send failed"):
+            desk.assign(9, "", to=A1)
+        self.assertNotIn(td.ASSIGNED_LABEL, gh.issue["labels"])
+        self.assertTrue(gh.comments[-1]["body"].startswith("<!-- todo-agent:failed -->\nThe task was not sent to"))
+
+    def test_dispatch_request_for_a_running_agent(self):
+        sent = []
+        desk, gh = self.make(sent, issue=self.issue(labels=["list:tasks", td.REQUESTED_LABEL]))
+        gh.comments = [{"body": "<!-- todo-agent-request to=%s -->\n\nplease" % A3, "created_at": "t",
+                        "html_url": "u", "user": {"login": "example-user"}}]
+        self.assertEqual(desk.dispatch(), [(9, "sent to a running agent")])
+        self.assertEqual(sent[0][1], A3)
+        self.assertIn("please", sent[0][2])
+        self.assertIn("from the to-do web app", gh.comments[-1]["body"])
+        self.assertTrue(sent[0][2].startswith("[relayed from Alex via the to-do app (the web app"))
+
+    def test_dispatch_request_for_a_gone_agent(self):
+        sent = []
+        desk, gh = self.make(sent, issue=self.issue(labels=["list:tasks", td.REQUESTED_LABEL]))
+        gh.comments = [{"body": "<!-- todo-agent-request to=11111111-2222-3333-4444-555555555555 -->\n\ngo",
+                        "created_at": "t", "html_url": "u", "user": {"login": "example-user"}}]
+        out = desk.dispatch()
+        self.assertTrue(out[0][1].startswith("failed:"))
+        self.assertEqual(sent, [])
+        self.assertTrue(gh.comments[-1]["body"].startswith("<!-- todo-agent:failed -->\nThe task was not sent: "))
+        self.assertEqual(sum("todo-agent:failed" in c["body"] for c in gh.comments), 1)
+
+    def test_agents_command_and_publish(self):
+        desk, gh = self.make([])
+        puts = []
+        real = gh.rest
+
+        def rest(method, path, body=None, headers=None):
+            if path.endswith(td.AGENTS_PATH):
+                self.assertEqual(path, "/repos/example-user/tasks/contents/.todo/agents.json")
+                if method == "GET":
+                    err = td.GitHubError("404")
+                    err.status = 404
+                    raise err
+                puts.append(body)
+                return {}
+            return real(method, path, body, headers)
+        gh.rest = rest
+        res = td.Server(desk, out=io.StringIO()).dispatch({"cmd": "agents"})
+        self.assertEqual(len(res["agents"]), 3)
+        self.assertTrue(desk.publish_agents(now=1000))
+        doc = json.loads(td.base64.b64decode(puts[0]["content"]))
+        self.assertEqual((doc["v"], len(doc["agents"])), (1, 3))
+        self.assertEqual(puts[0]["message"], "Agents list (todo-desk)")
+        self.assertNotIn("sha", puts[0])
+        self.assertFalse(desk.publish_agents(now=1010))            # unchanged
+        self.assertTrue(desk.publish_agents(force=True, now=1020))
+        other = td.Desk(gh=gh, cache_path=desk.path, config=dict(CFG, repo="example-user/other"),
+                        board=lambda: SNAPSHOT, send=lambda *a: (0, ""))
+        gh.rest = lambda method, path, body=None, headers=None: (puts.append(path) or {}) if "/other/" in path \
+            else self.fail(path)
+        self.assertTrue(other.publish_agents(now=1030))             # a new tasks repo gets the list at once
+
+    def test_preview_for_a_running_agent(self):
+        desk, gh = self.make([])
+        msg = td.Server(desk, out=io.StringIO()).dispatch({"cmd": "assign_preview", "number": 9, "text": "x", "to": A2})
+        self.assertTrue(msg["message"].startswith("[relayed from Alex via the to-do app"))
+        self.assertNotIn("agent-spawn", msg["message"])
+        msg = td.Server(desk, out=io.StringIO()).dispatch({"cmd": "assign_preview", "number": 9, "text": "x"})
+        self.assertIn("agent-spawn --name todo-9-look-into-e-bikes", msg["message"])
+
+    def test_board_root_is_the_kits_board_or_the_commands_checkout(self):
+        self.assertTrue((td.KIT_BOARD / "agentboard" / "__init__.py").exists())   # the kit layout: board/ beside todo/
+        self.assertEqual(td.board_root(), str(td.KIT_BOARD))
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "repo/agentboard").mkdir(parents=True)
+        (tmp / "repo/agentboard/__init__.py").write_text("")
+        (tmp / "repo/bin").mkdir()
+        (tmp / "repo/bin/agent-board").write_text("#!/usr/bin/env python3\n")
+        (tmp / "bin").mkdir()
+        (tmp / "bin/agent-board").symlink_to(tmp / "repo/bin/agent-board")
+        (tmp / "bin/wrapper").write_text("#!/usr/bin/env bash\nexec python3 /somewhere/agent-board \"$@\"\n")
+        saved, td.KIT_BOARD = td.KIT_BOARD, tmp / "no-board"
+        try:
+            self.assertEqual(td.board_root(str(tmp / "bin/agent-board")), str((tmp / "repo").resolve()))
+            self.assertIsNone(td.board_root(str(tmp / "bin/wrapper")))     # then only `agent-board snapshot` is tried
+            self.assertIsNone(td.board_root())
+        finally:
+            td.KIT_BOARD = saved
+
+
 if __name__ == "__main__":
     unittest.main()

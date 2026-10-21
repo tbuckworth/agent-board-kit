@@ -32,6 +32,35 @@ class ClassifyTest(unittest.TestCase):
     def test_busy_wins_over_everything_live(self):
         self.assertEqual(self.state(raw_status="busy", mail={"unanswered": True, "last_out": NOW - 10}), "busy")
 
+    def test_mail_held_by_the_review_shows_once_its_turn_ends(self):
+        rev = [{"ts": NOW - 600, "subject": "Results", "reasons": "no summary first", "to": "owner"}]
+        st, why = classify.classify(agent(mail={"revise": rev}), NOW)
+        self.assertEqual(st, "idle")
+        self.assertTrue(why.startswith("its mail to you was sent back for revision 10m ago and hasn't gone out: "
+                                       "Results (no summary first) · idle"), why)
+        self.assertEqual(classify.classify(agent(raw_status="busy", mail={"revise": rev}), NOW), ("busy", "turn running"))
+        collab = {"ts": NOW - 120, "subject": "Data", "reasons": "", "to": "collaborator"}
+        why = classify.classify(agent(mail={"revise": [collab] + rev}), NOW)[1]
+        self.assertTrue(why.startswith("its mail to a collaborator was sent back for revision 2m ago and hasn't gone "
+                                       "out: Data (and 1 more held) · "), why)
+        # stopped for a credential: shown until a turn ends well after it (nothing will send it)
+        key = {"ts": NOW - 300, "subject": "Keys", "reasons": "", "to": "owner", "secret": True}
+        why = classify.classify(agent(mail={"revise": [key]}), NOW)[1]
+        self.assertTrue(why.startswith("its mail to you was stopped 5m ago (it looked like it had a credential in it) "
+                                       "and won't go out unless re-sent: Keys · idle"), why)
+        old = dict(key, ts=NOW - 2000)                                   # last turn ended 1940 s after it
+        self.assertEqual(classify.classify(agent(mail={"revise": [old]}), NOW)[1], "idle 60s")
+        # an older mail still unanswered: waiting, and the held one is said first
+        st, why = classify.classify(agent(last_turn_end=NOW - 3000, mail={
+            "revise": rev, "unanswered": True, "last_out": NOW - 3600, "last_out_subject": "Plan"}), NOW)
+        self.assertEqual(st, "waiting")
+        self.assertIn("sent back for revision 10m ago", why)
+        self.assertTrue(why.endswith("no reply yet: Plan"), why)
+        st, why = classify.classify(agent(last_turn_end=NOW - 3000, mail={
+            "unrevised": True, "unanswered": True, "last_out": NOW - 60, "last_out_subject": "Results"}), NOW)
+        self.assertEqual(st, "waiting")
+        self.assertTrue(why.endswith("(sent as-is: it didn't revise it after the pre-send review)"), why)
+
     def test_terminal_prompt_is_blocked(self):
         st, why = classify.classify(agent(raw_status="waiting", waiting_for="permission"), NOW)
         self.assertEqual(st, "blocked")
@@ -60,6 +89,16 @@ class ClassifyTest(unittest.TestCase):
                                       error={"ts": NOW - 30, "text": "overloaded"}), NOW)[1]
         self.assertIn("API error", why)
         self.assertEqual(self.state(error={"ts": NOW - 300, "text": "overloaded"}, last_turn_end=NOW - 40), "idle")
+
+    def test_a_limit_its_transcript_does_not_end_on_is_not_blocked(self):
+        # a StopFailure 429 a second after the agent's final answer; nothing failed in its conversation
+        lim = {"ts": NOW - 60, "kind": "limit", "text": 'rate_limit: 429 {"type":"error","error":{"type":"rate_limit_error",'
+                                                         '"message":"Usage credits are required for long context requests."}'}
+        st, why = classify.classify(agent(quota_ts=NOW - 60, last_turn_end=NOW - 61, limit=lim,
+                                          stop_unconfirmed=NOW - 60), NOW)
+        self.assertEqual(st, "idle")
+        self.assertIn("its turn finished; a request after it failed (rate_limit: Usage credits are required", why)
+        self.assertEqual(self.state(quota_ts=NOW - 60, last_turn_end=NOW - 61, limit=lim), "blocked")
 
     def test_blocked_note(self):
         note = {"ts": NOW - 600, "text": "BLOCKED: needs the HF token from Alex"}
@@ -246,6 +285,27 @@ class MailStateTest(unittest.TestCase):
         self.assertFalse(classify.mail_state(old, [], NOW)["unanswered"])
         held = [{"received_at": NOW - 10, "subject": "Re", "thread_id": "t", "action": "held"}]
         self.assertEqual(classify.mail_state([], held, NOW)["held"], 1)
+
+    def test_review_held_and_sent_as_is(self):
+        held = {"created_at": NOW - 120, "verdict": "revise", "subject": "Results [#abcd1234]",
+                "reasons": "no summary first", "has_draft": 1, "audience": "owner"}
+        self.assertEqual(classify.mail_state([], [], NOW, reviews=[held])["revise"],
+                         [{"ts": NOW - 120, "subject": "Results", "reasons": "no summary first", "to": "owner",
+                           "secret": False}])
+        stopped = dict(held, has_draft=0, kind="secret", reasons=None)      # a credential stop keeps no draft
+        self.assertEqual([(r["secret"], r["reasons"]) for r in classify.mail_state([], [], NOW, reviews=[stopped])["revise"]],
+                         [(True, "")])
+        self.assertEqual(classify.mail_state([], [], NOW, reviews=[dict(held, has_draft=0)])["revise"], [])
+        self.assertEqual(classify.mail_state([], [], NOW, reviews=[dict(held, verdict="pass")])["revise"], [])
+        self.assertEqual(classify.mail_state([], [], NOW)["revise"], [])
+        two = classify.mail_state([], [], NOW, reviews=[held, dict(held, created_at=NOW - 60, audience="collaborator")])
+        self.assertEqual([r["to"] for r in two["revise"]], ["collaborator", "owner"])           # newest first
+        sent = [{"sent_at": NOW - 30, "subject": "Results", "thread_id": "t1", "message_id": "<m1@x>"}]
+        expired = {"created_at": NOW - 30, "verdict": "expired", "subject": "Results", "sent_message_id": "<m1@x>"}
+        self.assertTrue(classify.mail_state(sent, [], NOW, reviews=[expired])["unrevised"])
+        self.assertTrue(classify.mail_state(sent, [], NOW, reviews=[dict(held, audience="other"), expired])["unrevised"])
+        self.assertFalse(classify.mail_state(sent, [], NOW, reviews=[dict(expired, sent_message_id="<m0@x>")])["unrevised"])
+        self.assertFalse(classify.mail_state(sent, [], NOW)["unrevised"])
 
     def test_keep_offline(self):
         m0 = classify.mail_state([], [], NOW)
@@ -618,6 +678,47 @@ class MailStoreTest(unittest.TestCase):
             self.assertEqual([h["owner"] for h in got["held"]], [True, False])               # newest first, owner flagged
             self.assertEqual(os.stat(db).st_mtime, os.stat(db).st_mtime)
 
+    def test_newest_review_per_tag_and_audience(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "mailroom.sqlite"
+            sid_a, sid_b = mail_fixture(db)
+            self.assertNotIn("reviews", sources.MailStore(db, owners=[OWNER]).read(NOW)["by_session"][("claude", sid_a)])
+            con = sqlite3.connect(str(db))          # the mailroom's schema (mailroom/agentmail/store.py)
+            con.executescript("""
+              create table reviews(id integer primary key, tag text not null, created_at integer not null,
+                                   round integer not null, verdict text not null, subject text, kind text,
+                                   sent_message_id text, reasons text, fixes text, words integer, model text,
+                                   seconds real, cost real, draft text, audience text);
+              create index reviews_created_at on reviews(created_at);
+            """)
+            con.executemany("insert into reviews(tag, created_at, round, verdict, subject, reasons, draft, audience) "
+                            "values(?,?,?,?,?,?,?,?)", [
+                ("taga", NOW - 700, 1, "pass", "Alpha done", None, None, None),
+                ("taga", NOW - 120, 1, "revise", "Alpha v2", "no summary first; plot attached, not inline", "{}", None),
+                ("taga", NOW - 60, 1, "pass", "To Sam", None, None, "collaborator"),   # doesn't settle the owner's draft
+                ("tagb", NOW - 400, 1, "revise", "Beta", "too long", None, "owner"),
+                ("tagb", NOW - 300, 1, "withdrawn", "Beta", None, None, "owner"),
+                ("tagb", NOW - 200, 1, "revise", "Key", "Contains what looks like a GitHub token ('ghp_ab...')", None,
+                 "collaborator"),
+                ("tagm", NOW - 60, 1, "revise", "Mac", "x", "{}", None)])
+            con.execute("update reviews set kind = 'secret' where subject = 'Key'")
+            con.commit()
+            con.close()
+            got = sources.MailStore(db, owners=[OWNER]).read(NOW)["by_session"]
+            ra = {r["audience"]: r for r in got[("claude", sid_a)]["reviews"]}
+            self.assertEqual((ra["owner"]["verdict"], ra["owner"]["has_draft"], ra["owner"]["subject"]), ("revise", 1, "Alpha v2"))
+            self.assertEqual(ra["collaborator"]["verdict"], "pass")
+            rb = {r["audience"]: r for r in got[("codex", sid_b)]["reviews"]}
+            self.assertEqual(rb["owner"]["verdict"], "withdrawn")
+            self.assertEqual((rb["collaborator"]["kind"], rb["collaborator"]["reasons"]), ("secret", None))  # never read
+            b = got[("codex", sid_b)]
+            self.assertEqual([(r["subject"], r["secret"], r["reasons"]) for r in classify.mail_state(
+                b["sent"], b["inbound"], NOW, reviews=b["reviews"])["revise"]], [("Key", True, "")])
+            self.assertNotIn(("claude", "c" * 36), got)                         # Mac-hosted session excluded
+            a = got[("claude", sid_a)]
+            self.assertEqual([r["subject"] for r in classify.mail_state(a["sent"], a["inbound"], NOW,
+                                                                        reviews=a["reviews"])["revise"]], ["Alpha v2"])
+
     def test_missing_store_is_not_an_error(self):
         got = sources.MailStore(Path("/nonexistent/mailroom.sqlite"), owners=[OWNER]).read(NOW)
         self.assertFalse(got["ok"])
@@ -739,6 +840,65 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(calls, [[4242]])                        # /proc is read at most every 30 s
             col.snapshot(NOW + 40)
             self.assertEqual(len(calls), 2)
+
+    def test_a_limit_is_checked_against_the_transcript(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            sid = "11111111-2222-3333-4444-555555555555"
+            log = d / "events.jsonl"
+            base = {"session_id": sid, "cli": "claude", "name": "interp", "cwd": "/x"}
+            log.write_text("".join(json.dumps(dict(base, **e)) + "\n" for e in (
+                {"ts": NOW - 4000, "event": "start"}, {"ts": NOW - 100, "event": "idle"},
+                {"ts": NOW - 99, "event": "limit", "text": "rate_limit: 429 long context"})))
+            claude = lambda: [{"cli": "claude", "id": sid, "name": "interp", "cwd": "/x", "raw_status": "idle",
+                               "kind": "interactive", "live": True, "pid": 4242, "tmux": "", "waiting_for": "",
+                               "started_at": NOW - 4000, "status_at": NOW - 100}]
+            answers, calls = [False], []
+            def stops(s):
+                calls.append(s)
+                return answers[0]
+            col = collect.Collector(events=sources.EventLog(log), codex=sources.CodexReader(d / "none"),
+                                    mail=sources.MailStore(d / "none.sqlite", owners=[OWNER]),
+                                    git=sources.GitCache(fetch=lambda c: {}), claude=claude, panes=lambda: {},
+                                    stops=stops)
+            col.sessions_fn = lambda: {}
+            self.assertEqual(col.snapshot(NOW - 80)["agents"][0]["state"], "blocked")   # under 30 s: not read yet
+            self.assertEqual(calls, [])
+            a = col.snapshot(NOW)["agents"][0]
+            self.assertEqual(a["state"], "idle")
+            self.assertIn("a request after it failed (rate_limit: 429 long context)", a["reason"])
+            col.snapshot(NOW + 5)
+            self.assertEqual(calls, [sid])                                  # read once per event
+            col2 = collect.Collector(events=sources.EventLog(log), codex=sources.CodexReader(d / "none"),
+                                     mail=sources.MailStore(d / "none.sqlite", owners=[OWNER]),
+                                     git=sources.GitCache(fetch=lambda c: {}), claude=claude, panes=lambda: {},
+                                     stops=lambda s: True)
+            col2.sessions_fn = lambda: {}
+            self.assertEqual(col2.snapshot(NOW)["agents"][0]["state"], "blocked")
+
+    def test_last_turn_failed_reads_the_transcript_tail(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            sid = "11111111-2222-3333-4444-555555555555"
+            (home / "projects/-x").mkdir(parents=True)
+            path = home / ("projects/-x/%s.jsonl" % sid)
+            ok = [{"type": "assistant", "message": {"content": "done"}}, {"type": "system", "subtype": "turn_duration"},
+                  {"type": "custom-title"}]
+            failed = [{"type": "assistant", "message": {"content": "done"}}, {"type": "user", "message": {"content": "go"}},
+                      {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit"},
+                      {"type": "user", "isMeta": True, "message": {"content": "caveat"}}]
+            real = actions.claude_home_of
+            actions.claude_home_of = lambda s: ("default", home)
+            try:
+                path.write_text("".join(json.dumps(e) + "\n" for e in ok))
+                self.assertIs(actions.last_turn_failed(sid), False)
+                path.write_text("".join(json.dumps(e) + "\n" for e in failed))
+                self.assertIs(actions.last_turn_failed(sid), True)
+                path.write_text("")
+                self.assertIsNone(actions.last_turn_failed(sid))
+                self.assertIsNone(actions.last_turn_failed("22222222-2222-3333-4444-555555555555"))
+            finally:
+                actions.claude_home_of = real
 
 
 class LeakedEnvTest(unittest.TestCase):
@@ -1015,7 +1175,8 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(calls[0], ["/bin/tmux", "show-environment", "-g"])     # leaked variables dropped first
         self.assertEqual(calls[1][:4], ["/bin/tmux", "new-session", "-d", "-s"])
         line = next(c[-1] for c in calls if "-l" in c)
-        self.assertIn("resume -s danger-full-access -a never -C %s -m gpt-6-astra -c model_reasoning_effort=xhigh %s" % (d, dead["id"]), line)
+        self.assertIn("resume -s danger-full-access -a never -C %s -c check_for_update_on_startup=false -m gpt-6-astra "
+                      "-c model_reasoning_effort=xhigh %s" % (d, dead["id"]), line)
         self.assertTrue(sent and "agent-mail show 311" in sent[0] and "carry on" in sent[0])
         self.assertTrue(sent[0].startswith("[relayed from Alex via agent-board] resumed\n"))
         self.assertIn("Alex resumed it from the agent board, in tmux session 'astra-2'", sent[0])

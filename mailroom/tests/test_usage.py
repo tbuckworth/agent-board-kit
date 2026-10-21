@@ -647,6 +647,18 @@ class Spawn(unittest.TestCase):
         self.assertEqual(calls[4], ("set-environment", "-t", "n2", "-r", "CLAUDE_CONFIG_DIR"))
         self.assertTrue(calls[5][-1].startswith("unset CLAUDE_CONFIG_DIR; /bin/claude "))
 
+    def test_codex_launch_skips_the_update_menu(self):
+        calls = []
+        with mock.patch.object(self.sp.registry, "codex_bin", return_value="/bin/codex"), \
+                mock.patch.object(self.sp.registry, "codex_live_ids", return_value=set()), \
+                mock.patch.object(self.sp, "tmux", side_effect=lambda *a, **k: calls.append(a)), \
+                mock.patch.object(self.sp, "wait_for", return_value=None), \
+                mock.patch.object(self.sp.time, "sleep"):
+            self.sp.launch_codex("n", "/work", "/b.md", "gpt-6.1-sol", "xhigh")
+        typed = next(c[-1] for c in calls if c[:2] == ("send-keys", "-t") and "-l" in c)
+        self.assertTrue(typed.startswith("/bin/codex -s danger-full-access -a never -C /work "
+                                         "-c check_for_update_on_startup=false "), typed)
+
     def test_trust_goes_to_the_accounts_own_claude_json(self):
         home_json = Path(tempfile.mkdtemp()) / ".claude.json"
         home_json.write_text("{}")

@@ -15,7 +15,8 @@ enum Renderer {
     }
 
     static func render(data path: String, to out: String, size: CGSize, dark: Bool, list: String?, select: Int?,
-                       edit: Int?, assign: Int?, agents: Bool, search: String?, zoom: CGFloat) -> Int32 {
+                       edit: Int?, assign: Int?, agents: Bool, search: String?, zoom: CGFloat,
+                       running: Bool = false) -> Int32 {
         guard let d = loadData(path) else {
             FileHandle.standardError.write("cannot read \(path)\n".data(using: .utf8)!)
             return 1
@@ -34,13 +35,30 @@ enum Renderer {
         if let a = assign {
             guard let t = store.items[a] else { print("no task #\(a)"); return 1 }
             store.previewStub = "[message from the owner via the to-do app (the Mac app, over SSH), not by email …]\n\nThe owner assigned this to-do to an agent from the to-do app. Start one agent to do it.\n\nTask #\(t.number): \(t.title)\nIssue: \(t.issue.url)\nList: \(t.list)    Labels: \(t.issue.labels.joined(separator: ", "))"
-            let sheet = AssignSheet(task: t, store: store).environment(\.zoom, zoom)
+            store.agentsStub = Renderer.sampleAgents
+            let sheet = AssignSheet(task: t, store: store, startRunning: running,
+                                    startChosen: running ? Renderer.sampleAgents[1].id : nil).environment(\.zoom, zoom)
                 .background(Color(nsColor: .windowBackgroundColor))
             return snap(AnyView(sheet), size: nil, dark: dark, to: out, settle: 0.8, expandPreview: true)
         }
         let view = RootView(store: store).padding(.top, 18).frame(width: size.width, height: size.height)
         return snap(AnyView(view), size: size, dark: dark, to: out, settle: 0.8)
     }
+
+    /// Running agents for the offscreen Assign sheet (--running)
+    static let sampleAgents: [BoardAgent] = [
+        BoardAgent(id: "01a11bf1-5b48-7651-b12c-140cb15c777e", cli: "codex", name: "docs-cleanup", state: "waiting",
+                   folder: "docs-site", note: "Two style guides disagree on headings; asked the owner which to keep",
+                   active: isoString(Date().addingTimeInterval(-600)), group: "Work / Docs"),
+        BoardAgent(id: "8d8bd0a8-3b6e-484b-89fe-217b761a2481", cli: "claude", name: "theme-colours", state: "idle",
+                   folder: "website", note: "Added 12 background presets and a background colour picker",
+                   active: isoString(Date().addingTimeInterval(-3 * 3600)), group: "Side projects"),
+        BoardAgent(id: "d21ff850-e1bb-46d1-8d0a-c5bc8842af30", cli: "claude", name: "importance-urgency reply", state: "busy",
+                   folder: "to-do-todo-42-importance", note: "Assign to a running agent: helper, Mac and web",
+                   active: isoString(Date().addingTimeInterval(-40)), group: "Admin"),
+        BoardAgent(id: "dad1b5f2-9dd2-4947-9010-b3acaffc4ed9", cli: "claude", name: "agent-board-mac", state: "stale",
+                   folder: "agent-board", note: "", active: isoString(Date().addingTimeInterval(-20 * 3600)), group: "Admin"),
+    ]
 
     static func snap(_ view: AnyView, size: CGSize?, dark: Bool, to out: String, settle: Double, expandPreview: Bool = false) -> Int32 {
         let host = NSHostingView(rootView: view)
@@ -427,6 +445,22 @@ enum SelfTest {
               "a group is rated itself")
         check(g.assignText(lead: 1, others: [5], text: "go").contains("#2") && g.assignText(lead: 1, others: [5], text: "go").contains("#5"),
               "one agent is told of the group's tasks and the others")
+
+        // Assign to a running agent: todo-desk's `agents` records, search, and the board's colours
+        let agentRows: [Any] = [
+            ["id": "01a11bf1-5b48-7651-b12c-140cb15c777e", "cli": "codex", "name": "docs-cleanup", "state": "waiting",
+             "folder": "docs", "note": "asked about headings", "active": "2026-10-16T14:00:00Z", "group": "Work / Docs"],
+            ["id": "8d8bd0a8-3b6e-484b-89fe-217b761a2481", "cli": "claude", "name": "theme-colours", "state": "idle",
+             "folder": "website", "note": "", "active": NSNull(), "group": NSNull()],
+            ["id": "broken"],
+        ]
+        let ba = BoardAgent.decode(agentRows)
+        check(ba.count == 2 && ba[0].cli == "codex" && ba[1].active == nil && ba[1].group == nil, "agents decode, a bad row skipped")
+        check(ba[0].matches("docs headings") && !ba[0].matches("theme") && ba[1].matches("THEME"),
+              "agent search: every word, any field, any case")
+        check(ba[0].stateLabel == "waiting on you" && ba[1].stateLabel == "idle", "agent state words")
+        check(Set(["busy", "background", "waiting", "blocked", "idle", "stale"].map { "\(Palette.agentState($0))" }).count == 6,
+              "each agent state has its own colour")
 
         print(fails.isEmpty ? "selftest OK" : "selftest FAILED:\n  " + fails.joined(separator: "\n  "))
         return fails.isEmpty ? 0 : 1

@@ -770,3 +770,40 @@ enum Grouping {
         return out
     }
 }
+
+// MARK: - running agents (Assign to a running agent)
+
+/// One agent running on the agent board, as todo-desk's `agents` command lists it.
+struct BoardAgent: Codable, Equatable, Identifiable {
+    var id: String
+    var cli: String
+    var name: String
+    var state: String                 // waiting, blocked, idle, background, busy or stale: the board's colours
+    var folder: String
+    var note: String
+    var active: String?
+    var group: String?
+
+    /// The board's words for its state, short enough for a row.
+    var stateLabel: String {
+        switch state {
+        case "waiting": return "waiting on you"
+        case "background": return "bg wait"
+        default: return state
+        }
+    }
+
+    /// The search box: every word must appear in the name, folder, group or last note.
+    func matches(_ query: String) -> Bool {
+        let hay = [name, folder, group ?? "", note].joined(separator: " ").lowercased()
+        return query.lowercased().split(separator: " ").allSatisfy { hay.contains($0) }
+    }
+
+    static func decode(_ any: Any?) -> [BoardAgent] {
+        ((any as? [Any]) ?? []).compactMap { a in
+            guard let d = a as? [String: Any], JSONSerialization.isValidJSONObject(d),
+                  let data = try? JSONSerialization.data(withJSONObject: d) else { return nil }
+            return try? JSONDecoder().decode(BoardAgent.self, from: data)
+        }
+    }
+}

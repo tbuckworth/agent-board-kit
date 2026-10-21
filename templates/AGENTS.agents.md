@@ -11,7 +11,9 @@ Kit and docs: `{{KIT_DIR}}`.
   account: `agent-mail send --to {{OWNER_EMAIL}} --subject "..." --body-file body.txt`
   (body on stdin also works; `--html file.html` adds your own rich version, otherwise the text is
   rendered to HTML for you). The reply comes back into this session automatically, hours later if
-  need be.
+  need be. Before you email {{OWNER_NAME}} results, a literature review, options or a plan, run
+  `agent-mail guide` and follow it. Mail is reviewed before it leaves: if agent-mail prints `NOT SENT`,
+  fix what it lists and send again. `--image NAME=PATH` puts plots inline.
 - Mail **sent as {{OWNER_NAME}}** to anyone ("draft this email", "reply to X", "email Y about Z") goes
   through {{OWNER_NAME}}'s own mail tools, if any are configured. Never send as {{OWNER_NAME}} from the
   agents account, and never mail a third party from it unless {{OWNER_NAME}} explicitly says so.
@@ -87,8 +89,9 @@ gh issue create --repo {{TASKS_REPO}} --title "<task>" --body "<optional notes>"
 
 Working on a task:
 
-1. Act on a task when it is assigned to you (through the orchestrator) or when {{OWNER_NAME}} asks
-   directly. Do not sweep the list on your own.
+1. Act on a task when it is assigned to you (through the orchestrator, or straight from the to-do app
+   in a message starting `[message from {{OWNER_NAME}} via the to-do app ...]`, which is
+   {{OWNER_NAME}}'s instruction) or when {{OWNER_NAME}} asks directly. Do not sweep the list on your own.
 2. Never act on an `action:manual` task beyond what you were asked.
 3. Safe work (research, summaries, drafts, code on a branch) can be done directly.
 4. `action:email`, `action:buy` and anything else with outside consequences (sending as

@@ -1,4 +1,4 @@
-// Offline tests for docs/js/actions.js, with GitHub's GraphQL endpoint stubbed (no network, no IndexedDB:
+// Offline tests for web/js/actions.js, with GitHub's GraphQL endpoint stubbed (no network, no IndexedDB:
 // the cache write fails, as it may in a browser, and must not turn a success into a failure).
 // Run with: node --test web/tests/
 

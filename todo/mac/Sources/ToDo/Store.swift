@@ -146,6 +146,7 @@ final class Store: ObservableObject {
     @Published var now = Date()
     @Published var hasLoaded = false
     var previewStub: String?          // the offscreen renderer's stand-in for the orchestrator message
+    var agentsStub: [BoardAgent]?     // ...and for the board's running agents
 
     static let defaults = UserDefaults.standard
     let channel = DeskLink()
@@ -1119,9 +1120,12 @@ final class Store: ObservableObject {
 
     // MARK: assign to an agent (needs the desktop now; never queued)
 
-    func assignPreview(_ number: Int, text: String, done: @escaping (String?, String?) -> Void) {
+    /// `to`: a running agent's session id; the preview is then the message that agent is sent.
+    func assignPreview(_ number: Int, text: String, to: String? = nil, done: @escaping (String?, String?) -> Void) {
         if let stub = previewStub { done(stub, nil); return }
-        channel.request(["cmd": "assign_preview", "number": number, "text": text], timeout: 60) { r in
+        var req: [String: Any] = ["cmd": "assign_preview", "number": number, "text": text]
+        if let to = to { req["to"] = to }
+        channel.request(req, timeout: 60) { r in
             switch r {
             case .success(let o): done(o["message"] as? String, nil)
             case .failure(let e): done(nil, e.message)
@@ -1129,13 +1133,29 @@ final class Store: ObservableObject {
         }
     }
 
-    func assign(_ number: Int, text: String, again: Bool, done: @escaping (String?) -> Void) {
-        channel.request(["cmd": "assign", "number": number, "text": text, "again": again], timeout: 120) { [weak self] r in
+    /// The agent board's running agents, from the desktop. A helper too old to know `agents` answers with an error,
+    /// so the sheet can't pick one, and never sends a `to` that helper would ignore by starting a new agent.
+    func runningAgents(done: @escaping ([BoardAgent]?, String?) -> Void) {
+        if let stub = agentsStub { done(stub, nil); return }
+        channel.request(["cmd": "agents"], timeout: 60) { r in
+            switch r {
+            case .success(let o): done(BoardAgent.decode(o["agents"]), nil)
+            case .failure(let e): done(nil, e.message)
+            }
+        }
+    }
+
+    /// `to`: send the task into that running agent instead of having the orchestrator start one.
+    func assign(_ number: Int, text: String, again: Bool, to: BoardAgent? = nil, done: @escaping (String?) -> Void) {
+        var req: [String: Any] = ["cmd": "assign", "number": number, "text": text, "again": again]
+        if let a = to { req["to"] = a.id }
+        channel.request(req, timeout: 120) { [weak self] r in
             guard let self = self else { return }
             switch r {
             case .success(let o):
                 if let i = decodeIssue(o["issue"]) { self.server[i.number] = i; self.rebuild([i.number]); self.scheduleSave() }
-                self.show("Assigned. The orchestrator is starting an agent and will email you which one.")
+                self.show(to.map { "Sent to \($0.name). It fits the task in around what it's doing." }
+                          ?? "Assigned. The orchestrator is starting an agent and will email you which one.")
                 done(nil)
             case .failure(let e):
                 done(e.message)

@@ -1,0 +1,11 @@
+[Unit]
+Description=agent-board: update Codex and Claude Code every 6 hours
+
+[Timer]
+OnBootSec=15min
+OnCalendar=*-*-* 03,09,15,21:40
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

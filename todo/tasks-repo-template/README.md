@@ -3,7 +3,7 @@
 This private repository is a to-do list. Each open issue is a task; a closed issue is a finished task (or an
 archived one, if it was closed as "not planned"). The to-do clients from agent-board-kit (the web app, the Mac
 app and the `todo-desk` helper) and the agents read and write it. Nothing in the repository's files is needed
-except `.todo/config.json`.
+except `.todo/config.json`; the desktop also writes `.todo/agents.json` (below).
 
 ## An issue
 
@@ -24,7 +24,8 @@ except `.todo/config.json`.
 
   Any other `## ` section is kept as it is by every client.
 - **Comments**: the agent workflow posts comments whose first line is a marker:
-  `<!-- todo-agent-request -->` (the web app asking for an agent), then
+  `<!-- todo-agent-request -->` (the web app asking for a new agent) or
+  `<!-- todo-agent-request to=SESSION_ID -->` (asking for the task to go to that running agent), then
   `<!-- todo-agent:assigned -->`, `<!-- todo-agent:started -->`, `<!-- todo-agent:done -->`,
   `<!-- todo-agent:blocked -->` or `<!-- todo-agent:failed -->`. The apps show the agent's progress from them.
 
@@ -43,7 +44,7 @@ except `.todo/config.json`.
 | `priority:high`, `priority:medium`, `priority:low` | legacy priority, still set by the Mac app's editor |
 | `source:app`, `source:claude`, `source:import` | where the task came from |
 | `status:agent-requested` | the web app asked for an agent; the desktop's `todo-desk dispatch` picks it up |
-| `status:agent-assigned` | an agent was started on it from a to-do app |
+| `status:agent-assigned` | an agent was started on it from a to-do app, or it was sent to a running agent |
 | `status:claude-processed` | an agent has worked on it; read `## Claude Resolution Notes` |
 | `status:waiting` | waiting on someone; the body's first line says who: `Waiting on: <who>` |
 | `follow-up:YYYY-MM-DD` | when to chase a waiting task (one per task) |
@@ -80,3 +81,10 @@ Optional. It groups lists in the sidebars and orders them, and names the lists t
 
 The Mac app writes this file through `todo-desk` when lists or groups are added, moved or deleted; the web app
 writes it when a list is deleted. Edit it by hand at any time; the clients pick it up on their next sync.
+
+## `.todo/agents.json`
+
+Written by the desktop (`todo-desk dispatch`, commit message "Agents list (todo-desk)"), not by hand: the agents
+running on the desktop, so the web app can offer "A running agent" in Assign to agent. It changes when an agent
+starts or stops, and at most every 5 minutes otherwise. It holds agent names, folders and last status notes.
+Deleting it is harmless; the next dispatch run writes it again.

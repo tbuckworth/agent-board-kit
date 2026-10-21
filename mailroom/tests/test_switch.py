@@ -329,7 +329,8 @@ class Relaunch(unittest.TestCase):
             ok, detail = switch.relaunch_codex(st, "gpt-6.1-sol", "ultra", None, "/bin/codex")
         self.assertTrue(ok)
         self.assertEqual(typed[0], "stty sane; unset CLAUDE_CONFIG_DIR; /bin/codex resume %s -s danger-full-access "
-                                   "-a never -C /w -m gpt-6.1-sol -c model_reasoning_effort=ultra" % st["id"])
+                                   "-a never -C /w -c check_for_update_on_startup=false -m gpt-6.1-sol "
+                                   "-c model_reasoning_effort=ultra" % st["id"])
 
 
 class CodexLiveness(unittest.TestCase):

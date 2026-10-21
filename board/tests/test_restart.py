@@ -140,6 +140,7 @@ class CommandsTest(unittest.TestCase):
             self.assertIn("--name 'weekly status report abcd1234'", work)
             cx = restart.launch_line(agent(cli="codex", id="0190aaaa-0000-7000-8000-00000000a001", model="gpt-6-astra"))
             self.assertTrue(cx.startswith("env %s /bin/codex resume -s danger-full-access -a never -C" % actions.SCRUB_ENV))
+            self.assertIn(" -c check_for_update_on_startup=false ", cx)
             self.assertTrue(cx.endswith("-m gpt-6-astra -c model_reasoning_effort=xhigh 0190aaaa-0000-7000-8000-00000000a001"))
         finally:
             sources.find_bin = real
@@ -312,6 +313,10 @@ class BoardTest(unittest.TestCase):
         col.sessions_fn = lambda: {}
         a = col.agents(NOW)[0][0]
         self.assertEqual(a["state"], "stale")              # resumed 10 min ago, but grey before: still grey
+        # what it does in the first minutes after the restore is activity (a reply came in; it acted and closed)
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"ts": at + 60, "event": "note", "session_id": sid, "cli": "claude", "text": "landed"}) + "\n")
+        self.assertEqual(col.agents(NOW)[0][0]["last_activity"], at + 60)
 
     def test_actions_validate_restart_requests(self):
         bad = ({"action": "restart_run", "update": "yes"}, {"action": "restart_run", "update": True, "wait_minutes": "15"},

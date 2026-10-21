@@ -225,6 +225,95 @@ Every mail is multipart/alternative: the text as given, plus an HTML part render
 (paragraphs, bullet and numbered lists, nested items, fenced code, `**bold**`, `` `code` ``; all
 escaped first) unless `--html` supplies one. Threading and routing never depend on the HTML.
 
+### Plots, images and files
+
+```bash
+agent-mail send --to X --subject S --body-file body.txt --html body.html \
+    --image acc=plots/accuracy.png --image demo=demo.gif --attach results.csv
+```
+
+`--image NAME=PATH` (PNG, JPEG, GIF or WebP, repeatable) embeds the image as a `multipart/related` part
+with `Content-ID: <NAME>`; place it in the HTML with `<img src="cid:NAME" alt="..." style="max-width:100%">`.
+An image the HTML does not reference is shown at the end, so `--image` also works without `--html`.
+`--attach PATH` adds an ordinary attachment. Both work through the Mac proxy (the proxy request is
+capped at 2 MiB, so send big figures from the Linux box). Images and attachments together are capped
+at 20 MB.
+
+### Pre-send review of agent mail
+
+Mail is reviewed before it leaves (`agentmail/review.py`), so that what reaches the owner can be acted on
+without a round of "what does this mean?". Mail to an owner address (the `allowlist`) is held to the
+owner's rules in `agentmail/email_rules.md`: bottom line first, no unexplained labels, scannable, plots
+inline, a clear ask. `agent-mail guide` prints them, and `agent-spawn`'s preamble tells agents to read
+them before a results mail. Mail to anyone else (collaborators, or a person the owner asked an agent to
+write to) is held to clarity rules in `agentmail/review_prompt_outside.md`: purpose first, no unexplained
+labels, self-contained asks and handovers, nothing that must not leave. Plots are not asked for there;
+the test is whether the owner and the collaborator could follow the thread later if asked about it.
+
+The rules were mined from several hundred replies in which one owner had to ask agents for clearer mail
+(jargon, structure, plots, length, the ask). Edit `email_rules.md` and `review_prompt.md` to match your
+own taste, and put a few sentences about yourself in `review.owner_context` (your field, your projects,
+the people you work with) so the reviewer does not ask agents to define what you already know.
+
+0. A credential in the mail (an API key or token pattern, `review.SECRET_PATTERNS`) holds it on every
+   round and in every mode, and no draft is kept for the watchdog; only `--no-review` sends it.
+1. Model-free checks: an image with a `data:` URI or a local path, or `cid:NAME` with no `--image NAME`.
+   These hold the mail even if the model is down.
+2. Mail under 120 words with nothing from step 1 is passed without a model call.
+3. A fresh-context reviewer reads only what Gmail will show (`review.render`: the HTML flattened to
+   text with `[IMAGE ...]` and `[TABLE]` markers, or the HTML agent-mail renders from the text), plus
+   hints (local paths, pipe tables, text a shell may have eaten, the third mail within an hour). It is
+   `claude -p --model haiku --tools "" --setting-sources "" --strict-mcp-config --no-session-persistence`
+   with the prompt for its reader as the system prompt (the first input line names a non-owner reader)
+   and a JSON schema: no CLAUDE.md, no hooks, no tools, so it logs nothing to the status log. It runs on
+   each ready Claude login in the usage order in turn (see [a second Claude login](#optional-a-second-claude-login-usage-routing-and-failover))
+   and last on the optional API-key fallback (`orchestrator_fallback_secret`), moving on when a login
+   fails (usage limit, logged out); the row's `model` reads `haiku`, `haiku (work login)` or
+   `haiku (api key)`. Mail proxied from the Mac is reviewed on the Linux box.
+4. `pass`: the mail goes. `revise`: nothing is sent; agent-mail prints `agent-mail: NOT SENT` and the
+   fixes, and exits 3 (a proxied send gets the same text as a completed receipt). The **next** send or
+   reply from that session to the same kind of reader (`audience`) goes out whatever the review says (one
+   pushback per mail); it is still reviewed and recorded, to measure whether the revision fixed it. A
+   held mail to a collaborator does not let the agent's next mail to the owner through, nor is it settled
+   by it.
+5. `--no-review "why"` sends at once (recorded as `override`); `agent-status report --email` passes it,
+   since the report has a fixed format, and `--unrouted` system mail is never reviewed.
+   `agent-mail withdraw` drops the held draft. A draft nobody revised or withdrew is sent unchanged by
+   the mailroom's watchdog after `fallback_minutes` (`expired`); mail to the owner gets a one-line note
+   at the top saying so, mail to anyone else does not.
+6. Any other failure (no claude binary, timeout, every login failing, bad JSON) sends the mail (`error`).
+
+Every decision is a row in the `reviews` table: `tag`, `created_at`, `round`, `verdict` (pass, revise,
+advised, skipped, override, error, withdrawn, expired), `subject`, `kind`, `sent_message_id` (set once that
+mail went out), `reasons`, `fixes` (JSON), `words`, `model`, `seconds`, `cost`, `draft` (the held mail,
+cleared once settled) and `audience` (`owner`, `collaborator` or `other`; null means owner). The agent
+board reads it, and relies on two shapes:
+
+- **A held draft** is the newest row per tag and audience with `verdict` revise and a `draft`: the board
+  shows "sent back for revision and not re-sent".
+- **A credential stop** is `verdict` revise, `kind` secret and no `draft`: nothing will go out unless the
+  agent sends again, so the board shows a tile until it does. Its `reasons` quote the start of the
+  credential, and the board never shows them.
+
+Config, under `"review"` in `config.json` (defaults shown):
+
+```json
+{"review": {"enabled": true, "model": "haiku", "timeout": 40, "min_words": 120,
+            "fallback_minutes": 30, "mode": "enforce", "review_round2": true,
+            "hold_kinds": "all", "hold_min_words": 300, "outside": true, "hold_outside": true,
+            "owner_context": ""}}
+```
+
+`"mode": "shadow"` reviews and records every mail but always sends: use it to measure first.
+The reviewer grades each issue `blocker` (the reader would have to ask before acting) or `polish`; only
+a blocker holds a mail, and polish is printed after sending as tips. `hold_kinds` narrows which mail a
+blocker holds: a list such as `["results_report", "literature_review", "recommendation",
+"plan_or_proposal"]` holds those kinds and any mail of `hold_min_words` or more, and sends the rest with
+the blockers as tips (`advised`). In the evaluation the reviewer was tuned on, that lighter setting held
+59% of the mails that had drawn a complaint instead of 93%, and about 30% of all agent mail instead of
+about 55%. `"outside": false` stops reviewing mail to anyone but the owner; `"hold_outside": false` sends
+it at once and returns its blockers to the agent as tips (`advised`).
+
 ## agent-send
 
 ```bash
@@ -412,7 +501,8 @@ Keys left out take these defaults (`agentmail/config.py`):
 | `memwatch` | `{}` | agent-memwatch overrides (`agentmail/memwatch.py`). |
 | `agent_memory_max` | `"32G"` | Per-agent MemoryMax; `"off"` for none. |
 | `agent_swap_max` | `"2G"` | Per-agent MemorySwapMax; `"off"` for none. |
-| `collaborators` | `{}` | `{address: {"name", "owner"}}` of collaborators' agents. |
+| `collaborators` | `{}` | `{address: {"name", "owner"}}` of collaborators' agents; `share_data_with` lists the rest of that collaborator's team (their own address, say), so mail to them is reviewed as collaborator mail. |
+| `review` | see [Pre-send review](#pre-send-review-of-agent-mail) | The pre-send review of agent mail: `enabled`, `mode`, `model`, `owner_context` and the hold settings. |
 | `require_dkim` | `true` | Honour owner/collaborator mail only with a DKIM pass for the sender's domain. |
 | `collaborator_hourly_cap` | `10` | Collaborator mails per hour before holding. |
 | `agent_thread_cap` | `12` | Consecutive agent messages in a thread before the loop guard holds it. |
@@ -516,6 +606,10 @@ After changing a unit, `systemctl --user daemon-reload` **before** restarting, a
 - `"crossSessionInbound": "accept"` in `~/.claude/settings.json`.
 - Neither CLI is on PATH in cron, systemd or a non-login SSH shell; `agent-send` and friends look in
   `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, then ask a login shell.
+- Once Codex knows of a newer release, an interactive start opens on an "Update available" menu
+  and waits for a key before loading the thread. agent-spawn and agent-switch pass
+  `-c check_for_update_on_startup=false` (`registry.CODEX_NO_UPDATE_PROMPT`) so their launches never
+  wait there; the board's `agent-cli-update` timer keeps both CLIs current instead.
 
 ## Tests
 

@@ -25,6 +25,13 @@
   --color-error: #D94652;
   --color-warning: #E8A840;
   --color-follow-up: #A86A00;
+  /* Agent states, as on the agent board */
+  --color-agent-busy: #AD7D48;
+  --color-agent-background: #7E5A33;
+  --color-agent-waiting: #3E9A62;
+  --color-agent-blocked: #D94652;
+  --color-agent-idle: #4A7FC1;
+  --color-agent-stale: #9E9EB0;
   --color-overlay: rgba(26, 26, 46, 0.5);
 
   /* Typography */
@@ -105,6 +112,12 @@
   --color-claude-bg: rgba(196, 149, 106, 0.12);
   --color-overlay: rgba(10, 10, 20, 0.7);
   --color-follow-up: #F2B85A;
+  --color-agent-busy: #C89660;
+  --color-agent-background: #9A7148;
+  --color-agent-waiting: #5CC487;
+  --color-agent-blocked: #EF6B75;
+  --color-agent-idle: #78A6E0;
+  --color-agent-stale: #6E6E88;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
   --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3);
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.4);

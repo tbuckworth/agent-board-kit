@@ -557,7 +557,7 @@ class MailStore:
         return self.con
 
     def read(self, now=None, window=7 * 86400):
-        """{"by_session": {(cli, sid): {"sent": [...], "inbound": [...]}}, "held": [...]}"""
+        """{"by_session": {(cli, sid): {"sent": [...], "inbound": [...], "reviews": [...]?}}, "held": [...]}"""
         now = now or time.time()
         owners = self.owners if self.owners is not None else owner_addresses()
         con = self._db()
@@ -596,6 +596,22 @@ class MailStore:
                     key = next((k for k in tags.values() if k[1] == sid), None)
                 if key:
                     out["by_session"].setdefault(key, {"sent": [], "inbound": []})["inbound"].append(d)
+            try:     # each tag's newest pre-send review per audience (the mailroom holds a draft per audience:
+                     # owner, collaborator, other; null is owner); a mailroom without the review has no table
+                for r in con.execute(
+                        # a credential stop's reasons quote the start of what matched: never read them
+                        "select r.tag, r.created_at, r.verdict, r.subject, r.kind, r.sent_message_id, "
+                        "case when r.kind = 'secret' then null else r.reasons end as reasons, "
+                        "coalesce(r.audience, 'owner') as audience, r.draft is not null as has_draft "
+                        "from reviews r where r.created_at >= ? and r.id = (select max(id) from reviews x "
+                        "where x.tag = r.tag and coalesce(x.audience, 'owner') = coalesce(r.audience, 'owner'))",
+                        (since,)):
+                    key = tags.get(r["tag"])
+                    if key:
+                        out["by_session"].setdefault(key, {"sent": [], "inbound": []}).setdefault(
+                            "reviews", []).append(dict(r))
+            except sqlite3.OperationalError:
+                pass
         except sqlite3.Error as e:
             self.con = None
             out["ok"] = False

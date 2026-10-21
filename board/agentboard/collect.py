@@ -3,7 +3,7 @@ import os
 import threading
 import time
 
-from . import SNAPSHOT_VERSION, classify, config, sources
+from . import SNAPSHOT_VERSION, actions, classify, config, sources
 
 EVENTS_PER_AGENT = 25
 NOTES_PER_AGENT = 8
@@ -157,7 +157,8 @@ def tmux_name(reg_tmux):
 class Collector:
     def __init__(self, events=None, codex=None, mail=None, git=None, metrics=None, usage=None,
                  claude=sources.claude_sessions_all, panes=sources.tmux_panes, prs=None, gmail=None, worktrees=None,
-                 desktop=None, restored=None, waits=sources.stuck_waits, routing=sources.claude_routing):
+                 desktop=None, restored=None, waits=sources.stuck_waits, routing=sources.claude_routing,
+                 stops=actions.last_turn_failed):
         self.events = events or sources.EventLog()
         self.codex = codex or sources.CodexReader()
         self.mail = mail or sources.MailStore()
@@ -175,6 +176,8 @@ class Collector:
         self.waits_fn = waits
         self.routing_fn = routing
         self.models = {}                       # (session id, pid) -> model, for agents on a later login
+        self.stops_fn = stops
+        self.stops = {}                        # (session id, limit/error ts) -> (transcript ends on it?, read at)
         self.waits, self.waits_at = {}, 0
         self.sessions_fn = sources.tmux_sessions
         self.subagent_ids = set()
@@ -192,6 +195,26 @@ class Collector:
         if now - self.waits_at > 30 or not set(pids) <= set(self.waits_for):
             self.waits, self.waits_at, self.waits_for = (self.waits_fn(pids) if pids else {}), now, list(pids)
         return self.waits
+
+    def _unconfirmed_stop(self, a, now, kept):
+        """The time of the limit or API-error event that would show a live Claude agent as blocked, when its
+        transcript doesn't end on a failed request (a side request's StopFailure after a finished turn), else 0.
+        The transcript is read once per event, from 30 s after it (Claude Code may still be writing its record);
+        an unreadable one is asked again after 5 minutes."""
+        stop = max(a.get("quota_ts") or 0, (a.get("error") or {}).get("ts") or 0)
+        if not (a["live"] and a["cli"] == "claude" and stop and stop >= (a.get("last_turn_end") or 0)
+                and now - stop >= 30):
+            return 0
+        key = (a["id"], stop)
+        kept.add(key)
+        failed, at = self.stops.get(key, (None, 0))
+        if failed is None and now - at > 300:
+            try:
+                failed = self.stops_fn(a["id"])
+            except Exception:                    # unreadable: keep showing it blocked
+                failed = None
+            self.stops[key] = (failed, now)
+        return stop if failed is False else 0
 
     tmux_names = {}
     waits_for = []
@@ -271,12 +294,14 @@ class Collector:
             last_activity = max(ev.get("last_ts", 0), s.get("status_at") or 0)
             if sid in restored:
                 at, before = restored[sid]
+                # the restart's own start/end lines are not activity; anything else is, even in the first minutes
+                # (an agent can get a reply during the restore, act on it and close itself)
                 real = [e["ts"] for e in ev.get("events", [])
-                        if not (e["event"] in ("start", "end") and at - 120 <= e["ts"] <= at + 300) and e["ts"] > at + 300]
+                        if e["event"] not in ("start", "end") or e["ts"] > at + 300]
                 status_at = (s.get("status_at") or 0) if (s.get("status_at") or 0) > at + 300 else 0
                 last_activity = max([before, status_at] + real)
             m = mail["by_session"].get((s["cli"], sid), {"sent": [], "inbound": []})
-            ms = classify.mail_state(m["sent"], m["inbound"], now)
+            ms = classify.mail_state(m["sent"], m["inbound"], now, reviews=m.get("reviews"))
             if self.gmail is not None and ms["unanswered"]:
                 ms["read"] = self.gmail.is_read(ms["last_out_id"])
             if self.gmail is not None and ms.get("last_out_id"):
@@ -324,13 +349,16 @@ class Collector:
                     a["git"].update({k: f.get(k) for k in ("upstream", "ahead", "behind", "untracked", "default", "not_in_default", "linked")})
         shell = [int(a["pid"]) for a in rows if a["live"] and a["cli"] == "claude" and a["bg"] and a["pid"]]
         waits = self._waits(shell, now)
+        kept = set()
         for a in rows:
             if a["bg"] and a["pid"]:
                 a["bg_waits"] = waits.get(int(a["pid"]))
+            a["stop_unconfirmed"] = self._unconfirmed_stop(a, now, kept)
             a["display"] = classify.display_name(a)
             a["state"], a["reason"] = classify.classify(a, now, owner=self.owner)
             a["fresh"] = round(classify.freshness(a["state"], now - (a["last_activity"] or 0)), 2)
             a["stranded"] = classify.stranded(a)
+        self.stops = {k: v for k, v in self.stops.items() if k in kept}
         classify.disambiguate(rows)
         order = {s: i for i, s in enumerate(classify.STATES)}
         rows.sort(key=lambda a: (order.get(a["state"], 99), -(a["last_activity"] or 0)))
