@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -117,6 +118,52 @@ class CommandsTest(unittest.TestCase):
             self.assertEqual((broken["gpu_ok"], broken["gpu_message"]), (False, "NVIDIA-SMI has failed"))
         finally:
             sources.find_bin = real
+
+    def test_background_waits_leave_out_finished_and_older_commands(self):
+        home = Path(tempfile.mkdtemp())
+        sid = "11111111-2222-3333-4444-555555555555"
+        (home / "projects" / "-x").mkdir(parents=True)
+
+        def iso(t):
+            return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+        def bg(tid, t, what):
+            return {"type": "assistant", "timestamp": iso(t), "message": {"content": [
+                {"type": "tool_use", "id": tid, "name": "Bash",
+                 "input": {"command": "sleep 1", "description": what, "run_in_background": True}}]}}
+
+        def done(tid, t, status="completed"):
+            return {"type": "user", "timestamp": iso(t), "message": {"content": (
+                "<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>%s</tool-use-id>\n<status>%s</status>\n"
+                "<summary>Background command completed</summary>\n</task-notification>" % (tid, status))}}
+
+        def started(tid, task, t):
+            return {"type": "user", "timestamp": iso(t), "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tid, "content": "Command running in background with ID: %s. "
+                                                                        "Output is being written to: /x" % task}]}}
+
+        def stop(task, t):
+            return {"type": "assistant", "timestamp": iso(t), "message": {"content": [
+                {"type": "tool_use", "id": "toolu_stop", "name": "TaskStop", "input": {"task_id": task}}]}}
+
+        rows = [bg("toolu_old", NOW - 7200, "from before this process"), bg("toolu_a", NOW - 600, "finished"),
+                done("toolu_a", NOW - 500), bg("toolu_b", NOW - 400, "failed"), done("toolu_b", NOW - 300, "failed"),
+                bg("toolu_s", NOW - 350, "stopped by the agent"), started("toolu_s", "bstop1", NOW - 349),
+                stop("bstop1", NOW - 250), bg("toolu_c", NOW - 200, "still running"),
+                bg("toolu_q", NOW - 190, "ended mid-turn"),
+                {"type": "attachment", "timestamp": iso(NOW - 100), "attachment": {
+                    "type": "queued_command", "prompt": done("toolu_q", NOW - 100)["message"]["content"]}},
+                # a request record repeats earlier messages, with no timestamp: not a new command
+                dict(bg("toolu_a", NOW, "finished"), type="api-request-blob", timestamp=None)]
+        (home / "projects" / "-x" / ("%s.jsonl" % sid)).write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        real = actions.claude_home_of
+        actions.claude_home_of = lambda s: ("personal", str(home))
+        try:
+            waits = restart.background_waits({"id": sid, "cli": "claude", "started_at": NOW - 3600}, now=NOW)
+        finally:
+            actions.claude_home_of = real
+        self.assertEqual([w["what"] for w in waits], ["still running"])
+        self.assertEqual(set(waits[0]), {"ts", "what", "command"})
 
     def test_default_choices_and_steps(self):
         self.assertEqual(restart.default_choice(agent(state="busy")), "nudge")

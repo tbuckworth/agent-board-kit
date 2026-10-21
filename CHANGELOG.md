@@ -7,6 +7,10 @@ where the reader cannot yet tell what it is about. The first lines must say a de
 words; the question goes at the top only if it stands on its own (what would be done, with what, at what
 cost), otherwise right after the recommendation.
 
+**Restart: only commands still running count as waits** (board). Before a restart, the board lists what
+each Claude agent is waiting on. It used to list every background command from the last day; it now leaves
+out commands that have finished, failed or been stopped, and ones started before the agent was last resumed.
+
 ## 2026-10-21
 
 **Pre-send review of agent mail** (mailroom). Before an agent's mail of 120 words or more leaves, a

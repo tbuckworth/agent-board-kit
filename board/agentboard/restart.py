@@ -12,6 +12,7 @@
 Nothing here runs a model. The manifest lives in STATE; `status.json` is what the board shows while it runs.
 Mail goes to the mailroom config's owner_email (agent-mail send --unrouted); without one, nothing is mailed.
 """
+import datetime
 import json
 import os
 import re
@@ -173,14 +174,32 @@ def model_effort(agent):
     return model, effort
 
 
-def background_waits(agent, since=24 * 3600, limit=3):
-    """What a Claude agent said it was waiting for: the descriptions of its recent `run_in_background` commands."""
+NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
+BG_STARTED = re.compile(r"Command running in background with ID: (\w+)")
+TASK_STOPS = {"TaskStop": "task_id", "KillShell": "shell_id", "KillBash": "shell_id"}   # tool: its task-id argument
+BG_KEYS = ('"run_in_background"', "task-notification", "running in background with ID", '"TaskStop"', '"KillShell"',
+           '"KillBash"')
+
+
+def _epoch(iso):
+    try:
+        return datetime.datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def background_waits(agent, since=24 * 3600, limit=3, now=None):
+    """What a Claude agent said it was waiting for: the descriptions of its recent `run_in_background` commands
+    that are still running. One that ended has a `<task-notification>` with a status (completed, failed, killed)
+    or a TaskStop of its task id (the tool result that started it gives that id); one from before this process
+    started (a resume) or older than `since` isn't a wait now."""
     if agent["cli"] != "claude":
         return []
     _, home = actions.claude_home_of(agent["id"])
     if not home:
         return []
-    out = []
+    after = max((now or time.time()) - since, agent.get("started_at") or 0)
+    out, task_of, ended = [], {}, set()         # ended: tool-use ids and task ids
     for path in Path(home).glob("projects/*/%s.jsonl" % agent["id"]):
         try:
             with open(path, "rb") as fh:
@@ -189,19 +208,37 @@ def background_waits(agent, since=24 * 3600, limit=3):
         except OSError:
             continue
         for line in lines:
-            if '"run_in_background"' not in line:
+            if not any(k in line for k in BG_KEYS):
                 continue
+            # an end arrives as a user message, or mid-turn as a queued_command attachment / queue operation
+            for note in NOTIFICATION.findall(line):
+                status = re.search(r"<status>([a-z_]+)</status>", note)
+                if status and status.group(1) != "running":
+                    ended.update(re.findall(r"<(?:task-id|tool-use-id)>([^<\s\\]+)</", note))
             try:
                 d = json.loads(line)
             except ValueError:
                 continue
+            if d.get("type") not in ("assistant", "user"):
+                continue                # api-request-blob and the like repeat messages, without a timestamp
             content = (d.get("message") or {}).get("content")
             for c in content if isinstance(content, list) else []:
                 inp = c.get("input") or {} if isinstance(c, dict) else {}
-                if c.get("type") == "tool_use" and c.get("name") == "Bash" and inp.get("run_in_background"):
-                    out.append({"ts": d.get("timestamp", ""), "what": (inp.get("description") or "")[:160],
-                                "command": (inp.get("command") or "")[:200]})
-    return out[-limit:]
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "tool_result":
+                    m = BG_STARTED.search(json.dumps(c.get("content")))
+                    if m:
+                        task_of[c.get("tool_use_id")] = m.group(1)
+                elif c.get("type") == "tool_use" and c.get("name") in TASK_STOPS:
+                    ended.add(str(inp.get(TASK_STOPS[c["name"]]) or ""))
+                elif c.get("type") == "tool_use" and c.get("name") == "Bash" and inp.get("run_in_background"):
+                    if (_epoch(d.get("timestamp")) or after) >= after:
+                        out.append({"id": c.get("id"), "ts": d.get("timestamp", ""),
+                                    "what": (inp.get("description") or "")[:160],
+                                    "command": (inp.get("command") or "")[:200]})
+    return [{k: v for k, v in w.items() if k != "id"} for w in out
+            if w["id"] not in ended and task_of.get(w["id"]) not in ended][-limit:]
 
 
 def agent_processes(agent, proc="/proc", limit=8):
