@@ -7,6 +7,10 @@ your inbox, a Mac menu-bar board and a GitHub-Issues to-do list.
   in the exact session that wrote to you, even hours later. Mail that no agent owns goes to an
   **orchestrator** (one fresh `claude -p` run per email), which starts, relays to, and closes
   agents for you.
+- **Mail you can act on.** Before an agent's mail leaves, a cheap model with no context reads it as
+  you will. If it would leave you asking "what does this mean?" or "where's the plot?", it goes back to
+  the agent once, with concrete fixes. Plots go inline, and a mail containing an API key or token is
+  never sent. Mail to collaborators and other people is checked for clarity too.
 - **One worktree per agent.** `agent-spawn` makes a branch off `origin/main`, a git worktree, a
   tmux session and a memory-capped systemd scope, and launches Claude Code or Codex in it with a
   brief. `agent-close` removes it, but only when its work is landed.
@@ -14,8 +18,8 @@ your inbox, a Mac menu-bar board and a GitHub-Issues to-do list.
   a tile coloured by state (busy, waiting on you, blocked, idle, offline), with git progress
   toward main, plan usage, and right-click actions (message, close, resume, switch model/login).
 - **A to-do list agents can work on.** Your tasks are issues in a private GitHub repo. A web app
-  and a Mac app edit them. **Assign to agent** starts an agent on a task; it reports back on the
-  issue and by email.
+  and a Mac app edit them. **Assign to agent** starts an agent on a task, or hands it to one that is
+  already running; it reports back on the issue and by email.
 - **Free status notes.** Hooks log every turn; agents add one-line milestones with
   `agent-status note`. A status report email costs one small model call.
 
@@ -107,7 +111,8 @@ mailroom on macOS itself is untested; [docs/07-mac.md](docs/07-mac.md) says what
 
 ## Updating
 
-`git pull && ./install.sh` (add `--start` to also enable anything new; running services are not restarted). Your
+`git pull && ./install.sh` (add `--start` to also enable anything new; running services are not restarted).
+What changed in each update: [CHANGELOG.md](CHANGELOG.md). Your
 `kit.env`, configs, Gmail token, orchestrator memory and state survive updates. After a change to
 the mailroom code, restart the daemon: `systemctl --user restart agent-mailroom` (check that no
 orchestrator run is in flight: `agent-orchestrate --runs`).

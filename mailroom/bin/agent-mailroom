@@ -29,12 +29,13 @@ unread. Own outbound copies are ignored. State: ~/.local/state/agent-mail/mailro
 import argparse
 import fcntl
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import alerts, config, deliver, gmail, orchestrate, recovery, registry, routing, statuslog  # noqa: E402
+from agentmail import alerts, config, deliver, gmail, orchestrate, recovery, registry, review, routing, statuslog  # noqa: E402
 from agentmail.store import Store  # noqa: E402
 
 STOP = False
@@ -273,6 +274,15 @@ def watchdog(svc, st, cfg):
             recovery.notify(svc, st, cfg, row)
         except Exception as e:
             log("reply #%s notification failed: %s" % (row["id"], e))
+    # 2. mail the pre-send review sent back that its agent neither revised nor withdrew in time: send it as is
+    if st.stale_drafts(now - 60 * review.settings(cfg)["fallback_minutes"]):
+        try:
+            r = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "agent-mail"), "flush-drafts"],
+                               capture_output=True, text=True, timeout=300)
+            for line in (r.stdout + r.stderr).splitlines():
+                log("review " + line)
+        except Exception as e:
+            log("review flush-drafts failed: %s" % e)
     # (the orchestrator now runs as a synchronous `claude -p` per event, so its outcome is known
     #  immediately; see process())
 

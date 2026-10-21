@@ -547,6 +547,47 @@ export async function fetchConfig() {
   return { config: content, sha: data.sha };
 }
 
+// The running agents the desktop publishes for Assign to agent (.todo/agents.json); null until it has.
+// Read through the contents API, not the raw file, so the private repo's token works and it isn't cached.
+export async function fetchAgents() {
+  if (!_token) throw new AuthError('No token configured');
+
+  const res = await fetch(
+    `https://api.github.com/repos/${OWNER}/${REPO}/contents/.todo/agents.json`,
+    {
+      headers: {
+        'Authorization': `Bearer ${_token}`,
+        'Accept': 'application/vnd.github.v3+json',
+      },
+      cache: 'no-store',
+    }
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Agent list fetch failed: ${res.status}`);
+
+  const data = await res.json();
+  const bytes = Uint8Array.from(atob((data.content || '').replace(/\s/g, '')), c => c.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+// An issue's comments, oldest first (the first 100), for the agent status line
+export async function fetchIssueComments(issueNumber) {
+  if (!_token) throw new AuthError('No token configured');
+
+  const res = await fetch(
+    `https://api.github.com/repos/${OWNER}/${REPO}/issues/${issueNumber}/comments?per_page=100`,
+    {
+      headers: {
+        'Authorization': `Bearer ${_token}`,
+        'Accept': 'application/vnd.github.v3+json',
+      },
+      cache: 'no-store',
+    }
+  );
+  if (!res.ok) throw new Error(`Comments fetch failed: ${res.status}`);
+  return res.json();
+}
+
 // Push config file to .todo/config.json
 export async function pushConfig(config, sha) {
   if (!_token) throw new AuthError('No token configured');

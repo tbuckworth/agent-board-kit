@@ -195,10 +195,15 @@ export function isRatedList(listName, groupName) {
 export const AGENT_REQUESTED_LABEL = 'status:agent-requested';
 export const AGENT_ASSIGNED_LABEL = 'status:agent-assigned';
 export const AGENT_REQUEST_MARKER = '<!-- todo-agent-request -->';
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export function agentRequestBody(instructions) {
+// `to` (a running agent's session id) asks the desktop to send the task to that agent instead of starting
+// a new one: `<!-- todo-agent-request to=<id> -->`
+export function agentRequestBody(instructions, to = null) {
   const text = (instructions || '').trim();
-  return `${AGENT_REQUEST_MARKER}\n\n${text || 'No extra instructions.'}`;
+  if (to != null && !SESSION_ID.test(to)) throw new Error('Not an agent session id');
+  const marker = to ? `<!-- todo-agent-request to=${to.toLowerCase()} -->` : AGENT_REQUEST_MARKER;
+  return `${marker}\n\n${text || 'No extra instructions.'}`;
 }
 
 // The notes (without the checklist, Claude's notes or the "Waiting on:" line) and who the task waits on.

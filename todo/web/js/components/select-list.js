@@ -17,6 +17,7 @@ import { isRatedList } from '../parser.js';
 import { normaliseTag, addDays } from '../tags.js';
 import { buildRows, loadCollapsed, saveCollapsed, groupCounts } from '../groups.js';
 import * as bulk from '../bulk.js';
+import { agentPicker } from './agent-picker.js';
 
 const DRAG_THRESHOLD = 6;
 
@@ -371,11 +372,17 @@ export function selectableTaskList({ tasks, listName, onOpen, onToggle, rerender
 
   function askAgent(nums) {
     const textarea = el('textarea', { className: 'input textarea', placeholder: 'Instructions (optional)' });
+    const picker = agentPicker('bulk-assign');
     modal(nums.length > 1 ? `One agent for ${nums.length} tasks` : 'Assign to agent', [
+      picker.element,
       nums.length > 1 ? el('p', { className: 'form-hint' }, 'One agent gets them all as one job. The desktop picks it up within 2 minutes.') : null,
       textarea,
     ], 'Assign', () => {
-      run(() => bulk.assignTasks(nums, textarea.value), 'Assigned to an agent');
+      const problem = picker.check();
+      if (problem) { showToast(problem); return false; }
+      const target = picker.target();
+      run(() => bulk.assignTasks(nums, textarea.value, target?.id || null),
+        target ? `Handed to ${target.name}` : 'Assigned to an agent');
       return true;
     });
     textarea.focus();

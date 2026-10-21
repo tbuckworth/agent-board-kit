@@ -182,6 +182,8 @@ def preamble(name, path, branch, cli, cfg=None):
         "Protocol: record milestones, blockers and finished work with `agent-status note \"...\"` (free, no model). "
         "Email %s only when you are done or blocked and they must act, or when they asked for email updates: "
         "`agent-mail send --to %s --subject ... --body-file ...`%s. "
+        "Before mailing them results, a review, options or a plan, run `agent-mail guide` and follow it: they read "
+        "with no context, want the bottom line first, plain words and plots inline (`--image`). "
         "Their replies come back into this session automatically. Commit as you go; do not push unless the brief says so. "
         "If %s asks you to close (in any words), run `agent-close --self --dry-run`. If it reports unlanded work, "
         "say what is left and ask whether to land it or discard it (then `--force`). Otherwise reply with a "
@@ -245,7 +247,7 @@ def wait_for(pred, timeout, step=1.0):
 def launch_codex(name, path, brief_path, model, effort, props=None):
     cx = registry.codex_bin() or die("codex binary not found")
     before = registry.codex_live_ids()
-    cmd = [cx, "-s", "danger-full-access", "-a", "never", "-C", path]
+    cmd = [cx, "-s", "danger-full-access", "-a", "never", "-C", path] + registry.CODEX_NO_UPDATE_PROMPT
     if model:
         cmd += ["-m", model]
     if effort:

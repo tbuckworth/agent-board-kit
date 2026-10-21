@@ -633,6 +633,8 @@ struct AssignSheet: View {
     let task: TaskItem
     @ObservedObject var store: Store
     var others: [Int] = []                          // several selected: this one agent handles them as well
+    var startRunning = false                        // the offscreen renderer: open on "A running agent"...
+    var startChosen: String?                        // ...with this agent picked
     @State private var text = ""
     @State private var preview: String?
     @State private var previewError: String?
@@ -640,12 +642,27 @@ struct AssignSheet: View {
     @State private var sending = false
     @State private var error: String?
     @State private var previewTask: DispatchWorkItem?
+    /// A new agent from the orchestrator, or one already running on the agent board
+    @State private var running = false
+    @State private var agents: [BoardAgent]?
+    @State private var agentsError: String?
+    @State private var chosen: BoardAgent?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Assign to an agent").font(.system(size: 15 * z, weight: .semibold))
-            Text("The orchestrator starts an agent for this task and emails you which one. The task gets the status:agent-assigned label and a comment, so it isn't assigned twice. The agent comments on the task when it starts and when it's done.")
+            Picker("", selection: $running) {
+                Text("New agent").tag(false)
+                Text("A running agent").tag(true)
+            }
+            .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 300 * z)
+            Text(running
+                 ? "The task goes straight to the agent you pick, which fits it in around what it's doing. The task gets the status:agent-assigned label and a comment naming the agent. It comments on the task when it's done."
+                 : "The orchestrator starts an agent for this task and emails you which one. The task gets the status:agent-assigned label and a comment, so it isn't assigned twice. The agent comments on the task when it starts and when it's done.")
                 .font(.system(size: 12 * z)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if running {
+                RunningAgentPicker(agents: agents, error: agentsError, chosen: $chosen, now: store.now) { loadAgents() }
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text(task.title).font(.system(size: 13 * z, weight: .semibold)).lineLimit(2)
                 Text(summary).font(.system(size: 11 * z)).foregroundStyle(.secondary)
@@ -657,13 +674,14 @@ struct AssignSheet: View {
                 Text(othersNote).font(.system(size: 12 * z)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if task.assigned {
-                Text("Already assigned \(Fmt.ago(task.agent?.assignedAt ?? task.issue.updatedAt, now: store.now)). Assigning again starts a second agent.")
+                Text("Already assigned \(Fmt.ago(task.agent?.assignedAt ?? task.issue.updatedAt, now: store.now)). "
+                     + (running ? "Assigning again gives it to a second agent." : "Assigning again starts a second agent."))
                     .font(.system(size: 12 * z, weight: .medium)).foregroundColor(Palette.attention)
             }
             Text("Anything the agent should know? (optional)").font(.system(size: 12 * z)).foregroundStyle(.secondary)
             TextEditor(text: $text)
                 .font(.system(size: 13 * z))
-                .frame(height: 110 * z)
+                .frame(height: (running ? 70 : 110) * z)
                 .padding(4)
                 .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.18)))
             DisclosureGroup(isExpanded: $showPreview) {
@@ -676,7 +694,7 @@ struct AssignSheet: View {
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
             } label: {
-                Text("Message to the orchestrator").font(.system(size: 12 * z))
+                Text(running ? "Message to \(chosen?.name ?? "the agent")" : "Message to the orchestrator").font(.system(size: 12 * z))
             }
             if !store.link.isLive {
                 Text("The desktop isn't connected, and assigning needs it. Try again once the link is back.")
@@ -690,20 +708,41 @@ struct AssignSheet: View {
                 Spacer()
                 if sending { ProgressView().controlSize(.small) }
                 Button("Cancel") { store.assigning = nil }.keyboardShortcut(.cancelAction)
-                Button(task.assigned ? "Assign again" : "Assign to agent") { send() }
+                Button(running ? "Send to \(chosen?.name ?? "agent")" : task.assigned ? "Assign again" : "Assign to agent") { send() }
                     .buttonStyle(CaramelButton())
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(sending || !store.link.isLive)
+                    .disabled(sending || !store.link.isLive || (running && chosen == nil))
             }
         }
         .padding(22)
         .frame(width: 560 * z)
-        .onAppear { loadPreview() }
+        .onAppear {
+            if startRunning { running = true; loadAgents() }
+            loadPreview()
+        }
         .onChange(of: text) { _ in
             previewTask?.cancel()
             let w = DispatchWorkItem { loadPreview() }
             previewTask = w
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
+        }
+        .onChange(of: running) { on in
+            if on && agents == nil { loadAgents() }
+            loadPreview()
+        }
+        .onChange(of: chosen?.id) { _ in loadPreview() }
+    }
+
+    func loadAgents() {
+        agentsError = nil
+        guard store.link.isLive || store.agentsStub != nil else { agentsError = "The desktop isn't connected."; return }
+        store.runningAgents { list, err in
+            if let list = list {
+                agents = list
+                if let id = chosen?.id ?? startChosen { chosen = list.first { $0.id == id } }   // gone since: unpicked
+            } else {
+                agentsError = "Couldn't read the agent board: \(err ?? "no answer")"
+            }
         }
     }
 
@@ -723,17 +762,21 @@ struct AssignSheet: View {
 
     func loadPreview() {
         guard store.link.isLive || store.previewStub != nil else { previewError = "The desktop isn't connected."; return }
-        store.assignPreview(task.number, text: store.assignText(lead: task.number, others: others, text: text)) { msg, err in
+        if running && chosen == nil { preview = nil; previewError = "Pick an agent to see what it is sent."; return }
+        store.assignPreview(task.number, text: store.assignText(lead: task.number, others: others, text: text),
+                            to: running ? chosen?.id : nil) { msg, err in
             preview = msg
             previewError = err.map { "Couldn't build the message: \($0)" }
         }
     }
 
     func send() {
+        if running && chosen == nil { return }
         sending = true
         error = nil
         let lead = task.number, rest = others
-        store.assign(lead, text: store.assignText(lead: lead, others: rest, text: text), again: task.assigned) { err in
+        store.assign(lead, text: store.assignText(lead: lead, others: rest, text: text), again: task.assigned,
+                     to: running ? chosen : nil) { err in
             sending = false
             if let e = err { error = e } else {
                 store.noteOthers(rest, lead: lead)
@@ -741,6 +784,76 @@ struct AssignSheet: View {
                 store.assigning = nil
             }
         }
+    }
+}
+
+/// The agent board's running agents, to pick one for a task: searchable, the ones that most want you first.
+struct RunningAgentPicker: View {
+    @Environment(\.zoom) private var z
+    let agents: [BoardAgent]?
+    let error: String?
+    @Binding var chosen: BoardAgent?
+    let now: Date
+    let refresh: () -> Void
+    @State private var query = ""
+
+    var body: some View {
+        let shown = (agents ?? []).filter { query.isEmpty || $0.matches(query) }
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search agents", text: $query).textFieldStyle(.plain).font(.system(size: 13 * z))
+                Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Read the agent board again")
+            }
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    if let e = error {
+                        Text(e).font(.system(size: 12 * z)).foregroundColor(Palette.red).padding(6)
+                    } else if agents == nil {
+                        HStack { ProgressView().controlSize(.small); Text("Reading the agent board…").foregroundStyle(.secondary) }
+                            .font(.system(size: 12 * z)).padding(6)
+                    } else if shown.isEmpty {
+                        Text(query.isEmpty ? "No agents are running." : "No running agent matches.")
+                            .font(.system(size: 12 * z)).foregroundStyle(.secondary).padding(6)
+                    }
+                    ForEach(shown) { a in row(a) }
+                }
+            }
+            .frame(height: 200 * z)
+        }
+    }
+
+    func row(_ a: BoardAgent) -> some View {
+        let picked = chosen?.id == a.id
+        let color = Palette.agentState(a.state)
+        return Button { chosen = picked ? nil : a } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Circle().fill(color).frame(width: 8 * z, height: 8 * z).padding(.top, 5 * z)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(a.name).font(.system(size: 13 * z, weight: .semibold)).lineLimit(1)
+                        Text(a.stateLabel).font(.system(size: 11 * z, weight: .medium)).foregroundColor(color)
+                        Spacer()
+                        Text(Fmt.age(a.active, now: now)).font(.system(size: 11 * z)).foregroundStyle(.secondary)
+                    }
+                    Text(([a.folder] + (a.group.map { [$0] } ?? [])).joined(separator: " · "))
+                        .font(.system(size: 11 * z)).foregroundStyle(.secondary).lineLimit(1)
+                    if !a.note.isEmpty {
+                        Text(a.note).font(.system(size: 11 * z)).foregroundStyle(.secondary).lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(RoundedRectangle(cornerRadius: 6).fill(picked ? Palette.caramel.opacity(0.18) : Color.clear))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(picked ? Palette.caramel : Color.clear))
+        }
+        .buttonStyle(.plain)
     }
 }
 

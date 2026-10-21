@@ -515,7 +515,8 @@ def launch_line(a):
         parts += ["--name", shlex.quote(a.get("name") or a["display"])]
         return " ".join(parts)
     exe = sources.find_bin("codex") or "codex"
-    parts = ["env", actions.SCRUB_ENV, shlex.quote(exe), "resume", "-s", "danger-full-access", "-a", "never", "-C", shlex.quote(cwd)]
+    parts = ["env", actions.SCRUB_ENV, shlex.quote(exe), "resume", "-s", "danger-full-access", "-a", "never", "-C", shlex.quote(cwd),
+             actions.CODEX_NO_UPDATE_PROMPT]
     if a.get("model"):
         parts += ["-m", shlex.quote(a["model"])]
     if a.get("effort"):

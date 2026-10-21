@@ -9,6 +9,8 @@ appended to a run log.
 import fcntl
 import json
 import os
+import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -53,14 +55,17 @@ def fallback_available(cfg):
 
 def fallback_command(cfg, claude_cmd):
     """Wrap the claude command so it runs with ANTHROPIC_API_KEY taken from Bitwarden Secrets
-    Manager (https://bitwarden.com/help/secrets-manager-cli/). `bws run` injects every project secret into the child environment under its stored
-    name; the one-line `sh -c` maps the stored name onto ANTHROPIC_API_KEY *inside that child*, so
-    the value never passes through this process, its logs, or a file."""
+    Manager (https://bitwarden.com/help/secrets-manager-cli/). `bws run` injects every project secret into the child
+    environment under its stored name and runs its arguments, joined by spaces, as one `sh -c` script. So the script is
+    passed whole, with the claude command shell-quoted, and maps the stored name onto ANTHROPIC_API_KEY *inside that
+    child*: the value never passes through this process, its logs, or a file. (Passed unquoted, the script would be
+    only the assignment and claude would never run.)"""
     bws = registry.find_bin("bws", ["~/.local/bin/bws", "/usr/local/bin/bws"])
     proj = Path(os.path.expanduser(cfg.get("bws_project_file", "~/.config/bws/project-id"))).read_text().strip()
     secret = cfg["orchestrator_fallback_secret"]
-    return [bws, "run", "--project-id", proj, "--", "sh", "-c",
-            'ANTHROPIC_API_KEY="$%s" exec "$@"' % secret, "sh"] + list(claude_cmd)
+    if not re.fullmatch(r"[A-Za-z_]\w*", secret):
+        raise ValueError("orchestrator_fallback_secret must be a variable name")
+    return [bws, "run", "--project-id", proj, "--", 'ANTHROPIC_API_KEY="$%s" exec %s' % (secret, shlex.join(claude_cmd))]
 
 
 def _fallback_env(cfg, env):

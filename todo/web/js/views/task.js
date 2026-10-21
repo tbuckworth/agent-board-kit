@@ -18,6 +18,14 @@ import {
 } from '../parser.js';
 import { normaliseTag, addDays, waitingState } from '../tags.js';
 import { setTags, setWaiting } from '../actions.js';
+import { agentPicker } from '../components/agent-picker.js';
+import { requestedToast } from '../components/assign-dialog.js';
+import { latestAgentStatus } from '../agents.js';
+
+const AGENT_KIND_WORDS = {
+  assigned: 'Agent assigned', started: 'Agent', done: 'Agent done', blocked: 'Agent blocked', failed: 'Agent failed',
+};
+const agentStatusCache = new Map();     // "number@updatedAt" -> latestAgentStatus(...)
 
 export function renderTask(container, { number }) {
   const task = getIssueByNumber(number);
@@ -112,8 +120,40 @@ export function renderTask(container, { number }) {
       currentTask.updatedAt ? ` · Updated ${formatRelative(currentTask.updatedAt)}` : '',
     );
 
-    mount(container, actions, title, labelsEl, ratingEl, renderTags(currentTask), renderWaiting(currentTask), bodyEl,
-      renderGroup(currentTask), checklistEl, claudeEl, metaEl);
+    mount(container, actions, title, labelsEl, renderAgentStatus(currentTask), ratingEl, renderTags(currentTask),
+      renderWaiting(currentTask), bodyEl, renderGroup(currentTask), checklistEl, claudeEl, metaEl);
+  }
+
+  // What the desktop or the agent last said on the issue (`<!-- todo-agent:KIND -->` comments), for a task
+  // handed to an agent. Comments aren't cached, so it is fetched once per version of the task.
+  function renderAgentStatus(currentTask) {
+    const requested = currentTask.labels.includes(AGENT_REQUESTED_LABEL);
+    if (!requested && !currentTask.labels.includes(AGENT_ASSIGNED_LABEL)) return null;
+    const line = el('div', { className: 'agent-status' },
+      el('span', { className: 'agent-status-kind' }, requested ? 'Agent requested' : 'Agent assigned'),
+      el('span', { className: 'agent-status-text' },
+        requested ? 'The desktop picks it up within a couple of minutes.' : ''));
+    // While requested, an older status would describe the previous agent; the desktop's answer removes the label
+    if (requested) return line;
+    const key = `${currentTask.number}@${currentTask.updatedAt}`;
+    const show = (status) => {
+      if (!status) return;
+      line.dataset.kind = status.kind;
+      line.firstChild.textContent = AGENT_KIND_WORDS[status.kind];
+      line.lastChild.textContent = status.text;
+    };
+    if (agentStatusCache.has(key)) {
+      show(agentStatusCache.get(key));
+    } else if (navigator.onLine !== false) {
+      api.fetchIssueComments(currentTask.number)
+        .then(comments => {
+          const status = latestAgentStatus(comments);
+          agentStatusCache.set(key, status);
+          show(status);
+        })
+        .catch(() => {});
+    }
+    return line;
   }
 
   // Tags: chips with a remove button, and a field to add one, existing or new. Saved at once.
@@ -364,11 +404,17 @@ export function renderTask(container, { number }) {
       placeholder: 'What should the agent do? (optional)',
     });
 
+    const hint = el('p', { className: 'form-hint', style: { marginTop: '0', marginBottom: 'var(--space-3)' } });
+    const picker = agentPicker('assign', () => { hint.textContent = picker.describe(); });
+    hint.textContent = picker.describe();
+
     const assignBtn = el('button', {
       className: 'btn btn-primary',
       onClick: async () => {
+        const problem = picker.check();
+        if (problem) { showToast(problem); return; }
         assignBtn.disabled = true;
-        const ok = await requestAgent(currentTask, instructions.value);
+        const ok = await requestAgent(currentTask, instructions.value, picker.target());
         if (ok) modal.close();
         else assignBtn.disabled = false;
       },
@@ -377,8 +423,8 @@ export function renderTask(container, { number }) {
     const modal = showModal({
       title: again ? 'Assign again' : 'Assign to agent',
       body: [
-        el('p', { className: 'form-hint', style: { marginTop: '0', marginBottom: 'var(--space-3)' } },
-          'The desktop starts an agent on this task within a couple of minutes. This needs the network.'),
+        picker.element,
+        hint,
         el('div', { className: 'form-group' },
           el('label', { className: 'form-label', htmlFor: 'assign-instructions' }, 'Instructions'),
           instructions,
@@ -394,20 +440,20 @@ export function renderTask(container, { number }) {
   }
 
   // Comment first, then label: the desktop only acts on the label, and reads the newest request comment
-  async function requestAgent(currentTask, instructions) {
+  async function requestAgent(currentTask, instructions, target = null) {
     if (navigator.onLine === false) {
       showToast('Assigning needs the network');
       return false;
     }
     try {
       const issueId = currentTask.nodeId || await api.getIssueNodeId(number);
-      await api.addComment(issueId, agentRequestBody(instructions));
+      await api.addComment(issueId, agentRequestBody(instructions, target?.id || null));
       const raw = await api.addLabels(issueId, [AGENT_REQUESTED_LABEL]);
       const parsed = parseIssue(raw);
       setState({ issues: getState().issues.map(i => i.number === number ? parsed : i) });
       await db.issues.put(parsed);
       render();
-      showToast('Requested — the desktop starts the agent within a couple of minutes');
+      showToast(requestedToast(target));
       return true;
     } catch (err) {
       showToast(`Error: ${err.message}`);

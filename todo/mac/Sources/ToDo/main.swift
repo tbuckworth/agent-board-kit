@@ -3,7 +3,8 @@ import SwiftUI
 
 // ToDo                                     the menu-bar app
 // ToDo --render DATA.json OUT.png [W H] [--light] [--list NAME] [--select N] [--edit N] [--assign N]
-//                                          [--agents] [--search WORDS] [--zoom Z]
+//                                          [--agents] [--search WORDS] [--zoom Z] [--running]
+//                                          (--running: the Assign sheet on "A running agent", with sample agents)
 //                                          draw the real views offscreen from a todo-desk snapshot or the app's
 //                                          cache, into a PNG, and exit (screenshots without screen recording)
 // ToDo --probe                             connect exactly as the app does, print what arrives, and exit
@@ -32,7 +33,8 @@ if let i = args.firstIndex(of: "--render"), args.count > i + 2 {
                         list: flag("--list"), select: flag("--select").flatMap { Int($0) },
                         edit: flag("--edit").flatMap { Int($0) }, assign: flag("--assign").flatMap { Int($0) },
                         agents: rest.contains("--agents"), search: flag("--search"),
-                        zoom: flag("--zoom").flatMap { Double($0) }.map { CGFloat($0) } ?? 1)
+                        zoom: flag("--zoom").flatMap { Double($0) }.map { CGFloat($0) } ?? 1,
+                        running: rest.contains("--running"))
     }
     exit(code)
 }

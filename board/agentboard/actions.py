@@ -425,6 +425,9 @@ LEAKED = ("AGENT_ORCHESTRATOR", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAU
           "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED",
           "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CLAUDE_PID")
 SCRUB_ENV = " ".join("-u " + v for v in LEAKED)
+# Once Codex knows of a newer release it opens on an "Update available" menu and waits for a key before loading the
+# thread, so an agent the board resumes (or a restart brings back) would sit there. The board's launches skip that check.
+CODEX_NO_UPDATE_PROMPT = "-c check_for_update_on_startup=false"
 
 
 def scrub_tmux_env(tmux, run=None):
@@ -533,6 +536,31 @@ def last_claude_model(home, sid):
     return None
 
 
+def last_turn_failed(sid):
+    """Whether the session's conversation ends on Claude Code's own record of a failed request (an assistant entry
+    with isApiErrorMessage), from its newest transcript's tail; None when that can't be read. A StopFailure hook
+    also fires when a side request fails after a turn finished normally (for example a 429 on a background request a
+    second after the agent's final answer), and that leaves no such record."""
+    _, home = claude_home_of(sid)
+    paths = sorted(Path(home).glob("projects/*/%s.jsonl" % sid), key=lambda p: p.stat().st_mtime) if home else []
+    if not paths:
+        return None
+    try:
+        with open(paths[-1], "rb") as fh:
+            fh.seek(max(0, os.path.getsize(paths[-1]) - 2_000_000))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("type") in ("assistant", "user") and not d.get("isMeta"):
+            return d["type"] == "assistant" and bool(d.get("isApiErrorMessage"))
+    return None
+
+
 def codex_settings(tid):
     con = sources.CodexReader()._db()
     if con is None:
@@ -565,8 +593,9 @@ def launch_line(agent, tmux, cfg):
     model = model or cfg.get("spawn_codex_model") or "gpt-6.1-sol"
     effort = effort or cfg.get("spawn_codex_effort") or "xhigh"
     exe = sources.find_bin("codex") or "codex"
-    line = "env %s %s resume -s danger-full-access -a never -C %s -m %s -c model_reasoning_effort=%s %s" % (
-        SCRUB_ENV, shlex.quote(exe), shlex.quote(cwd), shlex.quote(model), shlex.quote(effort), sid)
+    line = "env %s %s resume -s danger-full-access -a never -C %s %s -m %s -c model_reasoning_effort=%s %s" % (
+        SCRUB_ENV, shlex.quote(exe), shlex.quote(cwd), CODEX_NO_UPDATE_PROMPT, shlex.quote(model), shlex.quote(effort),
+        sid)
     return line, "codex · %s · %s" % (model, effort)
 
 

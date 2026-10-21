@@ -45,7 +45,7 @@ CLAUDE_INCLUDE = "@~/.config/agent-kit/AGENTS.agents.md"
 REQUIRED = ["OWNER_NAME", "OWNER_EMAIL", "AGENT_EMAIL", "AGENT_FROM_NAME", "GITHUB_OWNER", "TASKS_REPO",
             "REPOS_ROOT", "GENERAL_REPO", "ORCHESTRATOR_DIR", "HOST_ID", "DESKTOP_HOST"]
 OPTIONAL = {"MAC_HOST": "", "WITH_MEMWATCH": "yes", "WITH_RESTART": "yes", "WITH_CLOUD_WATCHDOG": "no",
-            "WITH_TODO_DISPATCH": "yes"}
+            "WITH_TODO_DISPATCH": "yes", "WITH_CLI_UPDATE": "yes"}
 EXAMPLE_VALUES = {"alex@example.com", "yourname.agents@gmail.com", "alex-gh", "alex-gh/tasks"}
 DESKTOP_STEPS = ["config", "venv", "wrappers", "configs", "instructions", "hooks", "orchestrator",
                  "general-repo", "systemd", "cron"]
@@ -189,6 +189,8 @@ def tools(env, role):
         skip.add("agent-restart")
     if not yes(env, "WITH_MEMWATCH"):
         skip.add("agent-memwatch")
+    if not yes(env, "WITH_CLI_UPDATE"):
+        skip.add("agent-cli-update")
     if role == "mac":                                   # server-side tools: they run on the Linux machine
         skip.update({"agent-mailroom", "agent-memwatch", "agent-failover", "agent-orchestrate"})
     for comp in components(env, role):
@@ -489,6 +491,8 @@ def units(env):
             if "restart" in name and not yes(env, "WITH_RESTART"):
                 continue
             if "dispatch" in name and not yes(env, "WITH_TODO_DISPATCH"):
+                continue
+            if "cli-update" in name and not yes(env, "WITH_CLI_UPDATE"):
                 continue
             want.append((comp, p, name))
     return want

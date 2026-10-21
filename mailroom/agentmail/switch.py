@@ -430,7 +430,8 @@ def relaunch_codex(st, model, effort, prompt, codex):
         i += 1
     if "-C" not in keep and "--cd" not in keep and st["cwd"]:
         keep += ["-C", st["cwd"]]
-    cmd = [codex, "resume", st["id"]] + keep + ["-m", model, "-c", "model_reasoning_effort=%s" % effort]
+    cmd = [codex, "resume", st["id"]] + keep + registry.CODEX_NO_UPDATE_PROMPT + [
+        "-m", model, "-c", "model_reasoning_effort=%s" % effort]
     if prompt:
         cmd.append(prompt)
     if not stop(st["pid"]):
@@ -477,8 +478,8 @@ def start_codex(st, model, effort, brief, codex, trust=None):
     if trust and st["cwd"]:
         trust(st["cwd"], None)
     before = registry.codex_live_ids()
-    cmd = [codex, "-s", "danger-full-access", "-a", "never", "-C", st["cwd"] or ".", "-m", model,
-           "-c", "model_reasoning_effort=%s" % effort]
+    cmd = [codex, "-s", "danger-full-access", "-a", "never", "-C", st["cwd"] or "."] + registry.CODEX_NO_UPDATE_PROMPT + [
+        "-m", model, "-c", "model_reasoning_effort=%s" % effort]
     type_line(st["pane"], st["name"], "stty sane; unset CLAUDE_CONFIG_DIR; " + " ".join(shlex.quote(c) for c in cmd))
     new = wait_for(lambda: (registry.codex_live_ids() - before) or None, 60)
     if not new:

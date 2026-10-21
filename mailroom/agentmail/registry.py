@@ -72,6 +72,12 @@ def codex_bin():
     return find_bin("codex", ["~/.local/bin/codex", "/opt/homebrew/bin/codex", "/usr/local/bin/codex"])
 
 
+# Once Codex knows of a newer release, an interactive start opens on an "Update available" menu and waits for a key
+# before it loads the thread (so every Codex agent resumed after a restart would sit there). Unattended
+# launches skip that check.
+CODEX_NO_UPDATE_PROMPT = ["-c", "check_for_update_on_startup=false"]
+
+
 def short(s, n=8):
     return (s or "")[:n]
 

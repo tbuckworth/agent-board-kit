@@ -128,15 +128,16 @@ export function saveRating(number, changed) {
   });
 }
 
-// Assign to agent: comment first, then label; the desktop's `todo-desk dispatch` acts on the label
-export async function requestAgent(number, instructions) {
+// Assign to agent: comment first, then label; the desktop's `todo-desk dispatch` acts on the label.
+// `to` (a running agent's session id) hands the task to that agent instead of starting a new one.
+export async function requestAgent(number, instructions, to = null) {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     throw new Error('Assigning needs the network');
   }
   const task = getIssueByNumber(number);
   if (!task) throw new Error(`Task #${number} is not loaded`);
   const issueId = task.nodeId || await api.getIssueNodeId(number);
-  await api.addComment(issueId, agentRequestBody(instructions));
+  await api.addComment(issueId, agentRequestBody(instructions, to));
   const parsed = parseIssue(await api.addLabels(issueId, [AGENT_REQUESTED_LABEL]));
   replaceLocal(parsed);
   await cache(parsed);

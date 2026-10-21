@@ -9,7 +9,9 @@ agents' `## Claude Resolution Notes`. Three things use it:
   you ask ("add to my to-do: renew passport") and how to report on one it was given.
 - **Assign to agent**: from either app, a task becomes an orchestrator event that starts one agent on
   it. The orchestrator comments `<!-- todo-agent:started -->` with the agent's name; the agent comments
-  `<!-- todo-agent:done -->` (or `blocked`) when it finishes, and emails you.
+  `<!-- todo-agent:done -->` (or `blocked`) when it finishes, and emails you. Or pick an agent that is
+  already running (the picker lists the board's live agents): the task goes straight into its session
+  with `agent-send`, as a message from you, and it answers by email.
 
 Full reference (schema, every label, the web app's token and hosting, the Mac app, the assign flow end
 to end, agent rules): [todo/README.md](../todo/README.md).
@@ -40,6 +42,8 @@ to end, agent rules): [todo/README.md](../todo/README.md).
 
 5. **Dispatch** (web "Assign to agent" requests): `./install.sh --start` enables the
    `todo-dispatch.timer` (every 2 minutes). The Mac app assigns directly and does not need it.
+   Dispatch also publishes the running agents to `.todo/agents.json` in the tasks repo, so the web
+   app can offer them: keep the tasks repo private.
 
 The Mac app: see [07-mac.md](07-mac.md).
 

@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""agent-cli-update: update Codex and Claude Code on this machine (`codex update`, `claude update`).
+
+    agent-cli-update            update both now; one line each in ~/.local/state/agent-board/cli-update.log
+    agent-cli-update log [N]    the last N lines of that log (default 20)
+
+agent-cli-update.timer runs it every 6 hours. Running agents keep their version; new launches get the new one.
+A CLI that is not installed is skipped; the exit status is 1 when an installed one fails to update.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentboard import cliupdate  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-cli-update", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("log")
+    p.add_argument("n", nargs="?", type=int, default=20)
+    a = ap.parse_args(argv)
+    if a.cmd == "log" and a.n < 1:
+        ap.error("log N: N must be at least 1")
+    if a.cmd == "log":
+        try:
+            lines = cliupdate.LOG.read_text().splitlines()
+        except OSError:
+            lines = []
+        print("\n".join(lines[-a.n:]) if lines else "nothing logged yet")
+        return 0
+    return 0 if cliupdate.run_all() else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

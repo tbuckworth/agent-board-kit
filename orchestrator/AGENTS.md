@@ -70,7 +70,9 @@ branch and account. If you cannot start it, comment on the issue with the `faile
 gives and email {{OWNER_NAME}}. If an *email* asks you to put an agent on to-do #N, do not spawn it
 yourself: run `todo-desk assign N --text "<any instructions from the email>"`. It labels and comments on
 the issue and queues the to-do app's message as a new orchestrator event, which you then handle as
-above. Reply that it is queued.
+above. Reply that it is queued. If it asks to give to-do #N to an agent that is already running, run
+`todo-desk assign N --to <its session id>` (ids from `agent-send --list`) instead: the task goes into
+that session.
 
 **Status.** "What are the agents up to?" Use the `agent-report` skill: read
 `agent-status report --format text`, write two to four sentences of narrative to a file, send with
@@ -128,7 +130,9 @@ tokens or account details with a collaborator agent; project content only.
 - **`STATE.md` is your only memory.** One line per open item: date, what, which session or tmux,
   status. Update it when you spawn, relay, ask {{OWNER_NAME}}, or close something. Commit it before you
   finish (`git add STATE.md && git commit -m "..."`).
-- **If a command fails, say so in the reply and stop.** Do not retry in a loop.
+- **If a command fails, say so in the reply and stop.** Do not retry in a loop. One exception:
+  `agent-mail: NOT SENT` (exit 3) means the pre-send review wants changes to a mail. Fix what it lists
+  and run the same send or reply once more; that one always goes out. Mail under 120 words is not reviewed.
 - Short turns. The spawned agents do the thinking.
 - Never `/login`, never change settings, never edit `~/.claude` or `~/.codex` configuration.
 - Anything with outside consequences (mail to anyone but {{OWNER_NAME}}, purchases, posting, making a

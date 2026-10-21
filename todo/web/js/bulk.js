@@ -125,14 +125,14 @@ export async function rateTasks(numbers, change) {
 
 // One agent for the lot: the first task carries the request, naming the others; each other task gets a note.
 // A group's agent is asked to handle the group's tasks as well.
-export async function assignTasks(numbers, instructions = '') {
+export async function assignTasks(numbers, instructions = '', to = null) {
   const [lead, ...rest] = numbers;
   const members = openDescendants(lead, all()).map(t => t.number);
   const lines = [];
   if (members.length) lines.push(`This is a group; its tasks are its sub-issues: ${members.map(n => `#${n}`).join(', ')}.`);
   if (rest.length) lines.push(`Handle these tasks together with this one, as one job: ${rest.map(n => `#${n}`).join(', ')}.`);
   const text = [instructions.trim(), ...lines].filter(Boolean).join('\n\n');
-  await requestAgent(lead, text);
+  await requestAgent(lead, text, to);
   for (const n of rest) {
     const t = getIssueByNumber(n);
     const id = t?.nodeId || await api.getIssueNodeId(n);

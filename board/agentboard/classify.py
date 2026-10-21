@@ -27,6 +27,7 @@ MAIL_WINDOW = 7 * 86400         # only mail this recent can make an agent "waiti
 OFFLINE_WINDOW = 12 * 3600      # an exited session that did real work (notes or mail) stays this long
 MAIL_OFFLINE_WINDOW = 48 * 3600 # ...or this long while mail is in flight either way
 CLOSED_WINDOW = 3600            # a deliberately closed session (agent-close) lingers this long
+HELD_TO = {"owner": "you", "collaborator": "a collaborator", "other": "someone else"}   # reviews.audience
 
 BLOCKED_WORDS = r"you|approval|input"
 
@@ -85,13 +86,18 @@ def disambiguate(agents):
     return agents
 
 
-def mail_state(sent, inbound, now, window=MAIL_WINDOW):
+def mail_state(sent, inbound, now, window=MAIL_WINDOW, reviews=None):
     """One session's mail picture from the mailroom store.
 
-    sent     rows this session sent to the owner: {sent_at, subject, thread_id}
+    sent     rows this session sent to the owner: {sent_at, subject, thread_id, message_id}
     inbound  rows from the owner routed to this session: {received_at, subject, action, id}
-    Returns {last_out, last_out_subject, last_in, unanswered, held, threads}; unanswered means the last
-    word is the agent's: its newest mail to the owner is newer than anything the owner sent it.
+    reviews  its newest pre-send review per audience: {created_at, verdict, subject, kind, reasons, sent_message_id,
+             audience, has_draft}
+    Returns {last_out, last_out_subject, last_in, unanswered, held, threads, revise, unrevised}; unanswered means
+    the last word is the agent's: its newest mail to the owner is newer than anything the owner sent it. revise: its
+    mails the review sent back that haven't gone out, newest first (the mailroom keeps each draft until a re-send to
+    that audience, a withdraw or its fallback sends it as-is; a mail stopped for a credential, `secret`, keeps no
+    draft and only a re-send settles it); unrevised: its newest mail out is that fallback's.
     """
     since = now - window
     sent = sorted((s for s in sent if (s.get("sent_at") or 0) >= since), key=lambda s: s["sent_at"])
@@ -111,6 +117,8 @@ def mail_state(sent, inbound, now, window=MAIL_WINDOW):
     for t in ordered:
         t["subject"] = strip_tag(t["subject"])
         t["unanswered"] = t["last_out"] > t["last_in"]
+    reviews = sorted(reviews or [], key=lambda r: -r["created_at"])
+    out_id = (last_out or {}).get("message_id")
     return {
         "last_out": last_out["sent_at"] if last_out else None,
         "last_out_subject": strip_tag(last_out.get("subject") or "") if last_out else "",
@@ -120,6 +128,13 @@ def mail_state(sent, inbound, now, window=MAIL_WINDOW):
         "unanswered": unanswered,
         "held": sum(1 for i in inbound if i.get("action") == "held"),
         "threads": ordered,
+        # a credential stop's reasons quote the start of what matched: never passed on, even if a reader supplied them
+        "revise": [{"ts": r["created_at"], "subject": strip_tag(r.get("subject") or ""),
+                    "reasons": "" if r.get("kind") == "secret" else (r.get("reasons") or ""),
+                    "to": r.get("audience") or "owner", "secret": r.get("kind") == "secret"}
+                   for r in reviews if r.get("verdict") == "revise" and (r.get("has_draft") or r.get("kind") == "secret")],
+        "unrevised": bool(out_id) and any(r.get("verdict") == "expired" and r.get("sent_message_id") == out_id
+                                          for r in reviews),
     }
 
 
@@ -181,6 +196,14 @@ def classify(a, now, owner=None):
     q = a.get("quota_ts") or 0
     err = a.get("error") or {}
     fo = (a.get("failover") or {}).get("ts", 0)
+    # ...but not one its transcript doesn't end on: a side request failed after the turn had finished
+    side, aside = a.get("stop_unconfirmed") or 0, ""
+    if side:                             # the newest of the two, so neither stopped it
+        failed = (err.get("text") if err.get("ts") == side else (a.get("limit") or {}).get("text")) or "an error"
+        said = re.search(r'"message"\s*:\s*"([^"]+)"', failed)        # 'rate_limit: 429 {"type":"error",...}'
+        aside = "its turn finished; a request after it failed (%s) · " % (
+            failed.split(":", 1)[0] + ": " + said.group(1) if said else failed)[:100]
+        q, err = 0, {}
     if q and q >= turn_end and q > fo and q >= err.get("ts", 0):
         lim = a.get("limit") or {}
         if lim.get("kind") == "limit-wait":
@@ -192,12 +215,24 @@ def classify(a, now, owner=None):
     note = a.get("last_note") or {}
     if note.get("text") and blocked_note(owner).match(note["text"]) and turn_end <= note.get("ts", 0) + SETTLE:
         return "blocked", "last note: " + note["text"][:120]
+    # its turn ended with a mail still held by the mailroom's pre-send review: the agent may think it went. A
+    # credential stop has no draft, no withdraw and no fallback; once a turn ends well after it, the agent moved on
+    rev = [r for r in mail.get("revise") or [] if not r.get("secret") or turn_end <= r["ts"] + SETTLE]
+    back = ""
+    if rev:
+        r, to = rev[0], HELD_TO.get(rev[0]["to"], "someone else")
+        back = ("its mail to %s was stopped %s ago (it looked like it had a credential in it) and won't go out "
+                "unless re-sent: %s" % (to, fmt_age(now - r["ts"]), r["subject"]) if r.get("secret") else
+                "its mail to %s was sent back for revision %s ago and hasn't gone out: %s" % (
+                    to, fmt_age(now - r["ts"]), r["subject"]) + (" (%s)" % r["reasons"][:120] if r.get("reasons") else "")
+                ) + (" (and %d more held)" % (len(rev) - 1) if len(rev) > 1 else "") + " · "
     out = mail.get("last_out")
     owes = mail.get("unanswered") and out and turn_end <= out + SETTLE
     if owes and mail.get("read") is not True:          # read in Gmail: the owner has seen it, so it stops shouting
-        return "waiting", "mailed you %s ago, no reply yet: %s" % (fmt_age(now - out), mail.get("last_out_subject") or "")
+        return "waiting", back + "mailed you %s ago, no reply yet: %s" % (fmt_age(now - out), mail.get("last_out_subject") or "") + (
+            " (sent as-is: it didn't revise it after the pre-send review)" if mail.get("unrevised") else "")
     age = now - (a.get("last_activity") or 0)
-    seen = dead + ("you've read its mail, no reply yet · " if owes else "")
+    seen = back + dead + aside + ("you've read its mail, no reply yet · " if owes else "")
     f = a.get("failover") or {}
     if f.get("ts") and f["ts"] >= turn_end:
         seen += "moved to %s after a limit · " % (f.get("account") or "another login")

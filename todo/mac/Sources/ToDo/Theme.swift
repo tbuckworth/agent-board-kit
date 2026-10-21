@@ -14,6 +14,19 @@ enum Palette {
     static let attention = Color(hex: 0xD99A1E)
     static let ok = Color(hex: 0x3D8BD9)
     static let tag = Color(hex: 0x7A5BD6)                  // tags, near the tag: labels' 5319E7
+
+    /// An agent's state in AgentBoard's colours: caramel busy, darker caramel waiting on a background command,
+    /// green waiting on you, red blocked, blue idle, grey stale.
+    static func agentState(_ state: String) -> Color {
+        switch state {
+        case "busy": return caramel
+        case "background": return caramelDark
+        case "waiting": return green
+        case "blocked": return red
+        case "idle": return blue
+        default: return slate
+        }
+    }
 }
 
 /// Zoom (⌘+ / ⌘- / ⌘0): every font and fixed dimension is multiplied by it.
