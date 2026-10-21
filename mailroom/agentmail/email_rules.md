@@ -10,7 +10,9 @@ once if it falls short.
 ## Every mail
 
 1. **Bottom line first.** The first two lines say what this is about (project, what it answers) and
-   the headline: result, verdict or status. If they must act, the ask is in the first lines too.
+   the headline: result, verdict or status. If they must act, the first lines say so, in words that
+   stand on their own: what would be done, with what, at what cost. The question itself can wait
+   until after the context and recommendation it depends on (see 5).
 2. **No-context reader.** Every internal label, acronym, run id, codename, version tag, file or
    variable name, "cell", "phase 2", "the fixed10 set", "D2026-...", "my last mail", "as discussed"
    is either defined in a few plain words on first use or replaced. Widely known terms (GPU, API,
@@ -20,10 +22,14 @@ once if it falls short.
 4. **Concise.** Senior-manager register. Detail they do not need to act or to understand the
    headline goes below a clear break, in an attachment or behind a link. Length is fine when it is
    structured and they asked for the long thing (a table of every run, a full list).
-5. **The ask.** If they must decide or do something: one sentence, with the options, your
+5. **The ask.** If they must decide or do something: one clear question, with the options, your
    recommendation and the default if they do not answer ("Yes or no: ...", "Reply 1, 2 or 3; I
-   recommend 2"). Never hand them a task you could do yourself; unavoidable manual steps come as exact
-   copy-paste commands with where to run them.
+   recommend 2"). It must make sense where it stands. Ask it at the top only as a summary that stands
+   on its own (what exactly would be done, with what tool or model, how, at what cost). Otherwise ask
+   it right after your recommendation, and let the first lines say a decision follows ("Decision
+   needed: whether to ...; my recommendation and the question are below"). A bare yes/no before they
+   know what it is about makes them scroll down and back up. Never hand them a task you could do
+   yourself; unavoidable manual steps come as exact copy-paste commands with where to run them.
 6. **Nothing they cannot open.** No desktop file paths, "open ~/...", local commands or private repo
    paths as the way to see a result. Embed plots and images; link anything else to a page they can
    open on a phone.
@@ -44,8 +50,8 @@ once if it falls short.
   that matter, upgrade or downgrade against what they have now); product images embedded; buy links.
 - **Status**: a one-line verdict (on track / blocked / done); Done / Running / Next as bullets; for
   compute, cost so far, run time and ETA; a table when there are many runs.
-- **Decision / blocked**: the question in one sentence at the top, lettered options, a recommendation
-  and the default. Short is good.
+- **Decision / blocked**: the first lines say what needs deciding, in plain words; then the context the
+  answer depends on, lettered options, your recommendation, the default and the question. Short is good.
 - **Done**: what changed in plain words, where to see it (link), whether anything is needed from
   them, and side effects (restart? interrupts agents?). Short is good.
 - **Plan / proposal**: what it does for them first, then how, risks, then numbered decisions with the

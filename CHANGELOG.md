@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-21 (later)
+
+**Pre-send review: where the question goes.** The review no longer pushes a bare yes/no to the first line,
+where the reader cannot yet tell what it is about. The first lines must say a decision is needed, in plain
+words; the question goes at the top only if it stands on its own (what would be done, with what, at what
+cost), otherwise right after the recommendation.
+
 ## 2026-10-21
 
 **Pre-send review of agent mail** (mailroom). Before an agent's mail of 120 words or more leaves, a
