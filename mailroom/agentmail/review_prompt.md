@@ -32,7 +32,9 @@ question they asked) · other.
 
 Every kind:
 1. **Bottom line first.** The first two lines say what this is about (project, what it answers) and
-   the headline: result, verdict or status. If they must act, the ask is in the first lines too.
+   the headline: result, verdict or status. If they must act, the first lines say so, in words that
+   stand on their own: what would be done, with what, at what cost. The question itself can wait
+   until after the context and recommendation it depends on (see 5).
 2. **No-context reader.** Every internal label, acronym, run id, codename, version tag, file or
    variable name, "cell", "phase 2", "the fixed10 set", "D2026-...", "my last mail", "as discussed"
    is either defined in a few plain words on first use or replaced. Flag each one by name.
@@ -42,10 +44,16 @@ Every kind:
 4. **Concise.** Senior-manager register. Detail that they do not need to act or understand the
    headline goes below a clear break, in an attachment or behind a link. Length alone is fine when
    it is structured and they asked for the long thing (a table of every run, a full list).
-5. **The ask.** If they must decide or do something: one sentence, with the options, the agent's
-   recommendation and the default if they do not answer ("Yes or no: ...", "Reply 1, 2 or 3; I
-   recommend 2"). They must never be handed a task the agent could do itself; unavoidable manual
-   steps come as exact copy-paste commands with where to run them.
+5. **The ask.** If they must decide or do something: one clear question, with the options, the
+   agent's recommendation and the default if they do not answer ("Yes or no: ...", "Reply 1, 2 or 3; I
+   recommend 2"). It must make sense where it stands. A question at the top is fine only as a
+   self-contained summary: from those lines alone they know what exactly would be done, to what, with
+   which tool, model or method, and at what cost. If any of that is only explained further down, the
+   question at the top is a blocker: "Yes or no: shall I do the dry run?", or "classify the test
+   prompts on the GPU and report counts?" without saying classify with what, for what. Otherwise the
+   question goes right after the recommendation, with the first lines saying a decision follows.
+   They must never be handed a task the agent could do itself; unavoidable manual steps come as exact
+   copy-paste commands with where to run them.
 6. **Nothing they cannot open.** No desktop file paths, "open ~/...", local commands or private repo
    paths as the way to see a result. Plots and images must be embedded ([IMAGE embedded]) or at
    least linked to a page they can open on a phone.
@@ -64,8 +72,9 @@ Extra, by kind:
   that matter, upgrade or downgrade versus what they have now); product images embedded; buy links.
 - **status_update**: a one-line verdict (on track / blocked / done); Done / Running / Next as
   bullets; for compute, cost so far, run time and ETA; a table when there are many runs.
-- **decision_request**: the question in one sentence at the top, lettered options, a recommendation
-  and the default. Short is good.
+- **decision_request**: the first lines say what needs deciding, in plain words; then the context the
+  answer depends on, lettered options, the recommendation, the default and the question. A one-line
+  summary with the question at the top is fine if it stands on its own. Short is good.
 - **done_note**: what changed in plain words, where to see it (link), whether anything is needed
   from them, and side effects (restart? interrupts agents?). Short is good.
 - **plan_or_proposal**: what it does for them first, then how, risks, then numbered decisions with
@@ -85,14 +94,17 @@ what do you need from me?").
 List the problems (`issues`, at most 5, most important first). Each has a concrete, actionable `fix`
 for the agent: name the exact term, paragraph or number ("Define 'fixed10' (the 10 held-out
 prompts?) or say 'the 10 test prompts'", "Embed the accuracy-vs-steps plot right after the headline
-with --image", "Move 'Should I rerun the 3 failed seeds? I recommend yes' to the first line"). No
-generic advice. Each has a `severity`:
+with --image", "Open with 'Decision needed: whether to rerun the 3 seeds that crashed (2 hours on the
+desktop GPU, no spend); my recommendation and the question are below'"). No generic advice. A fix that
+moves the ask up must keep it answerable where it lands: never pull a bare question above the context
+it needs. Each has a `severity`:
 
 - `blocker`: they would most likely have to reply with a question or complaint before they could
   understand the main point or act on it. Typical blockers: the headline result or the ask depends on
   a term they cannot know; a results email with numbers but no plot of the main result; no bottom
-  line in the first lines of a long email; the ask missing, buried far down, or with no
-  recommendation; a paragraph wall of 150+ words or a run of them; tabular data as raw pipe or
+  line in the first lines of a long email; the ask missing, with no sign in the first lines that they
+  must decide something, or with no recommendation; a question asked before what it is about is
+  explained; a paragraph wall of 150+ words or a run of them; tabular data as raw pipe or
   space-aligned text; the result only viewable through a desktop path or file; a broken image.
 - `polish`: it would be better but they could still follow it and act: a secondary term, a missing
   caveat line, could be shorter, a nicer layout.
