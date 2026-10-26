@@ -108,17 +108,51 @@ class Decisions(unittest.TestCase):
         self.assertIn("URGENT", acts[0][3])
         self.assertIn("claude exp1 holds 16.0 GB", acts[1][1])
         self.assertIn("docker-6ac6.scope", acts[1][2])
+        self.assertIn("Messaged: claude exp1.", acts[1][2])
         self.assertEqual(memwatch.decide(st, use(91), own(), [], S, 1060 + 1800)[0][0][0], "ping")
         self.assertNotIn("email", [a[0] for a in memwatch.decide(st, use(91), own(), [], S, 1060 + 1800)[0]])
 
-    def test_swap_half_full_is_urgent(self):
-        self.assertEqual(memwatch.level(use(60, swap_pct=55), S), 2)
-        self.assertEqual(memwatch.level(use(60, swap_pct=55, swap_total=0), S), 0)
+    def test_swap_half_full_makes_a_warning_urgent(self):
+        self.assertEqual(memwatch.level(use(82, swap_pct=55), S), 2)
+        self.assertEqual(memwatch.level(use(82, swap_pct=40), S), 1)
+        self.assertEqual(memwatch.level(use(82, swap_pct=55, swap_total=0), S), 1)
+
+    def test_swap_alone_is_quiet(self):
+        # 2026-10-25 17:30 to 08:31: RAM 13-19%, swap 50-61% left over from earlier pressure, no memory pressure.
+        # Counting swap alone as urgent emailed the owner 16 times, once an hour, and pinged two agents 12 times.
+        self.assertEqual(memwatch.level(use(14, swap_pct=61), S), 0)
+        self.assertEqual(memwatch.level(use(60, swap_pct=100), S), 0)
+        procs = PROCS + [proc(201, 200, "vllm", 3.5, "/user.slice/app.slice/tmux-spawn-2.scope")]
+        st, sent = {}, []
+        for t in range(0, 16 * 3600, 15):
+            acts, st = memwatch.decide(st, use(14, swap_pct=61), own(procs), [], S, t)
+            sent += acts
+        self.assertEqual(sent, [])
 
     def test_rearms_below_75(self):
         _, st = memwatch.decide({}, use(82), own(), [], S, 1000)
         _, st = memwatch.decide(st, use(70), own(), [], S, 1100)
         self.assertEqual(len(memwatch.decide(st, use(82), own(), [], S, 1200)[0]), 1)
+
+    def test_rearm_with_swap_still_full(self):
+        _, st = memwatch.decide({}, use(82, swap_pct=60), own(), [], S, 1000)
+        _, st = memwatch.decide(st, use(70, swap_pct=60), own(), [], S, 1100)
+        self.assertEqual(st["sent"].keys(), {"email"})
+
+    def test_rearm_keeps_the_email_to_once_an_hour(self):
+        acts, st = memwatch.decide({}, use(91), own(), [], S, 1000)
+        self.assertEqual([a[0] for a in acts], ["ping", "email"])
+        _, st = memwatch.decide(st, use(70), own(), [], S, 1100)
+        acts, st = memwatch.decide(st, use(91), own(), [], S, 1200)
+        self.assertEqual([a[0] for a in acts], ["ping"])
+        self.assertIn("email", [a[0] for a in memwatch.decide(st, use(91), own(), [], S, 1000 + 3600)[0]])
+
+    def test_email_says_when_no_agent_was_messaged(self):
+        procs = [proc(300, 1, "uvicorn", 40, "/system.slice/docker-6ac6.scope"), proc(200, 1, "claude", 1.0)]
+        acts, _ = memwatch.decide({}, use(92), own(procs), [], S, 0)
+        self.assertEqual([a[0] for a in acts], ["email"])
+        self.assertIn("none was messaged", acts[0][2])
+        self.assertNotIn("Messaged:", acts[0][2])
 
     def test_small_agents_and_non_agents_are_not_messaged(self):
         procs = [proc(300, 1, "uvicorn", 40, "/system.slice/docker-6ac6.scope"), proc(200, 1, "claude", 1.0)]

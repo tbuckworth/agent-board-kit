@@ -153,13 +153,25 @@ agent-mail rerun N              # run it again on a held or failed mail
 
 A failed run holds the mail and sends the owner a `[mailroom]` notice; nothing is lost.
 
-**Optional API-key fallback.** If the claude.ai login fails or is rate-limited, a run can be retried
-once with an Anthropic API key from Bitwarden Secrets Manager. Set `orchestrator_fallback_secret` to
-the secret's name in your `bws` project, and provide `bws` on PATH (or `~/.local/bin/bws`), an access
-token file (`bws_token_file`) and a project-id file (`bws_project_file`). `bws run` injects the
-project's secrets into a child shell, which maps that name onto `ANTHROPIC_API_KEY` and execs
-`claude`; the key never passes through the mailroom, a file or a log. Unset (the default), there is
-no fallback.
+**When a login is out.** A login that fails on usage or login (or returns nothing) passes the event to
+the next (`orchestrate.logins`):
+
+1. each Claude login in `usage.order` that is set up (see [a second Claude login](#optional-a-second-claude-login-usage-routing-and-failover));
+2. Codex, where `usage.order` puts it (the default order lists it after every Claude login):
+   `codex exec --json --ignore-user-config`, so no MCP server, plugin or hook from
+   `~/.codex/config.toml` loads, as the Claude run has no MCP. The global and the directory's
+   `AGENTS.md` are still read. Model `orchestrator_codex_model` (`null`: `spawn_codex_model`), effort
+   `orchestrator_codex_effort`;
+3. optionally, an Anthropic API key from Bitwarden Secrets Manager. Set `orchestrator_fallback_secret`
+   to the secret's name in your `bws` project, and provide `bws` on PATH (or `~/.local/bin/bws`), an
+   access token file (`bws_token_file`) and a project-id file (`bws_project_file`). `bws run` injects
+   the project's secrets into a child shell, which maps that name onto `ANTHROPIC_API_KEY` and execs
+   `claude`; the key never passes through the mailroom, a file or a log. Unset (the default), there is
+   no API-key step.
+
+A timeout, or a failure after the run's first turn, ends the event there: that run may have acted
+already. The run log's `auth` says which one ran it (`agent-orchestrate --runs` shows it), and
+`failed` what the earlier ones said.
 
 ## Status log, hooks and the report
 
@@ -422,8 +434,9 @@ one by one and finally the user systemd manager, ending every agent. Two defence
   Not covered: sessions started by hand, Docker containers (charged to `dockerd`), many agents that
   each stay under their cap.
 - **agent-memwatch** (service, every 15 s) charges each process's memory to the agent it descends
-  from. At 80% RAM in use it messages the top agents (via `agent-send`) to cut workers; at 90% or
-  swap half full it messages them again and emails the owner; an agent near its own scope cap is
+  from. At 80% RAM in use it messages the top agents (via `agent-send`) to cut workers; at 90%, or 80%
+  with swap half full, it messages them again and emails the owner (swap alone never alerts: pages
+  swapped out under past pressure stay there long after it has gone); an agent near its own scope cap is
   warned first. `agent-memwatch --dry-run` shows who holds what. Settings: config key `memwatch`
   (`agentmail/memwatch.py` `DEFAULTS`, e.g. `{"warn_pct": 85}`).
 
@@ -488,7 +501,9 @@ Keys left out take these defaults (`agentmail/config.py`):
 | `orchestrator_model` | `"sonnet"` | Model alias for orchestrator runs. |
 | `orchestrator_effort` | `"high"` | Effort for orchestrator runs. |
 | `orchestrator_timeout` | `900` | Seconds per orchestrator attempt (and lock wait). |
-| `orchestrator_fallback_secret` | `null` | Name of a `bws` secret holding an Anthropic API key; `null` disables the fallback. |
+| `orchestrator_codex_model` | `null` | Codex model when the orchestrator runs on Codex (`null`: `spawn_codex_model`). |
+| `orchestrator_codex_effort` | `"high"` | Codex reasoning effort for those runs. |
+| `orchestrator_fallback_secret` | `null` | Name of a `bws` secret holding an Anthropic API key, the orchestrator's last resort; `null` disables it. |
 | `bws_token_file` | `"~/.config/bws/token"` | Bitwarden Secrets Manager access token file (fallback only). |
 | `bws_project_file` | `"~/.config/bws/project-id"` | File with the `bws` project id (fallback only). |
 | `spawn_claude_model` | `"claude-opus-5-5"` | agent-spawn's Claude model (`null`: CLI default). |
@@ -585,8 +600,8 @@ The kit's `install.sh` does all of this; by hand:
   the current message (including a running `agent-send` or orchestrator child), records the outcome,
   and exits without starting another; unprocessed messages stay behind the saved history cursor for
   the next poll. After the daemon exits (or the deadline passes) systemd kills what remains.
-  `TimeoutStopSec=1h` covers the worst case: an event waiting for the orchestrator lock, then two
-  15-minute attempts. If you raise `orchestrator_timeout`, raise this too. Agents themselves are not
+  `TimeoutStopSec=1h` covers the worst case: an event waiting for the orchestrator lock, then a
+  15-minute run (logins that are out fail within seconds and pass it on). If you raise `orchestrator_timeout`, raise this too. Agents themselves are not
   in this cgroup (see memory caps), so a restart does not touch them.
 - `agent-failover.service`: `KillMode=process`, so a restart never takes the agents it relaunched
   with it; `MemoryMax=256M`.

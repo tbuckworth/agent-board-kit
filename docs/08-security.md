@@ -49,9 +49,11 @@ command your user can. Mitigations, in order of value:
 | `~/.config/agent-mail/token.json` | the agents' Gmail refresh token (`gmail.modify`) | mode 600, dir 700; revoke at myaccount.google.com/permissions |
 | `~/.config/agent-kit/kit.env` | names and addresses only | no secrets |
 
-The orchestrator can optionally fall back to an Anthropic API key when the Claude login fails
+When a Claude login is out, the orchestrator moves on to the next login in `usage.order`, then Codex.
+On Codex it runs with `--ignore-user-config`, so no MCP server from your Codex config (a Gmail one,
+say) is loaded, as the Claude run loads none. As a last resort it can use an Anthropic API key
 (`orchestrator_fallback_secret`, via Bitwarden Secrets Manager's `bws run`, so the key is never
-written to disk or logged). It is off by default.
+written to disk or logged). That step is off by default.
 
 ## Privacy
 

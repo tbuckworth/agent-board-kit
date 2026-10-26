@@ -40,8 +40,8 @@ def main(argv=None):
         for r in runs:
             ts = time.strftime("%m-%d %H:%M", time.localtime(r.get("ts", 0)))
             cost = ("$%.3f" % r["cost"]) if isinstance(r.get("cost"), (int, float)) else "-"
-            print("%s %-6s %-4s %7s %3s turns %6ss  %s" % (
-                ts, r.get("source", ""), "ok" if r.get("ok") else "FAIL", cost, r.get("turns") or "-",
+            print("%s %-6s %-4s %-9s %7s %3s turns %6ss  %s" % (
+                ts, r.get("source", ""), "ok" if r.get("ok") else "FAIL", r.get("auth") or "-", cost, r.get("turns") or "-",
                 r.get("duration_s") or "-", (r.get("error") or r.get("result") or "").replace("\n", " ")[:90]))
         total = sum(r["cost"] for r in orchestrate.recent_runs(100000) if isinstance(r.get("cost"), (int, float)))
         print("total logged cost: $%.2f over %d runs" % (total, len(orchestrate.recent_runs(100000))))
