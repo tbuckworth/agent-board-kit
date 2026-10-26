@@ -1,6 +1,6 @@
 # The upstream commit each part of the kit was last brought up to date with (for the maintainer's refresh).
 # component       upstream repo          commit    synced
-mailroom          agent-mailroom         613345b   2026-10-21
+mailroom          agent-mailroom         e35e8ec   2026-10-26
 board             agent-board            7ff4802   2026-10-21
 todo              to-do                  afdbde0   2026-10-21
 cloud-watchdog    cloud-watchdog         4a1ddda   2026-10-16

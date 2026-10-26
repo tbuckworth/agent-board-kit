@@ -5,7 +5,7 @@ One agent's batch of parallel workers can fill RAM and swap; the kernel then kil
 agent that started the batch is usually enough for it to cut its workers. This sends that message automatically:
 
 - warn (default 80% of RAM in use): message the agents that hold most of it;
-- urgent (90% of RAM, or swap half full): message them again, urgently, and email the owner the table;
+- urgent (90% of RAM, or 80% with swap half full): message them again, urgently, and email the owner the table;
 - cap: an agent whose own scope (agent-NAME.scope, see memcap) is at 90% of its MemoryMax is told before
   the cap kills its batch.
 
@@ -19,8 +19,8 @@ from pathlib import Path
 DEFAULTS = {
     "warn_pct": 80,             # RAM in use, %: message the top agents
     "urgent_pct": 90,           # RAM in use, %: message again, urgently, and email the owner
-    "swap_urgent_pct": 50,      # swap in use, %: counts as urgent (swap thrash is what makes an OOM storm fatal)
-    "rearm_pct": 75,            # below this (and swap below half the urgent level) everything re-arms
+    "swap_urgent_pct": 50,      # swap in use, %: with RAM at warn_pct or more, counts as urgent (see level)
+    "rearm_pct": 75,            # below this the agent messages re-arm
     "interval_seconds": 15,
     "repeat_minutes": 30,       # per agent and level
     "email_repeat_minutes": 60,
@@ -167,9 +167,14 @@ def owners(procs, sessions_by_pid, sessions=(), env_of=env_session_id, env_min=1
 
 # ------------------------------------------------------------------ decisions
 def level(u, s):
-    if u["ram_pct"] >= s["urgent_pct"] or (u["swap_total"] and u["swap_pct"] >= s["swap_urgent_pct"]):
+    """0 quiet, 1 warn, 2 urgent. Swap filling while RAM is full is what made 2026-10-05 fatal, but swap alone
+    means nothing: pages swapped out under past pressure stay there until touched. On 2026-10-25 swap sat at 60%
+    with RAM at 14% and no memory pressure, and counting it alone emailed the owner every hour all night."""
+    if u["ram_pct"] >= s["urgent_pct"]:
         return 2
-    return 1 if u["ram_pct"] >= s["warn_pct"] else 0
+    if u["ram_pct"] < s["warn_pct"]:
+        return 0
+    return 2 if u["swap_total"] and u["swap_pct"] >= s["swap_urgent_pct"] else 1
 
 
 def targets(u, own, s):
@@ -191,17 +196,19 @@ def decide(state, u, own, caps, s, now):
     sent = state["sent"]
     lvl = level(u, s)
     actions = []
-    if lvl == 0 and u["ram_pct"] < s["rearm_pct"] and u["swap_pct"] < s["swap_urgent_pct"] / 2:
-        sent = state["sent"] = {k: v for k, v in sent.items() if k.startswith("cap:")}
+    if lvl == 0 and u["ram_pct"] < s["rearm_pct"]:
+        # agent messages re-arm; the email keeps its hourly limit, so a level bouncing around 80% mails the owner once
+        sent = state["sent"] = {k: v for k, v in sent.items() if k.startswith("cap:") or k == "email"}
     due = lambda key, minutes: key not in sent or now - sent[key] >= minutes * 60  # noqa: E731
     if lvl:
-        for g in targets(u, own, s):
+        warned = targets(u, own, s)
+        for g in warned:
             key = "%s:%d" % (g["key"], lvl)
             if due(key, s["repeat_minutes"]):
                 actions.append(("ping", g, lvl, ping_text(u, g, lvl, s)))
                 sent[key] = now
         if lvl == 2 and s["email"] and due("email", s["email_repeat_minutes"]):
-            actions.append(("email",) + email_text(u, own))
+            actions.append(("email",) + email_text(u, own, warned, s))
             sent["email"] = now
     for g, cur, mx in caps:
         key = "cap:" + g["key"]
@@ -246,9 +253,11 @@ def table(own, n=8):
     return "\n".join("%10s  %s  (%s)" % (gb(g["mem"]), g["label"], what(g)) for g in own[:n])
 
 
-def email_text(u, own):
+def email_text(u, own, warned, s):
     top = own[0] if own else None
     subject = "RAM %d%%%s" % (u["ram_pct"], (": %s holds %s" % (top["label"], gb(top["mem"]))) if top else "")
-    body = ("%s\n\nBiggest holders (anonymous memory + swap):\n\n%s\n\nThe agents among them have been messaged. "
-            "agent-memwatch emails at most once an hour while memory stays this high." % (headline(u), table(own)))
+    told = ("Messaged: %s." % ", ".join(g["label"] for g in warned) if warned else
+            "No agent among the biggest holders has %d GB or more, so none was messaged." % s["min_agent_gb"])
+    body = ("%s\n\nBiggest holders (anonymous memory + swap):\n\n%s\n\n%s agent-memwatch emails at most once an "
+            "hour while memory stays this high." % (headline(u), table(own), told))
     return subject, body

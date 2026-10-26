@@ -7,9 +7,10 @@
 Every 15 s it reads /proc/meminfo and charges each process's anonymous memory plus swap to the Claude or Codex
 session it descends from (registry.all_sessions, the address book agent-send uses).
 - At 80% of RAM in use it messages the agents holding most of it, via agent-send.
-- At 90%, or with swap half full, it messages them again, urgently, and emails the owner the table.
+- At 90%, or at 80% with swap half full, it messages them again, urgently, and emails the owner the table.
+  Swap alone never alerts: pages stay swapped out long after the pressure that put them there has gone.
 - An agent whose own agent-NAME.scope is at 90% of its MemoryMax is told before the cap kills its batch.
-At most one message per agent and level per 30 min, one email per hour; everything re-arms below 75%.
+At most one message per agent and level per 30 min, one email per hour; agent messages re-arm below 75%.
 Settings: config key "memwatch" (~/.config/agent-mail/config.json); defaults and reasons in agentmail/memwatch.py.
 """
 import argparse

@@ -56,6 +56,10 @@ DEFAULTS = {
     "orchestrator_model": "sonnet",
     "orchestrator_effort": "high",
     "orchestrator_timeout": 900,
+    # When both Claude logins are out, the event runs on Codex (usage.order puts it there): this model, or
+    # spawn_codex_model when null, at this reasoning effort.
+    "orchestrator_codex_model": None,
+    "orchestrator_codex_effort": "high",
     # agent-spawn's model and effort per CLI when --model/--effort are not given. Full ids, so a
     # new release does not change what spawned agents run. Set one to null in config.json to
     # leave that choice to the CLI's own default.
@@ -80,9 +84,9 @@ DEFAULTS = {
     # agent-failover: move a Claude agent to another login when its own hits a usage limit. Overrides go
     # here, e.g. {"enabled": false} or {"pinned": ["long-job-*"]}; keys and defaults: agentmail/failover.py.
     "failover": {},
-    # Optional: if the claude.ai login fails or is rate-limited, retry the orchestrator once with an
-    # Anthropic API key held in Bitwarden Secrets Manager, injected by `bws run`. Set this to the
-    # secret's name in your bws project (e.g. "ANTHROPIC_API_KEY"); None disables the fallback.
+    # Optional last resort for the orchestrator, after every login in usage.order fails or is out of usage:
+    # an Anthropic API key held in Bitwarden Secrets Manager, injected by `bws run`. Set this to the
+    # secret's name in your bws project (e.g. "ANTHROPIC_API_KEY"); None disables it.
     "orchestrator_fallback_secret": None,
     "bws_token_file": "~/.config/bws/token",
     "bws_project_file": "~/.config/bws/project-id",

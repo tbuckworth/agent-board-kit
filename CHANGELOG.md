@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-26
+
+**Orchestrator: every login before the API key** (mailroom). When a login is out of usage or logged
+out, the orchestrator now passes the event to the next one in `usage.order`: each Claude login, then
+Codex (`codex exec`, with no MCP servers, plugins or hooks from your Codex config, as the Claude run has
+none), and only then the optional API key. Before, it went from the default login straight to the API
+key, or failed without one. A run that times out or fails after its first turn is not repeated, since
+it may have acted already. `agent-orchestrate --runs` shows which login ran each event. New settings:
+`orchestrator_codex_model`, `orchestrator_codex_effort`.
+
+**Memory watch: swap alone no longer alerts** (mailroom). Swap half full now makes it urgent only with
+RAM at 80% or more: pages swapped out under past pressure stay in swap long after it has gone, and
+counting them alone emailed the owner every hour all night. The email names the agents it messaged.
+
 ## 2026-10-21 (later)
 
 **Pre-send review: where the question goes.** The review no longer pushes a bare yes/no to the first line,
