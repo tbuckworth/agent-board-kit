@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import alerts, registry, remote, routing, statuslog
+from . import alerts, config, gmail, registry, remote, routing, statuslog
 
 
 def search(queries, cfg):
@@ -15,8 +15,8 @@ def search(queries, cfg):
         raise ValueError("provide one to eight literal queries")
     if any(not isinstance(q, str) or not 8 <= len(q) <= 500 for q in queries):
         raise ValueError("queries must be between 8 and 500 characters")
-    deadline = time.monotonic() + min(20, cfg.get("recovery_seconds", 20))
-    cutoff = time.time() - min(30, cfg.get("recovery_days", 14)) * 86400
+    deadline = time.monotonic() + min(20, cfg["recovery_seconds"])
+    cutoff = time.time() - min(30, cfg["recovery_days"]) * 86400
     remaining = 64 * 1024 * 1024
     candidates, checked, limits = {}, 0, set()
     sessions = registry.all_sessions()
@@ -114,7 +114,7 @@ def search(queries, cfg):
             limits.add("worktree search budget reached")
             break
         root = Path(cwd)
-        if root == Path.home() or not (root / ".git").exists():
+        if root == config.HOME or not (root / ".git").exists():
             continue
         for directory, dirs, files in os.walk(str(root), followlinks=False):
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
@@ -135,8 +135,7 @@ def search(queries, cfg):
 def default_queries(st, inb):
     sent = st.sent_in_thread(inb["thread_id"])
     subject = (sent["subject"] if sent else inb["subject"]) or ""
-    subject = re.sub(r"^(?:(?:re|fwd?):\s*)+", "", subject, flags=re.I)
-    subject = re.sub(r"\s*\[#[a-z0-9]+\]", "", subject).strip()
+    subject = routing.bare_subject(subject)
     values = [subject, sent["message_id"] if sent else None]
     return [v for v in values if v and 8 <= len(v) <= 500]
 
@@ -165,7 +164,7 @@ def recover(st, cfg, inb, queries=None, refresh=False):
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             result["checks"].append({"host": cfg["host_id"], "error": str(e)[:500]})
         # Local matches are not proof of ownership, so the orchestrator may still need the Mac.
-        for host in cfg.get("recovery_hosts", []):
+        for host in cfg["recovery_hosts"]:
             try:
                 result["checks"].append(remote.call(cfg, host, {"op": "search", "queries": queries}))
             except remote.RemoteError as e:
@@ -205,12 +204,13 @@ def notify(svc, st, cfg, inb):
     else:
         happened = "I couldn't identify which session should receive your reply."
         action = "Reply here with the intended session or document so the orchestrator can arrange a handoff."
-    body = ("%s\n\nNothing has been lost: your email is saved in Gmail and in the mailroom. "
+    body = ("%s\n\nNothing has been lost: your email is saved %s. "
             "You don't need to resend it.\n\n%s\n\n"
             "Your reply: %s\nFrom: %s\n"
-            "Open email: https://mail.google.com/mail/?authuser=%s#all/%s\n\n"
+            "Open email: %s\n\n"
             "For diagnosis: %s\nSaved mail: agent-mail show %s\n") % (
-                happened, action, inb["subject"], inb["from_addr"], cfg["account"], inb["thread_id"],
+                happened, routing.saved_where(inb["gmail_id"]), action, inb["subject"], inb["from_addr"],
+                gmail.web_url(cfg["account"], "all/%s" % inb["thread_id"]),
                 inb["detail"] or "recipient unknown", inb["id"])
     if origin:
         body += "Original session: %s (%s)\n" % (origin["session_id"], origin["origin_host"])

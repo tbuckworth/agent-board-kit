@@ -1,30 +1,68 @@
-"""Text of every message the watchdog sends. Markdown; emails are rendered to HTML by notify.py.
+"""Text of the owner messages and the emails about resources and accounts. Markdown; emails are rendered to HTML by
+notify.py, which also adds the footer (how to answer) to each.
 
 Emails go to the human the watchdog works for (config owner_name / owner_email). Agent messages call
 that person by name, so an agent knows who will be asked next.
 """
 import json
 
-from . import rules, util
+from . import providers, rules, util
+
+PREFIX = "[cloud-watchdog"   # starts every subject and owner message; transcripts.py skips the lines that hold it
+WID_PREFIX = "wd-"
 
 
-def human(cfg=None):
-    return (cfg or {}).get("owner_name") or "the owner"
+def human(cfg=None, capital=False):
+    """The name of the person the watchdog works for (config owner_name), else "the owner"."""
+    name = (cfg or {}).get("owner_name") or "the owner"
+    return name[:1].upper() + name[1:] if capital else name
+
+
+def subject(text, inc_id=None):
+    """A subject line: PREFIX, the incident's id when there is one, then `text`."""
+    return "%s%s] %s" % (PREFIX, " " + wid(inc_id) if inc_id else "", text)
+
+
+def wid(inc_id):
+    """An incident's id as commands and messages write it (wd-17)."""
+    return "%s%d" % (WID_PREFIX, inc_id)
+
+
+def parse_wid(text):
+    """The incident id that `text` names (wd-17, in any case), or None when it is not an incident id."""
+    text = text.strip().lower()
+    number = text[len(WID_PREFIX):]
+    return int(number) if text.startswith(WID_PREFIX) and number.isdigit() else None
+
+
+def display_name(res):
+    """What a person knows the resource as: its name, else its provider id."""
+    return res["name"] or res["native_id"]
+
+
+def owner_label(res, short=False):
+    """Who owns the resource, for a person: the owner session's name, else its id (the first 8 characters with
+    `short`), else "unknown"."""
+    session = res["owner_session"] or ""
+    return res["owner_name"] or (session[:8] if short else session) or "unknown"
+
+
+def cost_text(res):
+    """What the resource has cost in its active stretch, marked ≈ when the provider's figure is an estimate."""
+    return util.money(rules.streak_cost(res), est="estimate" in (res["cost_source"] or ""))
 
 
 def label(res):
-    return "%s (%s)" % (res["name"] or res["native_id"], res["key"])
+    return "%s (%s)" % (display_name(res), res["key"])
 
 
 def facts(res, now):
     extra = json.loads(res["extra"] or "{}")
-    cost = rules.streak_cost(res)
     lines = []
     up = (now - res["launched_at"]) if res["launched_at"] else None
     lines.append("Up since %s (%s)." % (util.iso(res["launched_at"]), util.age(up)) if up else "Launch time unknown.")
-    if cost is not None:
-        lines.append("Cost so far: %s (%s)." % (util.money(cost, est="estimate" in (res["cost_source"] or "")),
-                                                 res["cost_source"] or "?"))
+    if rules.streak_cost(res) is not None:
+        lines.append("Cost so far: %s (%s)." % (cost_text(res), res["cost_source"] or "?"))
     if res["rate_usd_h"]:
         lines.append("Burning about %s/h (%s)." % (util.money(res["rate_usd_h"]), res["rate_source"] or "?"))
     if res["health"] == "crash_loop":
@@ -44,23 +82,23 @@ def facts(res, now):
     return lines
 
 
-def wid(inc):
-    return "wd-%d" % inc["id"]
-
-
-def ping(inc, res, findings, now, wait_min, auto_stop=False, cfg=None):
-    """auto_stop: policy would let the watchdog stop this crash loop itself if nobody answers."""
-    w = wid(inc)
-    head = "[cloud-watchdog %s] Is this yours? %s" % (w, label(res))
+def ping(inc, res, findings, now, wait_min, will_stop, cfg=None):
+    """The owner message. `will_stop`: whether the watchdog will stop the resource if nobody answers in time. `cfg`
+    names the human the watchdog asks next."""
+    w = wid(inc["id"])
+    mod = providers.get(res["provider"])
+    head = subject("Is this yours? %s" % label(res), inc["id"])
     why = "; ".join(f["text"] for f in findings)
-    then = ("If nobody answers in %d min I will stop it (`modal app stop`; volumes, secrets and images are kept) "
-            "and tell %s." % (wait_min, human(cfg))) if auto_stop else \
-        "If nobody answers in %d min I will ask %s." % (wait_min, human(cfg))
+    then = ("If nobody answers in %d min I will stop it (%s) and tell %s." % (wait_min, mod.STOP_EFFECT, human(cfg))
+            if will_stop else "If nobody answers in %d min I will ask %s." % (wait_min, human(cfg)))
+    close = ("  cloud-watch close %s --reason \"...\"               # stop it now: %s" % (w, mod.STOP_EFFECT)
+             if hasattr(mod, "stop") else
+             "  (cloud-watch cannot close %s resources: stop it in the provider's dashboard)" % res["provider"])
     body = [head, "Flagged: %s." % why] + facts(res, now) + [
         "Why I think it is yours: %s" % (res["owner_evidence"] or "?"),
         "",
         "Please run exactly ONE of:",
-        "  cloud-watch close %s --reason \"...\"               # stop it now (graceful; data kept)" % w,
+        close,
         "  cloud-watch ack %s --keep 24h --reason \"...\"      # still needed; optional --expect-cost USD" % w,
         "  cloud-watch disown %s --reason \"...\"              # not yours" % w,
         then,
@@ -68,31 +106,36 @@ def ping(inc, res, findings, now, wait_min, auto_stop=False, cfg=None):
     return "\n".join(body)
 
 
-def resume_turn(ping_text):
+def resume_turn(inc, res, findings, now, wait_min, will_stop, cfg=None):
     """For an owner session that has exited: one resumed turn, answer only this."""
     return ("This session was resumed by cloud-watchdog for ONE question. Answer it, run the one command, "
-            "and stop: do not continue any other work.\n\n" + ping_text)
+            "and stop: do not continue any other work.\n\n" + ping(inc, res, findings, now, wait_min, will_stop, cfg))
 
 
-def footer(inc_id=None, extra=None, cfg=None):
-    w = "wd-%d" % inc_id if inc_id else "<id>"
-    lines = ["", "", "---", "", "*How to answer:* reply in plain words (\"close it\", \"keep it 48h\", \"stay in shadow\").",
-             "*For the orchestrator:* %s's reply maps to one command, run on the machine cloud-watchdog runs on:"
-             % human(cfg),
-             "`cloud-watch close %s --by human --reason \"<their words>\"` · "
-             "`cloud-watch ack %s --by human --keep <duration> --reason \"<their words>\"` · "
-             "`cloud-watch mode shadow --by human` (stay in shadow) · `cloud-watch mode off --by human`. "
-             "Then confirm in-thread with the command's output." % (w, w)]
-    if extra:
-        lines.insert(2, extra)
+def footer(inc_id, shadow_days, cfg=None):
+    """How to answer an email about incident `inc_id` (None: no incident): the commands the human's reply maps to.
+    `shadow_days` is how long the shadow period that "stay in shadow" starts lasts (0: no end)."""
+    # The same reply -> command table is in docs/orchestrator-section.md, "cloud-watchdog threads": change both.
+    w = wid(inc_id) if inc_id else "<id>"
+    name = human(cfg)
+    shadow = ("`cloud-watch mode shadow --days %g --by human`" % shadow_days if shadow_days
+              else "`cloud-watch mode shadow --by human`")
+    lines = ["", "", "---", "",
+             "*How to answer:* reply in plain words (\"close it\", \"keep it 48h\", \"stay in shadow\", "
+             "\"turn it off\", \"go live now\").",
+             "*For the orchestrator:* %s's reply maps to one command, run on the machine cloud-watchdog runs on:" % name,
+             "`cloud-watch close %s --by human --reason \"%s: <their words>\"` · "
+             "`cloud-watch ack %s --by human --keep <duration> --reason \"%s: <their words>\"` · "
+             "%s (stay in shadow) · `cloud-watch mode off --by human` · "
+             "`cloud-watch mode live --by human`. Then confirm in-thread with the command's output."
+             % (w, name, w, name, shadow)]
     return "\n".join(lines)
 
 
-def escalation(inc, res, findings, now, reason, recommendation, crash, stop_at=None, cfg=None):
-    w = wid(inc)
-    subject = "[cloud-watchdog %s] %s: %s, owner not reached" % (w, res["name"] or res["native_id"],
-                                                                   ", ".join(sorted({f["rule"] for f in findings})))
-    body = ["**%s** in `%s`" % (res["name"] or res["native_id"], res["account"]), ""]
+def escalation(inc, res, findings, now, reason, recommendation, stop_at=None):
+    head = subject("%s: %s, owner not reached" % (display_name(res), ", ".join(sorted({f["rule"] for f in findings}))),
+                   inc["id"])
+    body = ["**%s** in `%s`" % (display_name(res), res["account"]), ""]
     body += ["- " + f["text"] for f in findings]
     body += ["- " + l for l in facts(res, now)]
     body += ["", "**Owning agent:** %s" % reason]
@@ -100,51 +143,51 @@ def escalation(inc, res, findings, now, reason, recommendation, crash, stop_at=N
         body += ["", "Evidence: %s" % res["owner_evidence"]]
     body += ["", "**Recommendation:** %s" % recommendation]
     if stop_at:
-        body += ["", "**Unless you say keep, I will stop it at %s** (`modal app stop`; data kept)." % util.iso(stop_at, local=True)]
-    return subject, "\n".join(body) + footer(inc["id"], cfg=cfg)
+        body += ["", "**Unless you say keep, I will stop it at %s** (%s)." % (
+            util.iso(stop_at, local=True), providers.get(res["provider"]).STOP_EFFECT)]
+    return head, "\n".join(body)
 
 
-def auto_stopped(inc, res, findings, now, ok, detail, cfg=None):
-    w = wid(inc)
-    subject = "[cloud-watchdog %s] %s %s" % (w, "Stopped crash-looping" if ok else "FAILED to stop",
-                                              res["name"] or res["native_id"])
-    body = ["%s `%s` in `%s`." % ("Stopped" if ok else "Tried and failed to stop", res["name"], res["account"]), ""]
+def auto_stopped(inc, res, now, ok, detail):
+    head = subject("%s %s" % ("Stopped crash-looping" if ok else "FAILED to stop", display_name(res)), inc["id"])
+    body = ["%s `%s` in `%s`." % ("Stopped" if ok else "Tried and failed to stop", display_name(res), res["account"]),
+            ""]
     body += ["- " + l for l in facts(res, now)]
-    body += ["", "Owning agent: %s" % (res["owner_name"] or res["owner_session"] or "not found"),
+    body += ["", "Owning agent: %s" % owner_label(res),
              "Action: `modal app stop %s`: %s" % (res["native_id"], detail),
-             "", "Nothing was deleted: the deployment can be redeployed with `modal deploy`; volumes, secrets and "
-             "images are untouched."]
-    return subject, "\n".join(body) + footer(inc["id"], cfg=cfg)
+             "", "Nothing was deleted: the app can be started again with `modal deploy` or `modal run`; volumes, "
+             "secrets and images are untouched."]
+    return head, "\n".join(body)
 
 
-def cost_email(inc_id, res, finding, now, cfg=None):
-    subject = "[cloud-watchdog%s] %s has cost %s" % (" wd-%d" % inc_id if inc_id else "", res["name"] or res["native_id"],
-                                                       util.money(rules.streak_cost(res)))
-    body = ["**%s** in `%s`: %s." % (res["name"], res["account"], finding["text"]), ""]
+def cost_email(inc_id, res, finding, now):
+    head = subject("%s has cost %s" % (display_name(res), cost_text(res)), inc_id)
+    body = ["**%s** in `%s`: %s." % (display_name(res), res["account"], finding["text"]), ""]
     body += ["- " + l for l in facts(res, now)]
-    body += ["", "Owning agent: %s%s" % (res["owner_name"] or res["owner_session"] or "unknown",
+    body += ["", "Owning agent: %s%s" % (owner_label(res),
                                   ("; acked until %s: %s" % (util.iso(res["suppress_until"]), res["suppress_reason"]))
                                   if res["suppress_until"] and res["suppress_until"] > now else "")]
-    body += ["", "Next email at %s unless it stops." % util.money(finding["tier"] * 2)]
-    return subject, "\n".join(body) + footer(inc_id, cfg=cfg)
+    # The threshold after this tier: next_tier(start, already emailed) with both set to this tier.
+    body += ["", "Next email at %s unless it stops." % util.money(rules.next_tier(finding["tier"], finding["tier"]))]
+    return head, "\n".join(body)
 
 
-def foreign_crash(res, now, cfg=None):
-    who = util.modal_user(res)
-    subject = "[cloud-watchdog] Someone else's app crash-looping: %s (%s)" % (res["name"], who or "unknown")
+def foreign_crash(res, now):
+    who = util.launched_by(res)
+    head = subject("Someone else's app crash-looping: %s (%s)" % (display_name(res), who or "unknown"))
     body = ["`%s` in `%s` is crash-looping. It was started by **%s**, not by you, so I will not touch it." % (
-        res["name"], res["account"], who or "someone else"), ""]
+        display_name(res), res["account"], who or "someone else"), ""]
     body += ["- " + l for l in facts(res, now)]
     body += ["", "The watchdog never contacts other people, so they have not been told. Forward this if you like."]
-    return subject, "\n".join(body) + footer(None, cfg=cfg)
+    return head, "\n".join(body)
 
 
-def blind(account, row, now, cfg=None):
-    subject = "[cloud-watchdog] Can't see %s" % account
+def blind(account, row):
+    head = subject("Can't see %s" % account)
     body = ["The `%s` check has failed %d times in a row since %s." % (account, row["consecutive_failures"],
                                                                        util.iso(row["last_ok_at"]) if row["last_ok_at"] else "install"),
             "", "Last error: `%s`" % (row["last_error"] or "?"),
             "", "Until it recovers I cannot see what is running there. Common causes: an expired or rotated key, a missing "
                 "or unreadable credentials file (`cloud-watch accounts` shows where each account's keys come from), "
                 "or an API change."]
-    return subject, "\n".join(body) + footer(None, cfg=cfg)
+    return head, "\n".join(body)

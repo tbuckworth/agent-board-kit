@@ -6,10 +6,6 @@ import { waitingState, addDays } from './tags.js';
 
 const DAY = 86400000;
 
-// "This week": Covey's weekly big rocks, a single label, at most five open tasks
-export const FOCUS_LABEL = 'focus:week';
-export const FOCUS_CAP = 5;
-
 // Snoozes grow: 1 day, 3 days, 1 week, 3 weeks, then 3 weeks again
 export const SNOOZE_DAYS = [1, 3, 7, 21];
 export const SNOOZE_HINT_COUNT = 4;
@@ -42,7 +38,7 @@ export function isSnoozed(entry, now) {
 
 export function snoozeHint(entry) {
   const count = entry?.count || 0;
-  return count >= SNOOZE_HINT_COUNT ? `Snoozed ${count} times — archive?` : null;
+  return count >= SNOOZE_HINT_COUNT ? `Snoozed ${count} times. Archive?` : null;
 }
 
 export function recencyFactor(lastShown, now) {
@@ -102,61 +98,6 @@ export function pruneShown(shown, now) {
     if (now - v < SHOWN_KEEP_DAYS * DAY) kept[k] = v;
   }
   return kept;
-}
-
-// Expired snoozes keep their count (it drives the next interval and the hint)
-export function pruneSnoozes(snoozes, openNumbers) {
-  const kept = {};
-  for (const [k, v] of Object.entries(snoozes || {})) {
-    if (!openNumbers || openNumbers.has(Number(k))) kept[k] = v;
-  }
-  return kept;
-}
-
-// This week
-export function hasFocus(task) {
-  return (task.labels || []).some(l => l.toLowerCase() === FOCUS_LABEL);
-}
-
-export function focusTasks(tasks) {
-  return tasks.filter(t => t.state === 'OPEN' && hasFocus(t));
-}
-
-export function withFocus(labels, on) {
-  const rest = (labels || []).filter(l => l.toLowerCase() !== FOCUS_LABEL);
-  return on ? [...rest, FOCUS_LABEL] : rest;
-}
-
-// Labels with the rating replaced: importance:, urgency: and due: (and the retired priority:) are rewritten,
-// every other label is kept as it is
-const RATING_PREFIXES = ['importance:', 'urgency:', 'due:', 'priority:'];
-
-export function withRating(labels, { importance, urgency, due }) {
-  const rest = (labels || []).filter(l => !RATING_PREFIXES.some(p => l.toLowerCase().startsWith(p)));
-  if (importance) rest.push(`importance:${importance}`);
-  if (urgency) rest.push(`urgency:${urgency}`);
-  if (due) rest.push(`due:${due}`);
-  return rest;
-}
-
-// The agent's "**First step:** …" line from the Claude notes (as nudges use it), or null
-const FIRST_STEP_RE = /^\W*\*\*First step:?\*\*:?\s*(.+)$/im;
-
-export function firstStep(claudeNotes) {
-  if (!claudeNotes) return null;
-  const m = FIRST_STEP_RE.exec(claudeNotes);
-  return m ? m[1].trim() : null;
-}
-
-// Archived: closed as "not planned", still in a list (the apps' delete removes the list: label)
-export function isArchived(task) {
-  return task.state === 'CLOSED' && task.stateReason === 'NOT_PLANNED' &&
-    (task.labels || []).some(l => l.toLowerCase().startsWith('list:'));
-}
-
-// Closed issues cached before stateReason was fetched; a full sync fills it in
-export function needsStateReason(tasks) {
-  return tasks.some(t => t.state === 'CLOSED' && t.stateReason === undefined);
 }
 
 // Per-device triage memory: { snoozes: { [number]: { count, until } }, shown: { [number]: epochMs } }

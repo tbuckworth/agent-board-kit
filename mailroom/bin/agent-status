@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """agent-status: the status log and the "what are my agents up to" report.
 
-    agent-status note TEXT...              record a milestone for this session (free; no model)
-    agent-status report [--since 24h] [--format text|md|html|json] [--email TO] [--narrative FILE]
-    agent-status log [--since 24h] [--session NAME_OR_ID] [--event note|idle|quota|...]
-    agent-status hook --cli claude|codex   (hook entry point; reads the hook JSON on stdin)
+    agent-status note TEXT... [--session NAME_OR_ID] [--cli claude|codex]   # record a milestone (free; no model)
+    agent-status report [--since 24h] [--format text|md|html|json] [--narrative FILE]
+                        [--email TO [--subject S] [--session NAME_OR_ID]]
+    agent-status log [--since 24h] [--session NAME_OR_ID] [--event EVENT] [--limit N]
+    agent-status hook --cli claude|codex   # the hooks' entry point; reads the hook's JSON on stdin
 
-Notes are for milestones, blockers and finished work the owner would want to know about.
-Inside Claude the session is found from CLAUDE_CODE_SESSION_ID; inside Codex from the
-working directory (pass --session to be explicit).
+Without --session, note finds the session from CLAUDE_CODE_SESSION_ID in Claude, from the working directory in
+Codex. Details: README.md, section "The status log and report"; the events: agentmail/statuslog.py.
 """
 import argparse
 import json
@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import registry, report, statuslog  # noqa: E402
+from agentmail import config, piped, registry, report, statuslog  # noqa: E402
 
 QUOTA_TYPES = ("quota_auto_resume_fired", "quota_auto_resume_stale", "quota_auto_resume_disabled")
 LIMIT_ERRORS = ("rate_limit", "billing_error", "account_on_hold")   # StopFailure errors that are the plan's limits
@@ -28,8 +28,8 @@ LIMIT_ERRORS = ("rate_limit", "billing_error", "account_on_hold")   # StopFailur
 
 def cmd_note(a):
     text = " ".join(a.text).strip()
-    if not text and not sys.stdin.isatty():
-        text = sys.stdin.read().strip()
+    if not text:
+        text = (piped.piped_text() or "").strip()       # only what was piped in: never the tool's open socket
     if not text:
         print("agent-status: empty note", file=sys.stderr)
         return 1
@@ -49,7 +49,10 @@ def _resolve(spec, cli):
 
 
 def cmd_hook(a):
-    """Never fails, never prints: a broken status log must not disturb the agent."""
+    """Never fails and never prints on stdout, which for a SessionStart hook goes into the agent's context: an error
+    is written to the status dir's hook-errors.jsonl (statuslog.record_hook_error), which `report` counts, and
+    only if that fails too, said on stderr."""
+    kind = ""
     try:
         raw = sys.stdin.read()
         d = json.loads(raw) if raw.strip() else {}
@@ -75,8 +78,12 @@ def cmd_hook(a):
         if kind == "StopFailure":
             ev["text"] = ("%s: %s" % (d.get("error", "unknown"), d.get("error_details") or ""))[:200]
         statuslog.append(ev)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - the agent must not be disturbed; the error is recorded instead
+        err = "%s: %s" % (type(e).__name__, e)
+        try:
+            statuslog.record_hook_error(a.cli, kind, err)
+        except OSError as e2:
+            print("agent-status hook: %s; recording it failed: %s" % (err, e2), file=sys.stderr)
     return 0
 
 
@@ -113,6 +120,7 @@ def cmd_report(a):
         tp.write_text(text_body)
         mail = Path(__file__).resolve().parent / "agent-mail"
         subject = a.subject or "Agents on %s: %d live, %d waiting" % (rep["host"], rep["live"], rep["waiting"])
+        # agent-mail runs under this interpreter, the kit's venv, which holds the Google client libraries
         cmd = [sys.executable, str(mail), "send", "--to", a.email, "--subject", subject, "--body-file", str(tp), "--html", str(hp)]
         # the report is generated in a fixed format: the pre-send review has nothing to fix in it
         cmd += ["--session", a.session, "--no-review", "generated status report"] if a.session else ["--unrouted"]
@@ -129,11 +137,11 @@ def main(argv=None):
     p = sub.add_parser("note", help="record a milestone for this session")
     p.add_argument("text", nargs="*")
     p.add_argument("--session", help="session name or id (default: this session, or the one in this directory)")
-    p.add_argument("--cli", choices=["claude", "codex"])
+    p.add_argument("--cli", choices=config.CLIS)
     p.set_defaults(fn=cmd_note)
 
     p = sub.add_parser("hook", help="hook entry point (stdin JSON)")
-    p.add_argument("--cli", choices=["claude", "codex"], required=True)
+    p.add_argument("--cli", choices=config.CLIS, required=True)
     p.set_defaults(fn=cmd_hook)
 
     p = sub.add_parser("log", help="print events")
@@ -146,7 +154,7 @@ def main(argv=None):
     p = sub.add_parser("report", help="what every agent is up to")
     p.add_argument("--since", default="24h")
     p.add_argument("--format", choices=["text", "md", "html", "json"], default="text")
-    p.add_argument("--email", help="send the report to this address (HTML + text)")
+    p.add_argument("--email", help="send the report (HTML + text) to this address, or to owner (agent-mail send --to)")
     p.add_argument("--subject")
     p.add_argument("--narrative", help="file with a short paragraph to put above the table")
     p.add_argument("--session", help="send the mail from this session (default: unrouted, replies go to the orchestrator)")

@@ -7,9 +7,11 @@ import { webcrypto } from 'node:crypto';
 
 import {
   snoozeDays, nextSnooze, isSnoozed, snoozeHint, recencyFactor, ageFactor, triageWeight, triagePool,
-  pickTriage, pruneShown, hasFocus, focusTasks, withFocus, withRating, firstStep, isArchived, needsStateReason,
-  loadTriageStore, saveTriageStore, STORE_KEY, FOCUS_LABEL, UNRATED_WEIGHT,
+  pickTriage, pruneShown, loadTriageStore, saveTriageStore, STORE_KEY, UNRATED_WEIGHT,
 } from '../js/triage.js';
+import {
+  hasFocus, focusTasks, withFocus, withRating, firstStep, isArchived, needsStateReason, FOCUS_LABEL,
+} from '../js/labels.js';
 import { parseIssue } from '../js/parser.js';
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
@@ -53,7 +55,7 @@ test('a snoozed task is hidden until its snooze ends', () => {
 
 test('the hint appears after the fourth snooze', () => {
   assert.equal(snoozeHint({ count: 3 }), null);
-  assert.equal(snoozeHint({ count: 4 }), 'Snoozed 4 times — archive?');
+  assert.equal(snoozeHint({ count: 4 }), 'Snoozed 4 times. Archive?');
   assert.equal(snoozeHint(undefined), null);
 });
 
@@ -135,9 +137,9 @@ test('withRating rewrites only the rating labels', () => {
 });
 
 test('firstStep reads the agent\'s line from the Claude notes', () => {
-  assert.equal(firstStep('Found it.\n\n**First step:** open https://gov.uk/form (~10 min)'),
-    'open https://gov.uk/form (~10 min)');
-  assert.equal(firstStep('- **First step**: call the GP'), 'call the GP');
+  assert.equal(firstStep('Found it.\n\n**First step:** open https://example.org/form (~10 min)'),
+    'open https://example.org/form (~10 min)');
+  assert.equal(firstStep('- **First step**: call the doctor'), 'call the doctor');
   assert.equal(firstStep('No step here'), null);
   assert.equal(firstStep(null), null);
 });

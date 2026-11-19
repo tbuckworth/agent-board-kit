@@ -154,11 +154,10 @@ export function icon(name, size = 20) {
   svg.style.verticalAlign = 'middle';
   svg.style.flexShrink = '0';
 
-  // Using innerHTML only on the SVG element we just created (no user content)
+  // The icon's markup is parsed with DOMParser and its nodes copied in. Safe: the icons are the hardcoded
+  // strings above, not user content.
   const svgContent = icons[name];
   if (svgContent) {
-    const temp = document.createElementNS(svgNS, 'g');
-    // This is safe: icons are hardcoded strings above, not user content
     const parser = new DOMParser();
     const doc = parser.parseFromString(`<svg xmlns="${svgNS}">${svgContent}</svg>`, 'image/svg+xml');
     for (const child of [...doc.documentElement.childNodes]) {

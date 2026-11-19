@@ -63,16 +63,42 @@ struct ListMeta: Codable, Equatable {
 struct TodoConfig: Codable, Equatable {
     var groups: [GroupMeta]
     var listMetadata: [ListMeta]
+    /// Lists in these groups, and these lists, are not rated: no rating controls and not in Triage (the web app reads
+    /// the same keys). Absent: every list is rated.
+    var unratedGroups: [String]
+    var unratedLists: [String]
 
-    init(groups: [GroupMeta] = [], listMetadata: [ListMeta] = []) {
+    init(groups: [GroupMeta] = [], listMetadata: [ListMeta] = [], unratedGroups: [String] = [], unratedLists: [String] = []) {
         self.groups = groups
         self.listMetadata = listMetadata
+        self.unratedGroups = unratedGroups
+        self.unratedLists = unratedLists
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        groups = (try? c.decode([GroupMeta].self, forKey: .groups)) ?? []
-        listMetadata = (try? c.decode([ListMeta].self, forKey: .listMetadata)) ?? []
+        groups = try c.decodeIfPresent([GroupMeta].self, forKey: .groups) ?? []           // absent: none
+        listMetadata = try c.decodeIfPresent([ListMeta].self, forKey: .listMetadata) ?? []
+        // a name that isn't a string is skipped, as the web app does, rather than losing the whole file
+        unratedGroups = (try? c.decodeIfPresent(Names.self, forKey: .unratedGroups))?.values ?? []
+        unratedLists = (try? c.decodeIfPresent(Names.self, forKey: .unratedLists))?.values ?? []
+    }
+
+    /// A JSON array of names: the strings in it, anything else left out.
+    private struct Names: Decodable {
+        var values: [String] = []
+
+        init(from decoder: Decoder) throws {
+            var c = try decoder.unkeyedContainer()
+            while !c.isAtEnd {
+                if let s = try? c.decode(String.self) { values.append(s); continue }
+                guard (try? c.decode(Skip.self)) != nil else { break }
+            }
+        }
+
+        private struct Skip: Decodable {
+            init(from decoder: Decoder) throws { _ = try decoder.singleValueContainer() }
+        }
     }
 
     /// The metadata for a list, by lower-case name. The file has both "Tasks" and "tasks"; one with a group wins.
@@ -230,8 +256,15 @@ struct ChecklistItem: Identifiable, Equatable {
 // MARK: - labels
 
 enum Labels {
-    /// One of each per task: adding one replaces the other with the same prefix.
-    static let single = ["list:", "section:", "group:", "action:", "priority:", "importance:", "urgency:", "due:", "follow-up:"]
+    static let importancePrefix = "importance:"
+    static let urgencyPrefix = "urgency:"
+    static let duePrefix = "due:"
+    /// Retired: importance and urgency replaced it. No client writes it, and an edit takes it off.
+    static let retiredPriorityPrefix = "priority:"
+
+    /// One of each per task: adding one replaces the other with the same prefix (todo-desk's SINGLE_PREFIXES).
+    static let single = ["list:", "section:", "group:", "action:", retiredPriorityPrefix, importancePrefix, urgencyPrefix, duePrefix,
+                         "follow-up:"]
 
     static func value(_ labels: [String], _ prefix: String) -> String? {
         guard let l = labels.first(where: { $0.lowercased().hasPrefix(prefix) }) else { return nil }
@@ -254,7 +287,6 @@ enum Labels {
 }
 
 let sections = ["personal", "work", "home", "health", "finance"]
-let priorities = ["high", "medium", "low"]
 
 /// Tags: `tag:<name>` labels, any number per task, such as `tag:home` for what can only be done at
 /// home. The list filters can show only the tasks with a tag, or hide them.
@@ -356,9 +388,121 @@ enum Waiting {
     /// "23 Oct" (with the year when it isn't this year).
     static func short(_ day: String, now: Date = Date()) -> String {
         guard let d = date(day) else { return day }
-        let f = DateFormatter()
-        f.dateFormat = Calendar.current.isDate(d, equalTo: now, toGranularity: .year) ? "d MMM" : "d MMM yyyy"
-        return f.string(from: d)
+        return Fmt.shortDay(d, now: now)
+    }
+}
+
+enum Rating {
+    /// The values of `importance:`, most important first. A task with none is unrated.
+    static let importances = ["high", "medium", "low"]
+    /// The importance filter's name for a task with no `importance:` label.
+    static let unrated = "unrated"
+    /// A due date this many days away or fewer, or past, makes a task urgent (parser.js's DUE_SOON_DAYS).
+    static let dueSoonDays = 14
+    /// The help on an "urgent" tag or chip.
+    static let urgentHelp = "Urgent, or due within \(dueSoonDays) days"
+    /// The due-date buttons, in the edit pane and on the Triage card: (button, days from now).
+    static let duePresets: [(String, Int)] = [("Today", 0), ("Tomorrow", 1), ("In a week", 7), ("In 2 weeks", 14), ("In a month", 30)]
+
+    /// Not rated, so not triaged: lists in the config's `unratedGroups`, and its `unratedLists` (parser.js's
+    /// isRatedList). Names match in lower case, trimmed; without a config every list is rated.
+    static func isRatedList(_ list: String?, group: String?, config: TodoConfig?) -> Bool {
+        func norm(_ s: String) -> String { s.trimmingCharacters(in: .whitespaces).lowercased() }
+        if let l = list, (config?.unratedLists ?? []).contains(where: { norm($0) == norm(l) }) { return false }
+        if let g = group, (config?.unratedGroups ?? []).contains(where: { norm($0) == norm(g) }) { return false }
+        return true
+    }
+
+    /// List (lower case) to its group in the shared config. A list the config names without a group maps to nil;
+    /// the file has both "Tasks" and "tasks", and one with a group wins.
+    static func groupsByList(_ config: TodoConfig?) -> [String: String?] {
+        var out: [String: String?] = [:]
+        for m in config?.listMetadata ?? [] {
+            let k = m.listName.lowercased()
+            if let known = out[k], known != nil { continue }
+            out[k] = .some(m.groupName)
+        }
+        return out
+    }
+
+    /// The task's group as the web app reads it for rating: the config's if the config knows the list, else the
+    /// task's own `group:` label.
+    static func group(of t: TaskItem, in groups: [String: String?]) -> String? {
+        if let g = groups[t.list] { return g }
+        return Labels.value(t.issue.labels, "group:")
+    }
+
+    static func urgent(_ t: TaskItem) -> Bool { Labels.value(t.issue.labels, Labels.urgencyPrefix)?.lowercased() == "high" }
+
+    static func due(_ t: TaskItem) -> String? { Labels.value(t.issue.labels, Labels.duePrefix) }
+
+    /// Whether an edit that puts `t` in the list typed as `list` rates it: by that list's group, or by the task's
+    /// own group when the list is unchanged.
+    static func rates(_ t: TaskItem, inList list: String, config: TodoConfig?) -> Bool {
+        let groups = groupsByList(config)
+        let l = listSlug(list)
+        return isRatedList(l, group: l == t.list ? group(of: t, in: groups) : groups[l] ?? nil, config: config)
+    }
+
+    /// The rating an edit saves: the task's `live` rating with only the fields the edit changed from `original`
+    /// (importance, the Urgent box, the due date), so a rating changed meanwhile elsewhere keeps the rest. Nil when
+    /// the edit changed none of them, so the save leaves the rating alone.
+    static func edited(live: Value, original: TaskItem, importance: String?, urgent: Bool, due: String?) -> Value? {
+        if importance == original.importance, urgent == Rating.urgent(original), due == Rating.due(original) { return nil }
+        var r = live
+        if importance != original.importance { r.importance = importance }
+        if urgent != Rating.urgent(original) { r.urgency = urgent ? "high" : "low" }
+        if due != Rating.due(original) { r.due = due }
+        return r
+    }
+
+    /// Urgent as the lists show and filter it: `urgency:high`, or due within `dueSoonDays` days or overdue.
+    static func effectivelyUrgent(_ t: TaskItem, now: Date) -> Bool {
+        if urgent(t) { return true }
+        guard let d = due(t) else { return false }
+        return d <= Waiting.day(in: dueSoonDays, from: now)
+    }
+
+    /// What a row, the task panel and a Triage card show beside the importance: the urgent marker (open tasks only),
+    /// and "due 12 Oct", red once the day has passed (parser.js's ratingMarkers).
+    struct Marks: Equatable {
+        var urgent: Bool
+        var due: String?
+        var overdue: Bool
+    }
+
+    static func marks(_ t: TaskItem, now: Date) -> Marks {
+        let d = due(t)
+        return Marks(urgent: t.isOpen && effectivelyUrgent(t, now: now), due: d.map { "due " + Waiting.short($0, now: now) },
+                     overdue: t.isOpen && d.map { $0 < Waiting.day(now) } == true)
+    }
+
+    /// The ring around a task's tick circle: strong (red, thicker) for high importance, faint (dashed) for low,
+    /// plain for medium and unrated.
+    enum Ring: Equatable {
+        case strong, plain, faint
+
+        init(importance: String?) {
+            switch importance {
+            case "high": self = .strong
+            case "low": self = .faint
+            default: self = .plain
+            }
+        }
+    }
+
+    /// A task's importance, urgency and due date as its labels carry them; nil is no label.
+    struct Value: Equatable {
+        var importance: String?
+        var urgency: String?
+        var due: String?
+    }
+}
+
+extension Rating.Value {
+    init(_ t: TaskItem) {
+        self.init(importance: t.importance, urgency: Labels.value(t.issue.labels, Labels.urgencyPrefix)?.lowercased(),
+                  due: Rating.due(t))
     }
 }
 
@@ -380,7 +524,6 @@ struct TaskItem: Identifiable, Equatable {
     var section: String?
     var group: String?
     var action: String
-    var priority: String
     var tags: [String]
     var waiting: Bool
     var cleared: Bool                 // an agent thinks the wait is over: the owner confirms or says still waiting
@@ -393,7 +536,7 @@ struct TaskItem: Identifiable, Equatable {
     var id: Int { issue.number }
     var number: Int { issue.number }
     var parent: Int? { issue.parent }
-    var importance: String? { Labels.value(issue.labels, "importance:")?.lowercased() }
+    var importance: String? { Labels.value(issue.labels, Labels.importancePrefix)?.lowercased() }
     var title: String { issue.title }
     var isOpen: Bool { issue.isOpen }
     var isLocal: Bool { issue.number < 0 }
@@ -433,7 +576,6 @@ struct TaskItem: Identifiable, Equatable {
         section = Labels.value(issue.labels, "section:")
         group = Labels.value(issue.labels, "group:") ?? config?.group(of: list)
         action = Labels.value(issue.labels, "action:") ?? "manual"
-        priority = Labels.value(issue.labels, "priority:") ?? "medium"
         tags = Tags.of(issue.labels)
         waiting = issue.labels.contains { $0.lowercased() == Waiting.label }
         cleared = issue.labels.contains { $0.lowercased() == Waiting.cleared }
@@ -475,7 +617,7 @@ struct PendingOp: Codable, Identifiable, Equatable {
     var title: String?                // create
     var body: String?
     var labels: [String]?
-    var set: [String: String] = [:]   // update: title, body, state
+    var set: [String: String] = [:]   // update: title, body, state, stateReason (NOT_PLANNED: archive)
     var base: [String: String] = [:]  // update: title and body as they were before the first edit
     var add: [String] = []
     var remove: [String] = []
@@ -515,6 +657,8 @@ struct PendingOp: Codable, Identifiable, Equatable {
 
     /// Fold a later update of the same task into this one.
     mutating func absorb(_ later: PendingOp) {
+        // An open or close says why itself: an archive's "not planned" must not outlive its undo or a later Done
+        if later.set["state"] != nil && later.set["stateReason"] == nil { set.removeValue(forKey: "stateReason") }
         for (k, v) in later.set { set[k] = v }
         for (k, v) in later.base where base[k] == nil && set[k] != nil { base[k] = v }
         for a in later.add {
@@ -621,19 +765,22 @@ enum Overlay {
 
 func isoString(_ d: Date) -> String { Fmt.isoParser.string(from: d) }
 
-/// The label changes that turn a task's fields into the edited ones. Only fields that changed are touched,
-/// and labels the app doesn't manage are never sent.
-func labelDiff(from t: TaskItem, list: String, section: String?, priority: String,
-               config: TodoConfig?) -> (add: [String], remove: [String]) {
+/// The label changes that leave exactly one `prefix` label, `prefix + new`, or none when `new` is nil.
+func swapLabel(_ labels: [String], _ prefix: String, _ new: String?) -> (add: [String], remove: [String]) {
+    let old = labels.filter { $0.lowercased().hasPrefix(prefix) }
+    let wanted = new.map { prefix + $0 }
+    if let w = wanted, old.count == 1, old[0].lowercased() == w.lowercased() { return ([], []) }
+    return (wanted.map { [$0] } ?? [], old.filter { $0.lowercased() != wanted?.lowercased() })
+}
+
+/// The label changes that turn a task's list and section into the edited ones. Only fields that changed are
+/// touched, and labels the app doesn't manage are never sent.
+func labelDiff(from t: TaskItem, list: String, section: String?, config: TodoConfig?) -> (add: [String], remove: [String]) {
     var add: [String] = [], remove: [String] = []
-    let labels = t.issue.labels
     func swap(_ prefix: String, _ new: String?) {
-        let old = labels.filter { $0.lowercased().hasPrefix(prefix) }
-        let wanted = new.map { prefix + $0 }
-        if let w = wanted, old.count == 1, old[0].lowercased() == w.lowercased() { return }
-        if wanted == nil && old.isEmpty { return }
-        remove += old.filter { $0.lowercased() != wanted?.lowercased() }
-        if let w = wanted { add.append(w) }
+        let d = swapLabel(t.issue.labels, prefix, new)
+        add += d.add
+        remove += d.remove
     }
     let newList = listSlug(list).isEmpty ? "tasks" : listSlug(list)
     if newList != t.list {
@@ -642,8 +789,27 @@ func labelDiff(from t: TaskItem, list: String, section: String?, priority: Strin
     }
     let sec = section.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.flatMap { $0.isEmpty ? nil : $0 }
     if sec != t.section?.lowercased() { swap("section:", sec) }
-    if priority != t.priority { swap("priority:", priority) }
     return (add, remove)
+}
+
+/// The label changes that give a task the rating `r`; a field already as wanted is left alone. As in the web app, a
+/// task left with an importance and no urgency gets `urgency:low`. The retired `priority:` label
+/// always goes.
+func ratingDiff(from t: TaskItem, to r: Rating.Value) -> (add: [String], remove: [String]) {
+    let urgency = r.urgency ?? (r.importance == nil ? nil : "low")
+    var add: [String] = []
+    var remove = retiredPriority(t)
+    for (prefix, value) in [(Labels.importancePrefix, r.importance), (Labels.urgencyPrefix, urgency), (Labels.duePrefix, r.due)] {
+        let d = swapLabel(t.issue.labels, prefix, value)
+        add += d.add
+        remove += d.remove
+    }
+    return (add, remove)
+}
+
+/// The task's retired `priority:` labels, which every save takes off.
+func retiredPriority(_ t: TaskItem) -> [String] {
+    t.issue.labels.filter { $0.lowercased().hasPrefix(Labels.retiredPriorityPrefix) }
 }
 
 /// The label changes from a task's tags to `tags` (typed names are normalised). Removes use GitHub's spelling.
@@ -762,11 +928,10 @@ enum Grouping {
         let imp = tasks.compactMap { $0.importance }.max { (order[$0] ?? 0) < (order[$1] ?? 0) }
         var out: [String] = []
         if let i = imp, order[i] != nil {
-            out.append("importance:" + i)
-            let urgent = tasks.contains { Labels.value($0.issue.labels, "urgency:")?.lowercased() == "high" }
-            out.append("urgency:" + (urgent ? "high" : "low"))
+            out.append(Labels.importancePrefix + i)
+            out.append(Labels.urgencyPrefix + (tasks.contains(where: Rating.urgent) ? "high" : "low"))
         }
-        if let due = tasks.compactMap({ Labels.value($0.issue.labels, "due:") }).sorted().first { out.append("due:" + due) }
+        if let due = tasks.compactMap(Rating.due).sorted().first { out.append(Labels.duePrefix + due) }
         return out
     }
 }

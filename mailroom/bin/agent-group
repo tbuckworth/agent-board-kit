@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""agent-group: group chat between agents, in which the owner may post; every post reaches every member.
+
+    agent-group new TITLE [--with NAME[@HOST],...] [--task TASK] [--json] [--id GROUP]   # you, them and the owner
+    agent-group new TITLE --with NAME[@HOST],... --for-mail N   # the orchestrator: the group the owner's mail N asks for
+    agent-group post GROUP [TEXT...] [--reply-to POST] [--id POST]  # or the text on stdin
+    agent-group inbox [GROUP] [--recent]       # your unread posts, oldest first, then read; --recent: the last 20
+    agent-group show GROUP [--json]            # members, maker, your alert setting and unread count
+    agent-group alerts GROUP all|named|never   # which agents' posts wake you; the owner's always do
+    agent-group add GROUP NAME[@HOST],...      # the group's maker, while a member, or the owner
+    agent-group remove GROUP NAME[@HOST],...
+    agent-group set GROUP [--title TITLE] [--with NAME[@HOST],...] [--json]   # the same: title, exact members
+    agent-group leave GROUP
+    agent-group list [--json]
+    agent-group posts GROUP [--since POST] [--json]   # read without marking anything read (the board)
+    agent-group hide|unhide GROUP              # the owner only: hides it on their board
+    agent-group hook --cli claude|codex        # the UserPromptSubmit hook: tells a session of its quiet posts
+
+Who you are: this Claude or Codex session (CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID), --session NAME_OR_ID (with
+--cli claude|codex to look in one CLI's sessions only), or --as owner, which is refused inside an agent session.
+GROUP: its id, or 4 or more of its first characters or its title among your groups. A bare NAME is on this
+machine. On a machine with config mail_proxy (the Mac) every command runs on the desktop.
+The owner may post but does not follow groups: never rely on a post reaching them, and send them what they must
+know, decide or do by email. Details: README.md, section "Groups".
+"""
+# Runs on Python 3.9+, standard library only.
+import argparse
+import functools
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentmail import cli, config, groupcmd, groups, piped, registry, remote, statuslog  # noqa: E402
+from agentmail.groups import GroupError  # noqa: E402
+
+die = functools.partial(cli.die, "agent-group")
+
+
+def this_session(cfg, spec, cli_hint):
+    """The session the command is for: --session, else this Claude session, else this Codex thread."""
+    if spec:
+        return cli.chosen_session("agent-group", spec, registry.resolve_exact(spec, cli_hint))
+    sess = registry.session_from_env(os.getcwd()) or registry.codex_session_from_env()
+    if sess is None and os.environ.get("CODEX_THREAD_ID"):
+        die("cannot find this Codex thread (%s) in the registry: pass --session NAME_OR_ID"
+            % os.environ["CODEX_THREAD_ID"], 4)
+    if sess is None:
+        die("not inside a Claude or Codex session: pass --session NAME_OR_ID, or --as %s (the board)"
+            % config.OWNER_ALIAS)
+    return sess
+
+
+def actor(cfg, a):
+    if a.as_owner:
+        if not config.is_owner_alias(cfg, a.as_owner):
+            die("--as takes only %s (or %s)" % (config.OWNER_ALIAS, cfg["owner_name"].lower()))
+        cli.refuse_in_agent("agent-group", "--as " + a.as_owner, cfg["owner_name"])
+        if a.session:
+            die("--as and --session exclude each other")
+        return groups.member(cfg["host_id"], None)
+    sess = this_session(cfg, a.session, a.cli)
+    if not sess.get("name"):
+        die("this session has no name, and a group member is a name: name it first (/rename in Claude or Codex)")
+    return groups.member(cfg["host_id"], sess["name"])
+
+
+def execute(cfg, who, action, args):
+    """Run the command here, or on the central mailroom from a machine with config mail_proxy."""
+    if cfg.get("mail_proxy"):
+        return groupcmd.proxy(cfg, who, action, args)
+    return groupcmd.run(cfg, who, action, args)
+
+
+def arguments(a):
+    """The command's arguments as groupcmd.ACTIONS lists them, from the parsed flags."""
+    if a.cmd == "post":
+        text = " ".join(a.text).strip()
+        if not text:
+            try:
+                text = (piped.piped_text() or "").strip()   # only what was piped in: never the tool's open socket
+            except TimeoutError as e:
+                die("no post: %s; pass the text as arguments" % e)
+        return {"group": a.group, "text": text, "reply_to": a.reply_to, "post_id": a.id or groups.new_id()}
+    if a.cmd in ("hide", "unhide"):
+        return {"group": a.group, "hidden": a.cmd == "hide"}
+    if a.cmd == "new":
+        return {"title": a.title, "members": a.members, "task": a.task, "json": a.json,
+                "group_id": a.id or groups.new_id()}
+    return {k: getattr(a, k) for k in groupcmd.ACTIONS[a.cmd]}
+
+
+def for_mail(cfg, a, args):
+    """new --for-mail N: the orchestrator makes the group the owner's mail N asks for, as theirs, with the id derived from
+    the mail (groupmail.request_mail says when it may). Returns the actor; sets args' group id."""
+    if cfg.get("mail_proxy"):
+        die("--for-mail runs on the central mailroom, where the orchestrator runs")
+    if os.environ.get("AGENT_ORCHESTRATOR") != "1":
+        die("--for-mail is for an orchestrator run on %s's mail" % cfg["owner_name"], 2)
+    if a.as_owner or a.session or a.id:
+        die("--for-mail excludes --as, --session and --id: the mail decides who and which id")
+    from agentmail import groupmail   # the mail modules load Gmail's client: the hook imports none of them
+    from agentmail.store import Store
+    try:
+        gmail_id = groupmail.request_mail(Store(), cfg, a.for_mail, time.time())
+    except GroupError as e:
+        die(str(e), e.code)
+    args["group_id"] = groupmail.group_id(gmail_id)
+    return groups.member(cfg["host_id"], None)
+
+
+def cmd_hook(cfg, a):
+    """The UserPromptSubmit hook: when a notice flag is raised for this session's name, print its QUIET lines as
+    context for the agent. Never fails and prints nothing else: an error goes to the status dir's hook-errors.jsonl
+    (statuslog.record_hook_error), and the flag goes up again so that the next prompt tries once more."""
+    name = None
+    try:
+        raw = sys.stdin.read()
+        if not groups.any_flag():
+            return 0
+        d = json.loads(raw) if raw.strip() else {}
+        sess, code, _ = registry.by_id(registry.all_sessions(a.cli), d.get("session_id") or d.get("thread_id") or "")
+        if code or not sess["name"] or not groups.take_flag(sess["name"]):
+            return 0
+        name = sess["name"]
+        text = execute(cfg, groups.member(cfg["host_id"], name), "notices", {})
+        if text:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
+    except Exception as e:  # noqa: BLE001 - the agent's prompt must go through; the error is recorded instead
+        err = "agent-group hook: %s: %s" % (type(e).__name__, e)
+        try:
+            if name:
+                groups.raise_flags([name])
+            statuslog.record_hook_error(a.cli, "UserPromptSubmit", err)
+        except OSError as e2:
+            print("%s; recording it failed: %s" % (err, e2), file=sys.stderr)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-group", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    who = argparse.ArgumentParser(add_help=False)   # who the command is for
+    who.add_argument("--as", dest="as_owner", metavar="owner", help="act as the owner: the board and the mailroom only")
+    who.add_argument("--session", help="the session to act as (default: this Claude or Codex session)")
+    who.add_argument("--cli", choices=config.CLIS)
+    as_json = argparse.ArgumentParser(add_help=False)
+    as_json.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("new", parents=[who, as_json], help="make a group of you, the agents named and the owner")
+    p.add_argument("title")
+    p.add_argument("--with", dest="members", metavar="NAME[@HOST],...", help="the other members")
+    p.add_argument("--task", help="a task on the owner's board this group is about (only a link)")
+    p.add_argument("--id", metavar="GROUP", help="the group's id, to retry a new whose outcome is unknown")
+    p.add_argument("--for-mail", type=int, metavar="N",
+                   help="the orchestrator only: make the group the owner's mail N asks for, as theirs, once per mail")
+    p = sub.add_parser("post", parents=[who], help="post in a group")
+    p.add_argument("group")
+    p.add_argument("text", nargs="*", help="the post (or pipe it on stdin)")
+    p.add_argument("--reply-to", metavar="POST", help="the id of the post this answers")
+    p.add_argument("--id", metavar="POST", help="the post's id, to retry a post whose outcome is unknown")
+    p = sub.add_parser("inbox", parents=[who], help="your unread posts, which are then marked read")
+    p.add_argument("group", nargs="?")
+    p.add_argument("--recent", action="store_true", help="the last %d posts, read or not" % groupcmd.RECENT)
+    p = sub.add_parser("show", parents=[who, as_json], help="a group's members, maker and your alert setting")
+    p.add_argument("group")
+    p = sub.add_parser("alerts", parents=[who], help="which posts in a group wake you")
+    p.add_argument("group")
+    p.add_argument("alerts", choices=groups.ALERTS)
+    for name, what in (("add", "add agents"), ("remove", "remove agents")):
+        p = sub.add_parser(name, parents=[who], help=what + " (the maker or the owner)")
+        p.add_argument("group")
+        p.add_argument("members", metavar="NAME[@HOST],...")
+    p = sub.add_parser("set", parents=[who, as_json],
+                       help="set a group's title and exact members, writing nothing if unchanged (the maker or the owner)")
+    p.add_argument("group")
+    p.add_argument("--title")
+    p.add_argument("--with", dest="members", metavar="NAME[@HOST],...", help='every member ("" for none)')
+    p = sub.add_parser("leave", parents=[who], help="leave a group")
+    p.add_argument("group")
+    sub.add_parser("list", parents=[who, as_json], help="your groups (the owner: all)")
+    p = sub.add_parser("posts", parents=[who, as_json], help="a group's posts, marking nothing read")
+    p.add_argument("group")
+    p.add_argument("--since", metavar="POST", help="only the posts after this one")
+    for name in ("hide", "unhide"):
+        p = sub.add_parser(name, parents=[who], help="%s a group on the owner's board (the owner only)" % name)
+        p.add_argument("group")
+    p = sub.add_parser("hook", help="the UserPromptSubmit hook (stdin JSON)")
+    p.add_argument("--cli", choices=config.CLIS, required=True)
+
+    a = ap.parse_args(argv)
+    cfg = config.load()
+    if a.cmd == "hook":
+        return cmd_hook(cfg, a)
+    action = "hide" if a.cmd in ("hide", "unhide") else a.cmd
+    args = arguments(a)
+    who = for_mail(cfg, a, args) if a.cmd == "new" and a.for_mail is not None else actor(cfg, a)
+    try:
+        out = execute(cfg, who, action, args)
+    except GroupError as e:
+        die(str(e), e.code)
+    except remote.RemoteError as e:
+        retry = {"post": ("post_id", "posted"), "new": ("group_id", "made")}.get(action)
+        hint = (" The outcome may be unknown: retry with --id %s, which is never %s twice." % (args[retry[0]], retry[1])
+                if retry else "")
+        die("%s%s" % (e, hint))
+    print(out, end="" if out.endswith("\n") or not out else "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,13 +1,12 @@
 // Search view — full-text search + filter chips
 
 import { el, icon, mount, clear } from '../render.js';
-import { getState, setState, matchesFilters } from '../state.js';
+import { getState, matchesFilters } from '../state.js';
 import { navigate } from '../router.js';
 import { taskRow } from '../components/task-row.js';
 import { filterBar } from '../components/filter-bar.js';
 import { showToast } from '../components/toast.js';
-import * as api from '../api.js';
-import * as db from '../db.js';
+import { toggleComplete } from '../actions.js';
 
 export function renderSearch(container) {
   let query = '';
@@ -86,21 +85,13 @@ export function renderSearch(container) {
     const rows = results.map(t =>
       taskRow(t, {
         onToggle: async (task) => {
-          const wasOpen = task.state === 'OPEN';
-          const { issues } = getState();
-          const updated = issues.map(i =>
-            i.number === task.number ? { ...i, state: wasOpen ? 'CLOSED' : 'OPEN' } : i
-          );
-          setState({ issues: updated });
+          const pending = toggleComplete(task.number);
           doSearch(query); // Re-render results
-
           try {
-            if (wasOpen) await api.closeIssue(task.number);
-            else await api.reopenIssue(task.number);
-            const final = getState().issues.find(i => i.number === task.number);
-            if (final) await db.issues.put(final);
+            await pending;
           } catch (err) {
             showToast(`Error: ${err.message}`);
+            doSearch(query);
           }
         },
         onClick: (task) => navigate(`#/task/${task.number}`),

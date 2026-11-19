@@ -5,10 +5,11 @@ Everything here takes plain dicts plus `now`, so tests can feed fixtures. No I/O
 States, in the order the legend shows them:
   busy     a turn is running
   background  Claude "shell": its turn ended but a background command it started is still running, so it is
-           only waiting on that (it wakes when it finishes), told apart from real work.
-           Not when every such command is a `pgrep -f` loop that finds itself and its target has gone: idle
+           only waiting on that (it wakes when it finishes), told apart from real work. Not when every such command
+           is a `pgrep -f` loop that finds itself and its target has gone: idle
   waiting  idle, and its latest mail to the owner has no reply yet (the owner must act)
-  blocked  stuck at a terminal prompt, hit a usage limit, or its last note says it is blocked
+  blocked  stuck at a terminal prompt, hit a usage limit, its mail to the owner is stuck in agent-mail, or its last
+           note says it is blocked
   idle     live and idle, active within STALE_AFTER
   stale    live and idle for longer than STALE_AFTER
   offline  the process is not running. The only state for a dead session; every other state is live.
@@ -19,6 +20,8 @@ import functools
 import os
 import re
 
+from . import sources
+
 STATES = ["busy", "background", "waiting", "blocked", "idle", "stale", "offline"]
 
 STALE_AFTER = 6 * 3600          # idle longer than this is "stale"
@@ -28,6 +31,7 @@ OFFLINE_WINDOW = 12 * 3600      # an exited session that did real work (notes or
 MAIL_OFFLINE_WINDOW = 48 * 3600 # ...or this long while mail is in flight either way
 CLOSED_WINDOW = 3600            # a deliberately closed session (agent-close) lingers this long
 HELD_TO = {"owner": "you", "collaborator": "a collaborator", "other": "someone else"}   # reviews.audience
+SIGNED_OUT = "authentication_failed"   # how an api-error event begins when the agent's login is signed out
 
 BLOCKED_WORDS = r"you|approval|input"
 
@@ -41,7 +45,8 @@ def blocked_note(owner=None):
 
 
 BLOCKED_NOTE = blocked_note()
-GENERIC_TITLE = re.compile(r"^\s*(you were started by agent-spawn|#\s*brief\b)", re.I)
+SPAWN_MARK = "You were started by agent-spawn"     # how every agent-spawn brief begins
+GENERIC_TITLE = re.compile(r"^\s*(%s|#\s*brief\b)" % re.escape(SPAWN_MARK), re.I)
 TRUNK = ("main", "master", "HEAD", "")
 
 
@@ -86,20 +91,21 @@ def disambiguate(agents):
     return agents
 
 
-def mail_state(sent, inbound, now, window=MAIL_WINDOW, reviews=None):
+def mail_state(sent, inbound, now, reviews=None):
     """One session's mail picture from the mailroom store.
 
     sent     rows this session sent to the owner: {sent_at, subject, thread_id, message_id}
     inbound  rows from the owner routed to this session: {received_at, subject, action, id}
     reviews  its newest pre-send review per audience: {created_at, verdict, subject, kind, reasons, sent_message_id,
              audience, has_draft}
-    Returns {last_out, last_out_subject, last_in, unanswered, held, threads, revise, unrevised}; unanswered means
+    Returns {last_out, last_out_subject, last_out_id, last_out_thread (its thread, as the Mail tab names it), read,
+    last_in, unanswered, held, threads, revise, unrevised}; unanswered means
     the last word is the agent's: its newest mail to the owner is newer than anything the owner sent it. revise: its
     mails the review sent back that haven't gone out, newest first (the mailroom keeps each draft until a re-send to
     that audience, a withdraw or its fallback sends it as-is; a mail stopped for a credential, `secret`, keeps no
     draft and only a re-send settles it); unrevised: its newest mail out is that fallback's.
     """
-    since = now - window
+    since = now - MAIL_WINDOW
     sent = sorted((s for s in sent if (s.get("sent_at") or 0) >= since), key=lambda s: s["sent_at"])
     inbound = sorted((i for i in inbound if (i.get("received_at") or 0) >= since), key=lambda i: i["received_at"])
     last_out = sent[-1] if sent else None
@@ -123,7 +129,8 @@ def mail_state(sent, inbound, now, window=MAIL_WINDOW, reviews=None):
         "last_out": last_out["sent_at"] if last_out else None,
         "last_out_subject": strip_tag(last_out.get("subject") or "") if last_out else "",
         "last_out_id": (last_out.get("message_id") or "") if last_out else "",
-        "read": None,             # filled in from the owner's Gmail when that check is on: True / False / None
+        "last_out_thread": (last_out.get("thread_id") or "") if last_out else "",
+        "read": None,             # filled in from the Mail tab or the owner's Gmail (Collector.is_read): True / False / None
         "last_in": last_in["received_at"] if last_in else None,
         "unanswered": unanswered,
         "held": sum(1 for i in inbound if i.get("action") == "held"),
@@ -154,6 +161,16 @@ def strip_tag(subject):
     return re.sub(r"\s*\[#[a-z0-9]{6,12}\]\s*$", "", subject or "").strip()
 
 
+def signed_out(a):
+    """The reason for an agent whose Claude login is signed out: which login it is, and which account to sign it in
+    to. Signing a login in to an account another login already uses makes both spend one allowance."""
+    login = a.get("account") or "default"
+    label = a.get("account_label")
+    return ("its Claude login \"%s\"%s is signed out: type /login in its window and choose %s, not an account "
+            "another login uses" % (login, " (%s)" % label if label else "",
+                                    "the %s account" % label if label else "the account this login is for"))
+
+
 def classify(a, now, owner=None):
     """(state, reason) for one agent dict. Fields used:
     live, raw_status, waiting_for, last_activity, last_turn_end, last_note {ts,text}, quota_ts, mail {...}.
@@ -173,6 +190,15 @@ def classify(a, now, owner=None):
     if raw == "waiting":
         wf = (a.get("waiting_for") or "").strip()
         return "blocked", "waiting at its terminal" + (": " + wf if wf else "")
+    stuck = a.get("mail_stuck") or []
+    if stuck:                            # before busy: its mail to the owner is not going out, whatever else it does
+        m = max(stuck, key=lambda s: s["age"])
+        what = "its mail to you" + (" \u201c%s\u201d" % m["subject"] if m.get("subject") else "")
+        more = " (and %d more)" % (len(stuck) - 1) if len(stuck) > 1 else ""
+        if m["why"] == "input":
+            return "blocked", ("%s never left: agent-mail has waited %s for text on an input that never ends; "
+                               "stop it (pid %d) and send again with --body-file%s" % (what, fmt_age(m["age"]), m["pid"], more))
+        return "blocked", "%s has been sending for %s (agent-mail pid %d)%s" % (what, fmt_age(m["age"]), m["pid"], more)
     if raw == "busy":
         return "busy", "turn running"
     dead = ""
@@ -211,6 +237,8 @@ def classify(a, now, owner=None):
                 " (%s)" % lim["text"] if lim.get("text") else "")
         return "blocked", "hit a plan limit %s ago" % fmt_age(now - q) + (": " + lim["text"] if lim.get("text") else "")
     if err.get("ts") and err["ts"] >= turn_end and err["ts"] > fo:
+        if a.get("cli") == "claude" and (err.get("text") or "").startswith(SIGNED_OUT):
+            return "blocked", signed_out(a)
         return "blocked", "its last turn ended on an API error" + (": " + err["text"] if err.get("text") else "")
     note = a.get("last_note") or {}
     if note.get("text") and blocked_note(owner).match(note["text"]) and turn_end <= note.get("ts", 0) + SETTLE:
@@ -228,7 +256,7 @@ def classify(a, now, owner=None):
                 ) + (" (and %d more held)" % (len(rev) - 1) if len(rev) > 1 else "") + " · "
     out = mail.get("last_out")
     owes = mail.get("unanswered") and out and turn_end <= out + SETTLE
-    if owes and mail.get("read") is not True:          # read in Gmail: the owner has seen it, so it stops shouting
+    if owes and mail.get("read") is not True:          # read (Mail tab or Gmail): the owner has seen it, so it stops shouting
         return "waiting", back + "mailed you %s ago, no reply yet: %s" % (fmt_age(now - out), mail.get("last_out_subject") or "") + (
             " (sent as-is: it didn't revise it after the pre-send review)" if mail.get("unrevised") else "")
     age = now - (a.get("last_activity") or 0)
@@ -259,7 +287,7 @@ def login_note(a, accounts, order, thresholds, now):
         kind = w.get("kind") or ""
         if kind not in ("session", "weekly") and model and not (w.get("model") and w["model"].lower() in model):
             continue
-        left = w["remaining_pct"] if w.get("remaining_pct") is not None else 100 - (w.get("used_pct") or 0)
+        left = sources.left_pct(w)
         if left <= 0 or left < thresholds.get("session" if kind.endswith("session") else "weekly", 0):
             return None
         parts.append("%s %d%% left" % (w.get("name") or kind, left))
@@ -343,10 +371,8 @@ def git_stage(g, pr=None):
         stage = "unpushed"
     elif pr and (pr.get("state") or "").upper() == "OPEN":
         stage = "pr"
-    elif merged and not nid:
-        stage = "merged"
     elif merged:
-        stage = "merged"              # squash/rebase merge: commits differ from main's but the PR landed them
+        stage = "merged"              # also a squash/rebase merge: commits differ from main's but the PR landed them
     elif pr and (pr.get("state") or "").upper() == "CLOSED":
         stage = "pr_closed"
     elif not trunk and nid:

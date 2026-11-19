@@ -12,7 +12,12 @@ struct BoardView: View {
             Divider()
             HStack(spacing: 0) {
                 Group {
-                    if model.tab == .board { BoardGrid(model: model) } else { OverviewView(model: model) }
+                    switch model.tab {
+                    case .board: BoardGrid(model: model)
+                    case .overview: OverviewView(model: model)
+                    case .mail: MailView(mail: model.mail, connected: model.snapshot != nil,
+                                         available: model.snapshot?.mailbox != nil)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if model.tab == .board, let a = model.selected {
@@ -29,12 +34,21 @@ struct BoardView: View {
         .frame(minWidth: 780, minHeight: 480)
         .background(Color(nsColor: .windowBackgroundColor))
         .environment(\.zoom, model.zoom)
-        .sheet(item: $model.switching) { s in SwitchSheet(session: s, model: model) }
-        .sheet(isPresented: $model.showRestart) { RestartSheet(model: model) }
+        .sheet(item: $model.sheet) { sheet in
+            switch sheet {
+            case .restart: RestartSheet(model: model)
+            case .sent: SentSheet(model: model)
+            case .time: TimeSheet(model: model)
+            case .switching(let s): SwitchSheet(session: s, model: model)
+            case .chats(let id): ChatsSheet(model: model, selected: id)
+            case .newChat(let id): NewChatSheet(model: model, preselected: id)
+            case .usage(let t, let w, let title): UsageSplitSheet(model: model, target: t, window: w, title: title)
+            }
+        }
     }
 }
 
-// MARK: - top bar: link, tabs, mail, machine metrics, plan usage
+// MARK: - top bar: link, tabs, mail, machine metrics, plan usage (not on the Mail tab)
 
 struct TopBar: View {
     @Environment(\.zoom) private var z
@@ -45,12 +59,17 @@ struct TopBar: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 LinkBadge(model: model)
+                let unread = model.snapshot?.mailbox?.unread ?? 0
                 Picker("", selection: $model.tab) {
-                    ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(Tab.allCases) { t in
+                        Text(t == .mail && unread > 0 ? "Mail \(unread)" : t.rawValue).tag(t)
+                    }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 170)
+                .frame(width: 250)
+                .help(model.snapshot?.mailbox == nil ? "Mail: the desktop has no mailbox yet"
+                      : "Mail between you and your agents: \(unread) unread")
                 Button { model.refreshAll() } label: {
                     Image(systemName: "arrow.clockwise").font(.system(size: 12 * z, weight: .medium))
                 }
@@ -62,7 +81,9 @@ struct TopBar: View {
                 .buttonStyle(.borderless)
                 .help("Message the orchestrator, like an email: e.g. ask it to start a new agent")
                 Spacer()
+                LayoutProblemChip(model: model)
                 if let s = model.snapshot {
+                    ProblemsChip(problems: s.problems)
                     let waiting = s.agents.filter { $0.agentState == .waiting }.count
                     if waiting > 0 {
                         Chip(text: "\(waiting) waiting on you", color: AgentState.waiting.color)
@@ -78,9 +99,12 @@ struct TopBar: View {
                     }
                     if let g = s.gmail, g.ok == false {
                         Text("read-check off").font(.system(size: 10 * z)).foregroundStyle(.secondary)
-                            .help("Can't see what you've read in Gmail (\(g.error ?? "unknown")). Tiles stay green until you reply.")
+                            .help("Can't see what you've read in Gmail (\(g.error ?? "unknown")). Tiles stay green until you reply, or read the mail in the Mail tab.")
                     }
                     DesktopChip(model: model)
+                    SentButton(model: model)
+                    ChatsButton(model: model)
+                    TimeButton(model: model)
                     Button { showHeld.toggle() } label: {
                         Label("\(s.mail.heldCount) held", systemImage: "tray.full")
                             .font(.system(size: 11 * z, weight: (s.mail.heldOwner ?? 0) > 0 ? .bold : .regular))
@@ -91,10 +115,12 @@ struct TopBar: View {
                     .popover(isPresented: $showHeld, arrowEdge: .bottom) { HeldList(model: model) }
                 }
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 8) {
-                    MachineMeters(metrics: model.metrics)
-                    UsageBars(model: model)
+            if model.tab != .mail {                    // the Mail tab gives their room to the mail
+                ScrollView(.horizontal, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        LiveMeters(meters: model.meters)
+                        UsageBars(model: model)
+                    }
                 }
             }
         }
@@ -142,6 +168,65 @@ struct Chip: View {
     }
 }
 
+/// The snapshot's problems (Snapshot.problems) as a count, listed as "source: error" on hover and on click. Nothing
+/// when there are none.
+struct ProblemsChip: View {
+    @Environment(\.zoom) private var z
+    let problems: [Problem]
+    @State private var open = false
+
+    var body: some View {
+        if !problems.isEmpty {
+            let lines = problems.map { "\($0.source): \($0.error)" }
+            Button { open.toggle() } label: {
+                Chip(text: problems.count == 1 ? "1 problem" : "\(problems.count) problems", color: Palette.attention)
+            }
+            .buttonStyle(.borderless)
+            .help(lines.joined(separator: "\n"))
+            .popover(isPresented: $open, arrowEdge: .bottom) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                            Text(line).font(.system(size: 11 * z)).textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(12)
+                }
+                .frame(width: 460, height: 260)
+            }
+        }
+    }
+}
+
+/// The saved layout file can't be used as it is (BoardModel.layoutProblem): what is wrong, and the owner's two ways on.
+/// Nothing when the file was fine.
+struct LayoutProblemChip: View {
+    @ObservedObject var model: BoardModel
+    @State private var open = false
+
+    var body: some View {
+        if let problem = model.layoutProblem {
+            Button { open.toggle() } label: { Chip(text: "Layout not saved", color: AgentState.blocked.color) }
+                .buttonStyle(.borderless)
+                .help(problem)
+                .popover(isPresented: $open, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(problem).font(.system(size: 11)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Text("Until you choose, group changes are not saved, and the desktop keeps the groups it has.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        HStack {
+                            Button("Read the file again") { model.reloadLayout() }
+                            Button("Save the board's layout over it") { open = false; model.replaceUnreadableLayout() }
+                        }
+                    }
+                    .padding(12)
+                    .frame(width: 420)
+                }
+        }
+    }
+}
+
 struct Meter: View {
     @Environment(\.zoom) private var z
     let label: String
@@ -152,6 +237,7 @@ struct Meter: View {
     var dim = false
     var detail: String? = nil
     var onHoverDetail: ((String?) -> Void)? = nil
+    var onTap: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -174,7 +260,14 @@ struct Meter: View {
         .contentShape(Rectangle())
         .help(detail ?? "")
         .onHover { inside in onHoverDetail?(inside ? detail : nil) }
+        .onTapGesture { onTap?() }
     }
+}
+
+/// The meters alone watch `Meters`, so their 5-second updates redraw only them.
+struct LiveMeters: View {
+    @ObservedObject var meters: Meters
+    var body: some View { MachineMeters(metrics: meters.metrics) }
 }
 
 struct MachineMeters: View {
@@ -223,6 +316,11 @@ struct UsageBars: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(accountTitle(acct))
                             .font(.system(size: 10 * z, weight: .semibold)).lineLimit(1)
+                        if let shared = acct.sameAccountAs, !shared.isEmpty {
+                            Text("same account as \(SharedLogin.names(shared, in: model.usage?.accounts ?? [])): /login again")
+                                .font(.system(size: 10 * z, weight: .semibold)).foregroundColor(AgentState.blocked.color).lineLimit(1)
+                                .help(SharedLogin.body(acct, shared, in: model.usage?.accounts ?? []))
+                        }
                         if (acct.windows ?? []).isEmpty, let err = acct.error {
                             Text(err.hasPrefix("no login") ? "not logged in yet" : err)
                                 .font(.system(size: 10 * z)).foregroundStyle(.secondary).lineLimit(1)
@@ -230,12 +328,27 @@ struct UsageBars: View {
                         }
                         HStack(spacing: 8) {
                             ForEach(acct.windows ?? []) { w in
-                                let left = w.remainingPct ?? (100 - (w.usedPct ?? 0))
+                                let left = w.left
                                 Meter(label: shortWindow(w), fraction: (100 - left) / 100,
                                       value: String(format: "%.0f%% left", left),
-                                      tint: left <= 10 ? AgentState.blocked.color : (left <= 25 ? Palette.attention : Palette.ok),
+                                      tint: UsageLevel(left: left).color,
                                       width: 96,
-                                      detail: "\(accountTitle(acct)) · \(w.name ?? w.kind ?? "window"): \(Int(left))% left · resets \(Fmt.resetAt(w.resetsAt, now: model.now))",
+                                      detail: "\(accountTitle(acct)) · \(w.name ?? w.kind ?? "window"): \(Int(left))% left · resets \(Fmt.resetAt(w.resetsAt, now: model.now))"
+                                          + (w.key == nil ? "" : " · click for where it went"),
+                                      onHoverDetail: { model.hoverInfo = $0 },
+                                      onTap: w.key.flatMap { key in acct.target.map { target in {
+                                          model.sheet = .usage(target: target, window: key,
+                                                               title: "\(accountTitle(acct)) · \(shortWindow(w)): where it went")
+                                      } } })
+                            }
+                            if let cr = acct.creditsMeter, let bal = cr.balance {
+                                let left = cr.leftPct ?? 100
+                                let spending = cr.spending ?? false
+                                Meter(label: "Credits", fraction: (100 - left) / 100,
+                                      value: spending ? "\(Fmt.count(bal)) · \(Int(left.rounded()))% left" : Fmt.count(bal),
+                                      tint: UsageLevel(left: left).color,
+                                      width: spending ? 150 : 100,
+                                      detail: creditsDetail(cr, bal),
                                       onHoverDetail: { model.hoverInfo = $0 })
                             }
                         }
@@ -273,10 +386,18 @@ struct UsageBars: View {
     }
 
     func accountTitle(_ a: UsageAccount) -> String {
-        // "Personal Claude (Max plan; the default login, ~/.claude)" -> "Personal Claude"
-        var label = a.label ?? a.target ?? "?"
-        if let cut = label.firstIndex(of: "(") { label = String(label[..<cut]).trimmingCharacters(in: .whitespaces) }
-        return a.plan.map { "\(label) · \($0)" } ?? label
+        a.plan.map { "\(a.shortLabel) · \($0)" } ?? a.shortLabel
+    }
+
+    func creditsDetail(_ cr: CreditsMeter, _ bal: Double) -> String {
+        guard cr.spending == true, let full = cr.full else {
+            return "Codex credits: \(Fmt.count(bal)). Codex spends them once its weekly limit is used up; this bar " +
+                "then counts down from the balance it ran out at."
+        }
+        let since = cr.since.map { " (\(Fmt.clock($0)))" } ?? ""
+        return "Codex credits: \(Fmt.count(bal)) left of the \(Fmt.count(full)) there were when the weekly limit ran out\(since): " +
+            "\(Fmt.count(max(0, full - bal))) spent, \(Int((cr.leftPct ?? 100).rounded()))% left. Back to full when the week " +
+            "resets \(Fmt.resetAt(cr.resetsAt, now: model.now))."
     }
 
     func shortWindow(_ w: UsageWindow) -> String {
@@ -401,11 +522,7 @@ struct SectionView: View {
     var header: some View {
         HStack(spacing: 6) {
             if section.kind != .ungrouped {
-                Button { model.toggleCollapsed(section) } label: {
-                    Image(systemName: section.collapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 9 * z, weight: .bold)).frame(width: 10)
-                }
-                .buttonStyle(.borderless)
+                CollapseChevron(collapsed: section.collapsed) { model.toggleCollapsed(section) }
             }
             Group {
                 if isGroupLike, let gid = section.groupID {
@@ -472,6 +589,37 @@ struct NewSubgroupZone: View {
     }
 }
 
+/// The chevron that folds a section of the board and unfolds it.
+struct CollapseChevron: View {
+    @Environment(\.zoom) private var z
+    let collapsed: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) {
+            Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                .font(.system(size: 9 * z, weight: .bold)).frame(width: 10)
+        }
+        .buttonStyle(.borderless)
+    }
+}
+
+/// How the header of one of the board's fixed sections starts (the worktrees with no agent, today's meetings): its
+/// chevron, its title and how many it holds. For an HStack.
+struct FixedSectionTitle: View {
+    @Environment(\.zoom) private var z
+    let title: String
+    let count: Int
+    let collapsed: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        CollapseChevron(collapsed: collapsed, toggle: toggle)
+        Text(title).font(.system(size: 10 * z, weight: .semibold)).tracking(0.6).foregroundStyle(.secondary)
+        Text("\(count)").font(.system(size: 10 * z).monospacedDigit()).foregroundStyle(.tertiary)
+    }
+}
+
 // MARK: - worktrees with no agent
 
 struct WorktreeSection: View {
@@ -482,13 +630,8 @@ struct WorktreeSection: View {
         let items = model.freeWorktrees
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Button { model.toggleWorktreesCollapsed() } label: {
-                    Image(systemName: model.layout.worktreesCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 9 * z, weight: .bold)).frame(width: 10)
-                }
-                .buttonStyle(.borderless)
-                Text("WORKTREES WITH NO AGENT").font(.system(size: 10 * z, weight: .semibold)).tracking(0.6).foregroundStyle(.secondary)
-                Text("\(items.count)").font(.system(size: 10 * z).monospacedDigit()).foregroundStyle(.tertiary)
+                FixedSectionTitle(title: "WORKTREES WITH NO AGENT", count: items.count,
+                                  collapsed: model.layout.worktreesCollapsed) { model.toggle(\.worktreesCollapsed) }
                 let merged = items.filter { $0.git?.stage == "merged" || $0.git?.stage == "clean" }.count
                 if merged > 0 {
                     Text("· \(merged) merged").font(.system(size: 10 * z)).foregroundStyle(.tertiary)
@@ -521,11 +664,83 @@ struct WorktreeMenu: View {
     @ObservedObject var model: BoardModel
 
     var body: some View {
-        Button("Start agent here…") { Dialogs.wtSpawn(wt, model: model) }
-        Button("Clean up…") { Dialogs.wtCleanup(wt, model: model) }
-        Button("Force remove…", role: .destructive) { Dialogs.wtForce(wt, model: model) }
+        ForEach(worktreeActions(wt, model: model)) { MenuAction(action: $0) }
         Divider()
         Button("Copy path") { copyToPasteboard(wt.path) }
+    }
+}
+
+/// One action on an agent or a worktree, listed once for both its right-click menu and its detail panel.
+struct BoardAction: Identifiable {
+    let title: String           // the menu item
+    let button: String?         // the detail panel's button; nil: in the menu only
+    let help: String
+    let role: ButtonRole?
+    let enabled: Bool
+    let perform: () -> Void
+    var id: String { title }
+}
+
+/// What can be done to a worktree with no agent in it.
+@MainActor
+func worktreeActions(_ w: FreeWorktree, model: BoardModel) -> [BoardAction] {
+    [BoardAction(title: "Start agent here…", button: "Start agent…", help: "", role: nil, enabled: true) {
+        Dialogs.wtSpawn(w, model: model) },
+     BoardAction(title: "Clean up…", button: "Clean up…", help: "", role: nil, enabled: true) {
+        Dialogs.wtCleanup(w, model: model) },
+     BoardAction(title: "Force remove…", button: "Force remove…", help: "", role: .destructive, enabled: true) {
+        Dialogs.wtForce(w, model: model) }]
+}
+
+/// What can be done to an agent: the same rules for its tile's menu and its detail panel.
+@MainActor
+func agentActions(_ a: Agent, model: BoardModel) -> [BoardAction] {
+    var out = [BoardAction(title: "Send message…", button: "Message…", help: "", role: nil, enabled: a.live) {
+        Dialogs.send(a, model: model) }]
+    if model.snapshot?.chats != nil {
+        out.append(BoardAction(title: "New group chat…", button: nil, help: "", role: nil, enabled: !a.name.isEmpty) {
+            model.sheet = .newChat(a.id) })
+    }
+    if a.live {
+        out.append(BoardAction(title: "Change agent…", button: "Switch…", help: "Change its CLI, Claude login, model or effort",
+                               role: nil, enabled: true) {
+            model.sheet = .switching(SwitchSession(agent: a, modelOnly: false)) })
+        out.append(BoardAction(title: "Change model/effort…", button: nil, help: "", role: nil, enabled: true) {
+            model.sheet = .switching(SwitchSession(agent: a, modelOnly: true)) })
+        out.append(BoardAction(title: "Close…", button: "Close…", help: "", role: nil, enabled: true) {
+            Dialogs.close(a, model: model) })
+    } else {
+        out.append(BoardAction(title: "Resume…", button: "Resume…", help: "Start it again in tmux: same conversation, model and login",
+                               role: nil, enabled: true) {
+            Dialogs.resume(a, model: model) })
+        out.append(BoardAction(title: "Clean up…", button: "Clean up…",
+                               help: "agent-close without --force: removes the worktree only if all work is landed",
+                               role: nil, enabled: true) {
+            Dialogs.cleanup(a, model: model) })
+    }
+    out.append(BoardAction(title: "Force close…", button: "Force close…", help: "", role: .destructive, enabled: true) {
+        Dialogs.forceClose(a, model: model) })
+    return out
+}
+
+/// A BoardAction as a menu item.
+struct MenuAction: View {
+    let action: BoardAction
+    var body: some View {
+        Button(action.title, role: action.role) { action.perform() }.disabled(!action.enabled).help(action.help)
+    }
+}
+
+/// The BoardActions that have a detail panel button, in a row.
+struct ActionButtons: View {
+    let actions: [BoardAction]
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(actions.filter { $0.button != nil }) { a in
+                Button(a.button ?? a.title, role: a.role) { a.perform() }.disabled(!a.enabled).help(a.help)
+            }
+        }
+        .controlSize(.small)
     }
 }
 
@@ -598,20 +813,13 @@ struct WorktreeDetail: View {
                     }
                     Text("A worktree with no agent in it").font(.system(size: 12 * z)).foregroundStyle(.secondary)
                 }
-                HStack(spacing: 8) {
-                    Button("Start agent…") { Dialogs.wtSpawn(wt, model: model) }
-                    Button("Clean up…") { Dialogs.wtCleanup(wt, model: model) }
-                    Button("Force remove…") { Dialogs.wtForce(wt, model: model) }
-                }
-                .controlSize(.small)
+                ActionButtons(actions: worktreeActions(wt, model: model))
                 DetailSection(title: "Facts") {
                     Fact("Repo", wt.repoBranch)
-                    HStack(alignment: .top) {
-                        Text("Path").frame(width: 62 * z, alignment: .leading).foregroundStyle(.secondary)
-                        Text(wt.path).font(.system(size: 10 * z, design: .monospaced)).textSelection(.enabled)
+                    Fact("Path", wt.path, mono: true) {
                         Button { copyToPasteboard(wt.path); model.show("Copied path.") } label: { Image(systemName: "doc.on.doc") }
                             .buttonStyle(.borderless)
-                    }.font(.system(size: 11 * z))
+                    }
                     if let c = wt.lastCommit, let h = c.hash {
                         Fact("Commit", "\(h) \(c.subject ?? "")" + (c.ts.map { " (\(Fmt.ago($0, now: model.now)) ago)" } ?? ""))
                     }
@@ -623,10 +831,7 @@ struct WorktreeDetail: View {
                         GitPipeline(stage: g.stage)
                         Fact("State", g.summary)
                         if let pr = g.pr, let n = pr.number, let url = pr.url, let link = URL(string: url) {
-                            HStack(alignment: .top) {
-                                Text("PR").frame(width: 62 * z, alignment: .leading).foregroundStyle(.secondary)
-                                Link("#\(n) \(pr.title ?? "")", destination: link).lineLimit(2)
-                            }.font(.system(size: 11 * z))
+                            Fact("PR", "#\(n) \(pr.title ?? "")", link: link)
                         }
                     }
                 }
@@ -645,7 +850,7 @@ struct NewGroupZone: View {
 
     var body: some View {
         Button { Dialogs.newGroup(model: model) } label: {
-            Label("New group — or drop a tile here", systemImage: "plus")
+            Label("New group, or drop a tile here", systemImage: "plus")
                 .font(.system(size: 11 * z)).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, minHeight: 34)
                 .contentShape(Rectangle())
@@ -695,20 +900,11 @@ struct TileMenu: View {
     @ObservedObject var model: BoardModel
 
     var body: some View {
-        if agent.live {
-            Button("Close…") { Dialogs.close(agent, model: model) }
-        } else {
-            Button("Resume…") { Dialogs.resume(agent, model: model) }
-            Button("Clean up…") { Dialogs.cleanup(agent, model: model) }
-        }
-        Button("Force close…", role: .destructive) { Dialogs.forceClose(agent, model: model) }
+        ForEach(agentActions(agent, model: model)) { MenuAction(action: $0) }
         Divider()
-        Button("Send message…") { Dialogs.send(agent, model: model) }.disabled(!agent.live)
-        if agent.live {
-            Button("Change agent…") { model.switching = SwitchSession(agent: agent, modelOnly: false) }
-            Button("Change model/effort…") { model.switching = SwitchSession(agent: agent, modelOnly: true) }
-        }
         Button("Open latest mail in Gmail") { model.openLatestMail(agent) }.disabled(model.latestMailURL(for: agent) == nil)
+        Button("Open latest mail in the Mail tab") { model.openInMail(agent) }
+            .disabled(model.snapshot?.mailbox == nil || (agent.mail.lastOutThread ?? "").isEmpty)
         Button("Open in Kitty") { Kitty.open(agent, model: model) }.disabled(!Kitty.canOpen(agent))
         let attach = model.attachCommand(for: agent)
         Button("Copy attach command") { copyToPasteboard(attach ?? "") }.disabled(attach == nil)
@@ -847,16 +1043,6 @@ struct TileView: View {
     }
 }
 
-struct PulseDot: View {
-    @Environment(\.zoom) private var z
-    @State private var on = false
-    var body: some View {
-        Circle().fill(Color.white).frame(width: 6 * z, height: 6 * z)
-            .opacity(on ? 1 : 0.3)
-            .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { on = true } }
-    }
-}
-
 // MARK: - detail panel
 
 struct DetailView: View {
@@ -875,26 +1061,10 @@ struct DetailView: View {
                         Spacer()
                         Button { model.selectedID = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
                     }
-                    Text("\(agent.agentState.label) — \(agent.reason)")
+                    Text("\(agent.agentState.label) · \(agent.reason)")
                         .font(.system(size: 12 * z)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-                HStack(spacing: 8) {
-                    Button("Message…") { Dialogs.send(agent, model: model) }.disabled(!agent.live)
-                    if agent.live {
-                        Button("Switch…") { model.switching = SwitchSession(agent: agent, modelOnly: false) }
-                            .help("Change its CLI, Claude login, model or effort")
-                    }
-                    if agent.live {
-                        Button("Close…") { Dialogs.close(agent, model: model) }
-                    } else {
-                        Button("Resume…") { Dialogs.resume(agent, model: model) }
-                            .help("Start it again in tmux: same conversation, model and login")
-                        Button("Clean up…") { Dialogs.cleanup(agent, model: model) }
-                            .help("agent-close without --force: removes the worktree only if all work is landed")
-                    }
-                    Button("Force close…") { Dialogs.forceClose(agent, model: model) }
-                }
-                .controlSize(.small)
+                ActionButtons(actions: agentActions(agent, model: model))
 
                 if !agent.live {
                     DetailSection(title: "Offline") {
@@ -919,9 +1089,7 @@ struct DetailView: View {
                     if let s = agent.startedAt, s > 0 { Fact("Started", Fmt.clock(s)) }
                     Fact("Dir", agent.cwd)
                     if let cmd = model.attachCommand(for: agent) {
-                        HStack(alignment: .top) {
-                            Text("Attach").frame(width: 62 * z, alignment: .leading).foregroundStyle(.secondary)
-                            Text(cmd).font(.system(size: 10 * z, design: .monospaced)).textSelection(.enabled)
+                        Fact("Attach", cmd, mono: true) {
                             Button { copyToPasteboard(cmd); model.show("Copied attach command.") } label: {
                                 Image(systemName: "doc.on.doc")
                             }.buttonStyle(.borderless)
@@ -929,12 +1097,9 @@ struct DetailView: View {
                                 Button { Kitty.open(agent, model: model) } label: { Image(systemName: "terminal") }
                                     .buttonStyle(.borderless).help("Open in Kitty")
                             }
-                        }.font(.system(size: 11 * z))
+                        }
                     }
-                    HStack(alignment: .top) {
-                        Text("Session").frame(width: 62 * z, alignment: .leading).foregroundStyle(.secondary)
-                        Text(agent.id).font(.system(size: 10 * z, design: .monospaced)).textSelection(.enabled)
-                    }.font(.system(size: 11 * z))
+                    Fact("Session", agent.id, mono: true)
                 }
 
                 if let subs = agent.subagents, !subs.isEmpty {
@@ -965,10 +1130,7 @@ struct DetailView: View {
                             Fact("Commit", "\(h) \(c.subject ?? "")" + (c.ts.map { " (\(Fmt.ago($0, now: model.now)) ago)" } ?? ""))
                         }
                         if let pr = g.pr, let n = pr.number, let url = pr.url, let link = URL(string: url) {
-                            HStack(alignment: .top) {
-                                Text("PR").frame(width: 62 * z, alignment: .leading).foregroundStyle(.secondary)
-                                Link("#\(n) \(pr.title ?? "")", destination: link).lineLimit(2)
-                            }.font(.system(size: 11 * z))
+                            Fact("PR", "#\(n) \(pr.title ?? "")", link: link)
                         }
                     }
                 }
@@ -1071,17 +1233,42 @@ struct DetailSection<Content: View>: View {
     }
 }
 
-struct Fact: View {
+/// A labelled line of the detail panel. `mono` sets the value in a monospaced font (paths, commands, ids); `link`
+/// makes it a link; `trailing` follows the value (copy and open buttons).
+struct Fact<Trailing: View>: View {
     @Environment(\.zoom) private var z
     let label: String
     let value: String
-    init(_ label: String, _ value: String) { self.label = label; self.value = value }
+    let mono: Bool
+    let link: URL?
+    let trailing: Trailing
+
+    init(_ label: String, _ value: String, mono: Bool = false, link: URL? = nil, @ViewBuilder trailing: () -> Trailing) {
+        self.label = label
+        self.value = value
+        self.mono = mono
+        self.link = link
+        self.trailing = trailing()
+    }
+
     var body: some View {
         HStack(alignment: .top) {
             Text(label).frame(width: 62 * z, alignment: .leading).foregroundStyle(.secondary)
-            Text(value).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            if let link = link {
+                Link(value, destination: link).lineLimit(2)
+            } else {
+                Text(value).font(mono ? Font.system(size: 10 * z, design: .monospaced) : nil)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
+            trailing
         }
         .font(.system(size: 11 * z))
+    }
+}
+
+extension Fact where Trailing == EmptyView {
+    init(_ label: String, _ value: String, mono: Bool = false, link: URL? = nil) {
+        self.init(label, value, mono: mono, link: link) { EmptyView() }
     }
 }
 
@@ -1163,7 +1350,7 @@ struct AgentDigest: View {
                     Spacer()
                     Text(Fmt.ago(agent.lastActivity, now: now)).font(.system(size: 10 * z).monospacedDigit()).foregroundStyle(.secondary)
                 }
-                Text("\(agent.agentState.label) — \(agent.reason)").font(.system(size: 11 * z)).foregroundStyle(.secondary).lineLimit(2)
+                Text("\(agent.agentState.label) · \(agent.reason)").font(.system(size: 11 * z)).foregroundStyle(.secondary).lineLimit(2)
                 ForEach(agent.notes.suffix(3).reversed(), id: \.self) { n in
                     HStack(alignment: .top, spacing: 6) {
                         Text(Fmt.clock(n.ts)).font(.system(size: 10 * z).monospacedDigit()).foregroundStyle(.secondary).frame(width: 64 * z, alignment: .leading)
@@ -1216,6 +1403,8 @@ struct FooterBar: View {
                 Text(t).font(.system(size: 11 * z, weight: .medium)).lineLimit(1)
             } else if let e = model.collectorError {
                 Text(e).font(.system(size: 11 * z)).foregroundColor(AgentState.blocked.color).lineLimit(1)
+            } else if model.tab == .mail {
+                Text("↑↓ threads · ←→ mails · Space page · r reply · e archive · Esc leaves a text box · ⌘↩ sends").lineLimit(1).font(.system(size: 10 * z)).foregroundStyle(.tertiary)
             } else {
                 Text("double-click: its latest mail · drag to arrange · right-click for actions · ⌘R · ⌘+/⌘- · ⌥⌘A").font(.system(size: 10 * z)).foregroundStyle(.tertiary)
             }

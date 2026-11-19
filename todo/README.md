@@ -37,7 +37,7 @@ the apps show its progress, and by email.
 | Path | What |
 |---|---|
 | `bin/todo-desk` | the desktop helper's entry point (the installer puts a wrapper in `~/.local/bin`) |
-| `desk/todo_desk.py`, `desk/tests/` | the helper and its unit tests |
+| `desk/todo_desk.py`, `desk/issue_body.py`, `desk/tests/` | the helper (and the issue-body sections it shares with any script of yours) and its unit tests |
 | `web/` | the web app (`index.html`, `js/`, `css/`, Inter fonts under the SIL OFL, `tests/`) |
 | `mac/` | the Mac app (SwiftPM; `build-app.sh`, `install.sh`, `Info.plist`) |
 | `scripts/mac-build.sh`, `scripts/mac-install.sh` | build and install the Mac app on a Mac from the Linux desktop over ssh |
@@ -77,10 +77,10 @@ the apps show its progress, and by email.
 | `group:NAME` | the list's group from `.todo/config.json`, copied onto the task when it is saved | all clients |
 | `action:buy`, `action:email`, `action:look-into`, `action:call`, `action:manual` | the kind of action, for agents; no `action:` label means manual. Neither app shows or sets it any more; edits keep it | you (on GitHub), agents |
 | `tag:NAME` | free-form tags, any number per task (`tag:home` for what can only be done at home); lower case, hyphenated | web, Mac |
-| `importance:high`, `importance:medium`, `importance:low` | how much it matters (one per task) | web, Mac, agents |
-| `urgency:high`, `urgency:low` | how soon (one per task); a due date within 14 days also counts as urgent | web, Mac, agents |
+| `importance:high`, `importance:medium`, `importance:low` | how much it matters (one per task); none is "unrated" | web, Mac, agents |
+| `urgency:high`, `urgency:low` | how soon (one per task); a due date within 14 days also counts as urgent. Rating a task's importance with no urgency adds `urgency:low` | web, Mac, agents |
 | `due:YYYY-MM-DD` | due date (one per task) | web, Mac |
-| `priority:high`, `priority:medium`, `priority:low` | legacy priority; the Mac app's editor sets it, the web app's editor removes it | Mac |
+| `priority:high`, `priority:medium`, `priority:low` | retired: importance and urgency replaced it. No client writes it, and every edit in the web or Mac app removes it | none (old tasks) |
 | `source:app`, `source:claude`, `source:import` | where the task came from (`source:app` is added to tasks made in an app) | all clients, agents |
 | `status:agent-requested` | the web app asked for an agent | web writes, `todo-desk dispatch` removes |
 | `status:agent-assigned` | an agent was started on it, or it was sent to a running agent | `todo-desk` |
@@ -90,7 +90,7 @@ the apps show its progress, and by email.
 | `status:waiting-cleared` | an agent thinks the wait is over (it swaps `status:waiting` for this and writes its evidence in the Claude notes); the task shows "Came through?" until you answer OK or Still waiting | agents set, web and Mac clear |
 | `approved` | you approved the outside-world step an agent prepared | you |
 | `subtask` | it is in a group (a sub-issue) | web, Mac (`todo-desk`) |
-| `focus:week` | one of at most five tasks in "This week" (web Triage) | web |
+| `focus:week` | one of at most five tasks in "This week" (Triage) | web, Mac |
 
 `list:`, `section:`, `group:`, `action:`, `priority:`, `importance:`, `urgency:`, `due:` and `follow-up:` are single-valued:
 setting one replaces any other with the same prefix. Every client keeps labels it does not manage.
@@ -111,7 +111,8 @@ Groups the lists in the sidebars, orders them, and names the lists that are not 
 
 The Mac app changes it through `todo-desk` (as operations on a fresh copy, so concurrent edits survive); the web
 app rewrites it when a list is deleted. Lists in `unratedGroups` / `unratedLists` get no rating controls and stay
-out of Triage. Without the file every list is ungrouped and rated.
+out of Triage, in both apps (names match in any case; an entry that is not a string is ignored). Without the file
+every list is ungrouped and rated.
 
 ## Install
 
@@ -145,7 +146,7 @@ On the always-on Linux machine ("the desktop"):
    |---|---|---|
    | `repo` | none (required); `$TODO_REPO` if the file has none | the tasks repo, `owner/name` |
    | `owner_name` | the mailroom config's `owner_name`, else "the owner" | your name, in the orchestrator message and issue comments |
-   | `owner_email` | the mailroom config's `owner_email`, else its `allowlist[0]` | where agents email results (`agent-mail send --to`) |
+   | `owner_email` | the mailroom config's `owner_email`, else its `allowlist[0]` | your address: which mail an agent sent you (for opening its latest mail) and the Chrome profile Gmail opens in. Agents themselves write `agent-mail send --to owner`, which the mailroom turns into your address |
    | `repos_root` | the mailroom config's `repos_root`, else `~/code` | where the orchestrator looks for a task's repo |
    | `general_repo` | the mailroom config's `general_repo`, else `<repos_root>/general` | where an agent starts for a task with no repo of its own |
 
@@ -160,6 +161,7 @@ On the always-on Linux machine ("the desktop"):
    todo-desk message 12 --text "test"      # the orchestrator message for task #12; sends nothing
    todo-desk dispatch --dry-run            # which web requests would start an agent; changes nothing
    todo-desk agents --pretty               # the running agents the apps offer (reads the agent board)
+   todo-desk agent-mail 12                 # the newest mail task #12's agent sent you (what the Mac opens)
    ```
 
 5. Start `todo-desk dispatch` every 2 minutes, either as a systemd user timer (the installer renders
@@ -185,8 +187,14 @@ On the always-on Linux machine ("the desktop"):
    refreshes); the Mac app assigns directly.
 
 Environment variables the helper reads: `TODO_REPO`, `TODO_DESK_CONFIG_DIR` (default `~/.config/todo-desk`),
-`AGENT_MAIL_CONFIG_DIR` (default `~/.config/agent-mail`), `TODO_DESK_CACHE` (default
-`~/.cache/todo-desk/cache.json`), `TODO_DESK_STATE` (default `~/.local/state/todo-desk`), `GH_TOKEN`/`GITHUB_TOKEN`.
+`AGENT_MAIL_CONFIG_DIR` (default `~/.config/agent-mail`), `AGENT_MAIL_STATE_DIR` (default
+`~/.local/state/agent-mail`), `TODO_DESK_MAILROOM` (the mailroom's database, read-only; default
+`$AGENT_MAIL_STATE_DIR/mailroom.sqlite`), `TODO_DESK_CACHE` (default `~/.cache/todo-desk/cache.json`),
+`TODO_DESK_STATE` (default `~/.local/state/todo-desk`), `GH_TOKEN`/`GITHUB_TOKEN`.
+
+The helper rewrites its cache only when a sync changed something (or at least every 30 minutes), and `serve` exits
+about 50 seconds after the Mac stops acknowledging data (it slept or left the network) when nothing is in flight;
+the Mac reconnects when it wakes.
 
 ### 3. The web app
 
@@ -260,17 +268,38 @@ TODO_HELPER=/path/to/todo-desk scripts/mac-install.sh   # point the app at anoth
 a folder you edit.
 
 Settings live in `defaults` for `org.agentkit.todo`: `host` (default `desktop`; also in the menu-bar item's
-right-click menu), `helper` (default `~/.local/bin/todo-desk`, run on the desktop), and window state (`zoom`,
-`list`, `expandedGroups`, `foldedTaskGroups`, `tagFilter`). The cache is `~/Library/Application Support/ToDo/cache.json`.
+right-click menu), `helper` (default `~/.local/bin/todo-desk`, run on the desktop), window state (`zoom`,
+`list`, `expandedGroups`, `foldedTaskGroups`, `tagFilter`), and Triage's memory on this Mac (`triageSnoozes`,
+`triageShown`). The cache is `~/Library/Application Support/ToDo/cache.json`; one that cannot be read is renamed
+aside to `cache.json.bad-<time>` and reported, never overwritten.
+
+**What it does.** The web app's lists, groups, search, tags, waiting and Assign to agent, with offline edits, plus:
+
+- **Rating.** In a rated list the edit pane has Importance (High, Medium, Low, None), Urgent and Due (presets or a
+  calendar). A row's ring is red for high importance and dashed for low; rows show "urgent" and "due 6 Nov" (red once
+  past). The filter chips are high, medium, low, unrated and urgent; the Rate menu rates a selection. An edit sends
+  only the rating fields you changed, and takes off any old `priority:` label.
+- **Triage** (top of the sidebar): one task at a time from the rated lists, drawn by the web app's rules (unrated,
+  important and long-untouched tasks come up most), with Archive (close as not planned), This week (at most five),
+  Snooze (1 day, 3 days, 1 week, then 3 weeks; on this Mac only), Done, Delete, Agent, importance, Urgent and a due
+  date. Every action is undoable with ⌘Z. The task panel on the right shows the card's task.
+- **An agent's latest email.** Double-click the agent's name on a task (its row, the task panel's agent line or its
+  envelope button, the Triage card) to open the newest mail that agent sent you in Gmail. The desktop finds it in the
+  mailroom's records (`todo-desk agent-mail N`); with the agent board's optional Gmail read-check on, it opens the
+  thread itself, otherwise a Gmail search for that message. It opens in the Chrome profile signed in to your address
+  when Chrome has one, else in your default browser.
 
 Keys: ⌥⌘T (anywhere) shows or hides the window; ⌘N add; ⌘F search; ↑↓ or j/k move; space complete or reopen;
 return or ⌘E edit; ⌘⌫ delete; ⇧⌘A assign to an agent; ⌘Z undo; ⌘R check GitHub now; ⇧⌘R fetch everything again;
 ⌘+ / ⌘- / ⌘0 zoom; ⇧-click / ⌘-click / ⌘A select several (then ⌘G groups them); esc clears the selection.
+On the Triage page: → or space next; ← or a archive; w this week; s snooze; d done; x delete; g agent; 1 2 3 or
+h m l importance; u urgent; return edit.
 
 Checks from a terminal on the Mac:
 
 ```bash
-/Applications/ToDo.app/Contents/MacOS/ToDo --selftest          # offline logic checks
+/Applications/ToDo.app/Contents/MacOS/ToDo --selftest          # offline logic checks (Triage, rating, agent mail links)
+/Applications/ToDo.app/Contents/MacOS/ToDo --selftest-clicks   # real clicks in an offscreen window (never on screen)
 /Applications/ToDo.app/Contents/MacOS/ToDo --probe             # connect as the app does and print what arrives
 /Applications/ToDo.app/Contents/MacOS/ToDo --selftest-remote   # creates, edits and deletes a dummy task on GitHub
 ```
@@ -313,8 +342,10 @@ The **orchestrator message** asks for one agent and tells the orchestrator to:
 
 - start it in the task's repo under `repos_root` on a new branch off `origin/main`, or a new repo
   (`agent-spawn --new-repo`) if the task plainly needs one, or else in `general_repo`;
-- name it `todo-N-<slug of the title>` (so the board and the apps can match it to the task);
-- comment on the issue `<!-- todo-agent:started -->` then `Agent started: NAME (REPO@BRANCH, ACCOUNT)`;
+- name it for what the task is, as it names agents it starts from email: 2 to 4 lowercase words joined by hyphens,
+  with no issue number, not starting with `todo-`, and not clashing with a name in `agent-send --list`;
+- comment on the issue `<!-- todo-agent:started -->` then `Agent started: NAME (REPO@BRANCH, ACCOUNT)` (the apps
+  read the agent's name from this comment);
 - email you (`owner_email`) the agent's name, repo and account; on failure comment `<!-- todo-agent:failed -->`.
 
 The **agent's brief** (written by the orchestrator from the message) says: read the issue with its comments
@@ -416,12 +447,13 @@ These belong in the global agent instructions the kit installs, so every agent f
 
 ```bash
 cd todo
-HOME=$(mktemp -d) python3 -m unittest discover -s desk/tests    # the helper: 61 tests, no network, fake GitHub
-node --test web/tests/*.test.js                                 # the web app: 58 tests (Node 18+, no npm install)
+HOME=$(mktemp -d) python3 -m unittest discover -s desk/tests    # the helper: 80 tests, no network, fake GitHub
+node --test web/tests/*.test.js                                 # the web app: 74 tests (Node 18+, no npm install)
 ./setup-labels.sh --dry-run alex-gh/tasks                  # prints the gh commands only
 ```
 
-The Mac app has no tests that run off a Mac; `ToDo --selftest` covers its model logic on the Mac.
+The Mac app has no tests that run off a Mac; on the Mac, `ToDo --selftest` covers its model logic (with a stand-in
+for the desktop, so no ssh) and `ToDo --selftest-clicks` real clicks in a window kept off every screen.
 
 ## Troubleshooting
 
@@ -433,8 +465,14 @@ The Mac app has no tests that run off a Mac; `ToDo --selftest` covers its model 
 - **Mac app says "todo-desk not found on the desktop"**: the `helper` path is wrong or the wrapper is missing;
   `ssh desktop '~/.local/bin/todo-desk config'` must work without a password prompt.
   `defaults write org.agentkit.todo helper /path/to/todo-desk` changes it.
-- **Mac app keeps reconnecting**: `ToDo --probe` on the Mac prints what arrives. The helper pings every 20 s and
-  exits after 12 hours (the app reconnects).
+- **Mac app keeps reconnecting**: `ToDo --probe` on the Mac prints what arrives. The helper pings every 20 s, exits
+  after 12 hours, and exits about 50 s after the Mac goes to sleep (the app reconnects).
+- **Double-clicking an agent says it "hasn't emailed you yet"**: the mailroom has no mail from a session of that
+  name (or in its worktree) to your address. `todo-desk agent-mail N` on the desktop shows what it finds; a
+  `thread_error` there only means the mail opens as a Gmail search instead of its thread.
+- **"N tasks couldn't be read" or "The lists' settings (.todo/config.json) couldn't be read"** in the Mac app: the
+  desktop sent an issue or a config the app cannot decode; it keeps the rest. Check `.todo/config.json` is valid
+  JSON with the documented keys.
 - **Web app: "Could not resolve to a Repository"**: the repo name is wrong, or the PAT was not given access to it.
 - **Web app: list deletion comes back**: the PAT has Contents read-only; give it Contents read and write.
 - **Web app shows old code after an update**: hard-refresh (Shift-reload); browsers may hold JS and CSS for a while.

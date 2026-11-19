@@ -10,7 +10,8 @@ refresh token at ~/.config/agent-mail/token.json (mode 600). The expected accoun
 config `account` (~/.config/agent-mail/config.json) unless --account is given. It refuses
 to save a token for any other account, so consenting with the wrong Google login cannot
 succeed. The OAuth client file is a "Desktop app" client downloaded from Google Cloud
-Console (default ~/.config/agent-mail/credentials.json).
+Console: --client-secrets, else config `oauth_client_file`, else ~/.config/agent-mail/credentials.json.
+The token goes where the mailroom reads it (~/.config/agent-mail, or AGENT_MAIL_CONFIG_DIR).
 
 On a headless machine (over SSH): pick a fixed port and skip the browser, e.g.
 `agent-mail-auth --port 8765 --no-browser`, forward that port from your laptop with
@@ -35,8 +36,9 @@ SAVED_FIELDS = ("client_id", "client_" + "secret", "refresh_" + "token")
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="agent-mail-auth", description=__doc__.split("\n\n")[0])
     ap.add_argument("--account", help="the agents Gmail address (default: config `account`)")
-    ap.add_argument("--client-secrets", default=str(config.CLIENT_SECRETS_PATH),
-                    help="OAuth client file for a Desktop app (default: %(default)s)")
+    ap.add_argument("--client-secrets",
+                    help="OAuth client file for a Desktop app (default: config oauth_client_file, else %s)"
+                    % config.CLIENT_SECRETS_PATH)
     ap.add_argument("--port", type=int, default=0,
                     help="fixed local port for the OAuth redirect (default 0: a random free port)")
     ap.add_argument("--no-browser", action="store_true",
@@ -46,11 +48,12 @@ def main(argv=None):
     config.CONF_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(config.CONF_DIR, 0o700)
 
-    expected = (a.account or config.load().get("account") or "").strip().lower()
+    cfg = config.load()
+    expected = (a.account or cfg.get("account") or "").strip().lower()
     if not expected:
         print("No agents account: pass --account ADDRESS or set `account` in %s." % config.CONFIG_PATH, file=sys.stderr)
         return 2
-    client = Path(os.path.expanduser(a.client_secrets))
+    client = Path(os.path.expanduser(a.client_secrets)) if a.client_secrets else config.oauth_client_path(cfg)
     if not client.is_file():
         print("No OAuth client file at %s. Create a Desktop-app OAuth client in Google Cloud Console "
               "(Gmail API enabled), download its JSON there, or pass --client-secrets PATH." % client, file=sys.stderr)

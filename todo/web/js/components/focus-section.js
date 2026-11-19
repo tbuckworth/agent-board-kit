@@ -5,7 +5,7 @@ import { getState } from '../state.js';
 import { navigate } from '../router.js';
 import { taskRow } from './task-row.js';
 import { showToast } from './toast.js';
-import { focusTasks, FOCUS_CAP } from '../triage.js';
+import { focusTasks, FOCUS_CAP } from '../labels.js';
 import * as actions from '../actions.js';
 
 // onChange re-renders the page after a task is ticked off

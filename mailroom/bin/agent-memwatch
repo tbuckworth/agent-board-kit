@@ -1,49 +1,24 @@
 #!/usr/bin/env python3
 """agent-memwatch: warn the agents holding the most memory before the machine runs out.
 
-    agent-memwatch                               # run forever (systemd/agent-memwatch.service)
+    agent-memwatch [--interval SECONDS]          # run forever (systemd/agent-memwatch.service)
     agent-memwatch --once [--dry-run] [--json]   # one sample; --dry-run sends nothing and saves no state
 
-Every 15 s it reads /proc/meminfo and charges each process's anonymous memory plus swap to the Claude or Codex
-session it descends from (registry.all_sessions, the address book agent-send uses).
-- At 80% of RAM in use it messages the agents holding most of it, via agent-send.
-- At 90%, or at 80% with swap half full, it messages them again, urgently, and emails the owner the table.
-  Swap alone never alerts: pages stay swapped out long after the pressure that put them there has gone.
-- An agent whose own agent-NAME.scope is at 90% of its MemoryMax is told before the cap kills its batch.
-At most one message per agent and level per 30 min, one email per hour; agent messages re-arm below 75%.
-Settings: config key "memwatch" (~/.config/agent-mail/config.json); defaults and reasons in agentmail/memwatch.py.
+Details: README.md, section "Memory watch"; settings: config key "memwatch" (agentmail/memwatch.py DEFAULTS).
 """
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import config, memwatch, registry  # noqa: E402
+from agentmail import config, jsonfile, memwatch, registry, watch  # noqa: E402
 
 BIN = Path(__file__).resolve().parent
-STATE_PATH = config.STATE_DIR / "memwatch.json"
-
-
-def log(msg):
-    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
-
-
-def load_state():
-    try:
-        return json.loads(STATE_PATH.read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def save_state(state):
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state))
-    os.replace(tmp, STATE_PATH)
+# What memwatch.decide keeps. Deleting it when damaged only resets the repeat limits.
+STATE = jsonfile.JsonFile(config.STATE_DIR / "memwatch.json", jsonfile.PLAIN, None)
 
 
 def sample():
@@ -63,26 +38,34 @@ def sample():
 
 
 def act(actions, cfg):
+    """Send each of memwatch.decide's actions: a ping through agent-send, the email through agent-mail. Logs each
+    with its exit code; returns the keys of those that went (exit 0), for memwatch.record."""
+    done = []
     for a in actions:
         if a[0] == "ping":
             g, lvl, text = a[1], a[2], a[3]
-            r = subprocess.run([sys.executable, str(BIN / "agent-send"), "--from", "agent-memwatch", g["session"]["id"], text],
+            r = subprocess.run([str(BIN / "agent-send"), "--from", "agent-memwatch", g["session"]["id"], text],
                                capture_output=True, text=True, timeout=60)
-            log("ping %s (%s, level %s): exit %s %s" % (g["label"], memwatch.gb(g["mem"]), lvl, r.returncode,
-                                                         (r.stdout + r.stderr).strip()[-160:]))
+            watch.log("ping %s (%s, level %s): exit %s %s" % (g["label"], memwatch.gb(g["mem"]), lvl, r.returncode,
+                                                               (r.stdout + r.stderr).strip()[-160:]))
         else:
-            to = cfg.get("alert_to") or config.owner_email(cfg)
+            to = config.alert_address(cfg)
             if not to:
+                watch.log("email %r not sent: config has no alert_to, owner_email or allowlist" % a[1])
                 continue
+            # agent-mail runs under this interpreter, the kit's venv, which holds the Google client libraries
             r = subprocess.run([sys.executable, str(BIN / "agent-mail"), "send", "--unrouted", "--to", to,
                                 "--subject", "[agent-memwatch] " + a[1]], input=a[2],
                                capture_output=True, text=True, timeout=120)
-            log("email %r: exit %s %s" % (a[1], r.returncode, (r.stdout + r.stderr).strip()[-160:]))
+            watch.log("email %r: exit %s %s" % (a[1], r.returncode, (r.stdout + r.stderr).strip()[-160:]))
+        if r.returncode == 0:
+            done.append(a[-1])
+    return done
 
 
-def report(u, own, caps, actions, as_json):
+def report(u, own, caps, actions, as_json, s):
     if as_json:
-        print(json.dumps({"usage": u, "level": memwatch.level(u, memwatch.settings(config.load())),
+        print(json.dumps({"usage": u, "level": memwatch.level(u, s),
                           "owners": [{"label": g["label"], "session": (g["session"] or {}).get("id"), "mem": g["mem"],
                                       "top": g["top"]} for g in own[:15]],
                           "caps": [{"label": g["label"], "current": c, "max": m} for g, c, m in caps],
@@ -94,44 +77,36 @@ def report(u, own, caps, actions, as_json):
     for g, c, m in caps:
         print("cap: %s at %s of %s" % (g["label"], memwatch.gb(c), memwatch.gb(m)))
     for a in actions:
-        print("would " + ("email %s: " % config.owner_name() + a[1] if a[0] == "email" else "message %s (level %s):\n  %s" % (
-            a[1]["label"], a[2], a[3])))
+        print("would " + ("email %s: %s" % (s["owner_name"], a[1]) if a[0] == "email" else
+                          "message %s (level %s):\n  %s" % (a[1]["label"], a[2], a[3])))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="agent-memwatch", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--once", action="store_true", help="one sample, then exit")
-    ap.add_argument("--dry-run", action="store_true", help="send nothing, save no state (implies --once)")
-    ap.add_argument("--json", action="store_true")
+    watch.add_options(ap, "send nothing, save no state")
     ap.add_argument("--interval", type=float, help="seconds between samples (default: config)")
     a = ap.parse_args(argv)
     cfg = config.load()
     s = memwatch.settings(cfg)
-    once = a.once or a.dry_run
+    once = watch.once(a)
     last_level = None
-    while True:
-        try:
-            u, own, caps = sample()
-            state = load_state()
-            actions, new_state = memwatch.decide(state, u, own, caps, s, time.time())
-            lvl = memwatch.level(u, s)
-            if once:
-                report(u, own, caps, actions, a.json)
-            elif lvl != last_level and (lvl or last_level):
-                log("level %s: %s" % (lvl, memwatch.headline(u)))
-            last_level = lvl
-            if not a.dry_run:
-                act(actions, cfg)
-                if new_state != state:
-                    save_state(new_state)
-        except Exception as e:  # noqa: BLE001 - a watch must outlive one bad sample
-            log("error: %s: %s" % (type(e).__name__, e))
-            if once:
-                return 1
+
+    def step(state):
+        nonlocal last_level
+        u, own, caps = sample()
+        now = time.time()
+        actions, new_state = memwatch.decide(state, u, own, caps, s, now)
+        lvl = memwatch.level(u, s)
         if once:
-            return 0
-        time.sleep(a.interval or s["interval_seconds"])
+            report(u, own, caps, actions, a.json, s)
+        elif lvl != last_level and (lvl or last_level):
+            watch.log("level %s: %s" % (lvl, memwatch.headline(u)))
+        last_level = lvl
+        if a.dry_run:
+            return new_state
+        return memwatch.record(new_state, act(actions, cfg), now)
+    return watch.run(a, step, STATE, lambda: a.interval or s["interval_seconds"])
 
 
 if __name__ == "__main__":

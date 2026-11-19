@@ -1,83 +1,104 @@
-"""Move a Claude agent to another login when its own runs out mid-task, and back once that one has reset.
+"""Move a Claude agent to another login, or onto the next model, when its own runs out mid-task, and back once
+that one has reset.
 
-Detection. When a limit stops a turn, Claude Code writes its own record into the transcript, an assistant entry
-with isApiErrorMessage, in one of two shapes:
-  - a plan limit (5-hour, weekly): error "rate_limit" and quotaLimits {status: "rejected", rateLimitType,
-    resetsAt}. That is the server's verdict, not a transient 429.
-  - a model's own weekly bucket used up, with extra usage off (for example Fable): apiError
-    "model_requires_usage_credits", no quotaLimits, and the text "You're out of usage credits. Run /usage-credits
-    to keep using Fable 5.1 or /model to switch models." (`claude -p` words it "You're out of usage credits.
-    Switch to another model, or manage usage credits at ..."). It carries no reset time; that comes from the
-    login's per-model window in agent-usage, which also tells a record from before the window's reset.
-A live agent whose transcript ends that way, with the reset still ahead, is stuck. Nothing else reads it: the
-watcher checks the transcript tails of live agents. Text that merely quotes such a message, such as a hook's
-systemMessage, is not a limit: a hook's own `claude -p` running out says nothing about the agent's login.
-Headroom is judged for the model the agent runs (its last reply's model), so a Fable agent only goes to, and
-only comes back to, a login with Fable left.
+Detection. When a limit stops a turn, Claude Code writes its own record into the transcript, in one of these shapes:
+  - a plan limit (5-hour, weekly): an assistant entry with isApiErrorMessage, error "rate_limit" and quotaLimits
+    {status: "rejected", rateLimitType, resetsAt}. That is the server's verdict, not a transient 429.
+  - a model's own weekly bucket used up, with extra usage off (Fable): an assistant entry with
+    isApiErrorMessage, apiError "model_requires_usage_credits", no quotaLimits, and the text "You're out of usage
+    credits. Run /usage-credits to keep using Fable 5.1 or /model to switch models." (`claude -p` words it "You're
+    out of usage credits. Switch to another model, or manage usage credits at ..."). It carries no reset time; that
+    comes from the login's per-model window in agent-usage, which also tells a record from before the window's reset.
+  - the end of Claude Code's grace allowance (Claude Code 2.1.314 on): no API error, only a system entry, subtype
+    "informational", "Usage limit reached · continuing automatically at 4:30pm · esc to cancel" (or "Usage limit
+    reached again · ..."). The reset is the next 4:30pm local time after the entry; when the line gives no time this
+    reads, it is the reset of the login's used-up window in agent-usage, and with none used up, a line from before
+    the latest reset of the login's windows is over.
+A live agent whose latest such record is newer than its latest good reply, with the reset still ahead, is stuck,
+whatever user lines came after the record: a background task's notice or a queued message can land after a refusal
+without starting a turn. A record from before the agent's last move, or its last switch by hand (agent-switch), belongs
+to the login it left.
+The transcript tail of a live agent is the only signal read. Text that merely quotes such a message, such as a
+hook's systemMessage, is not a limit: a hook's own `claude -p` running out says nothing about the agent's login.
+Where it goes is the first place with headroom in usage.places order (the README's "login and model order"): each
+Claude login in usage.order on the model it started on, then each on the next of config.claude_model_order, and
+so on, never an earlier model (a move to the same login on another model restarts it there with --model); with
+none, the place usage.last_resort allows, where it bills extra usage. Headroom is judged for the model the agent
+would run there, so a Fable agent stays on Fable only on a login with Fable left, and comes back to its first
+login and model only once that has reset. Until it replies on a model a move gave it, its model is the one that
+move recorded (its transcript still shows the old one). An agent switched by hand, or running a model not on that
+list, keeps its model and never bills.
 
-The move (same session id, same tmux pane; the conversation, memory and background jobs are kept):
-  1. SIGKILL the agent's claude process. Not SIGTERM: a graceful exit kills the agent's background jobs, while
-     after SIGKILL they keep running (reparented) and its MCP servers exit on their own. The agent is between
-     turns (its turn ended on the limit, or it is idle), so nothing is half written.
-  2. Copy its transcript (and session folder, if any) into the other login's projects/, same project folder,
-     same session id, so mail replies keep reaching it.
-  3. Trust the working directory in that login and link its auto memory (agentmail/usage.link_memory).
-  4. In the same tmux pane: `stty sane; export CLAUDE_CONFIG_DIR=...` (or unset it for the default login),
-     then `claude --resume ID --name NAME <its flags> [prompt]`.
-  5. Wait until the registry shows it live on the new login.
-
-Switching back. An agent moved off its first login ("home") goes back once the limit that moved it has reset,
-home has headroom again and comes first in usage.order, and the agent has been idle for `idle_seconds`. It is
-resumed with no prompt, so it simply waits for its next input. An idle agent on a login that is used up and
-billing extra usage moves to a login with headroom the same way. A busy agent is never interrupted.
+The move (migrate) keeps the session id, so mail replies keep reaching the agent. Its claude is stopped with
+SIGKILL, not SIGTERM: a graceful exit kills the agent's background jobs, while after SIGKILL they keep running
+(reparented) and its MCP servers exit on their own. The agent is between turns (its turn ended on the limit, or it
+is idle), so nothing is half written. A killed claude cannot remove its own registry entry, so the move does. The
+transcript is copied to the other login, the folder trusted there and its auto memory linked, and the session
+resumed in the same tmux pane with its flags. Moving back waits until the agent is idle and resumes it with no
+prompt, so a busy agent is never interrupted.
 
 A Claude Code background session (`claude --bg`, or one dispatched from `claude agents`; the claude daemon runs
-it, with no terminal) moves the same way, with the daemon's own commands: `claude stop ID` under its login (this
-also ends its background commands, and the note it resumes with says so), the copy, then `claude --resume ID
---bg <its model, effort and permission mode, read from the transcript> prompt` under the other login, in the
-session's folder. memcap then moves the daemon out of the caller's cgroup, so a restart of agent-failover (or
-the end of the agent that ran agent-switch) cannot take it down.
+it, with no terminal) moves with the daemon's own commands: `claude stop ID` under its login (this also ends its
+background commands, and the note it resumes with says so), the copy, then `claude --resume ID --bg <its model,
+effort and permission mode, read from the transcript> prompt` under the other login, in the session's folder.
+memcap then moves the daemon out of the caller's cgroup, so a restart of agent-failover (or the end of the agent
+that ran agent-switch) cannot take it down.
 
-Only those, and agents in a tmux pane whose shell started claude (agent-spawn's layout), are moved; a session in
-someone's terminal is left alone. Pure decisions here; bin/agent-failover reads, acts and loops.
+Two kinds of agent are moved: background sessions, and agents in a tmux pane whose shell started claude
+(agent-spawn's layout); a session in someone's terminal is left alone. This module decides (decide) and moves
+(migrate, place_resume); bin/agent-failover runs the watch loop.
+
+While live agents bill a login's extra usage, the owner is mailed when that starts, at each further step of spend
+and when it ends (spend_watch decides; bin/agent-failover sends). That only reports: it moves nothing.
 """
+import copy
+import datetime
 import fnmatch
 import json
 import os
 import re
 import shlex
-import shutil
 import signal
-import subprocess
 import time
-from pathlib import Path
 
-from . import registry, usage
+from . import accounts, claude_session, commands, config, jsonfile, launch, memcap, procs, registry, usage
 
 DEFAULTS = {
     "enabled": True,
     # Background commands the agent started: "keep" leaves them running and lists them in the note it resumes
     # with (pid, command, output file); "kill" stops them first and says so.
     "background": "keep",
-    "interval_seconds": 20,
+    "interval_seconds": 20,       # between watch passes
     "switch_back": True,          # move agents back to their first login after its limit resets
     "idle_seconds": 300,          # an agent must have been idle this long before a switch back
     "max_moves_per_hour": 4,      # per agent: a guard against ping-pong
-    "launch_wait_seconds": 60,
+    "launch_wait_seconds": 60,    # for a moved agent to show live on its new login
     # Session names (shell globs) that stay on their login: never moved when a limit stops them (they wait for its
-    # reset), never moved back or rebalanced, and resumed where their newest copy is. E.g. ["nightly-*"] for jobs
-    # that must only use the login they were started on.
+    # reset), and resumed where their newest copy is. E.g. ["nightly-*"] for jobs that must only use the login
+    # they were started on.
     "pinned": [],
-    "tail_bytes": 256 << 10,
+    "tail_bytes": 256 << 10,      # of each transcript, read for limits, model and flags
+    # Mail the owner while agents run on a Claude login that bills extra usage (a window counted for their model is
+    # used up and extra usage is on): once when they start, again each time the stretch's spend grows by spend_step
+    # (in the login's currency), and once with the stretch's total when none bills any more. Usage is read for it
+    # at most every spend_check_seconds while a Claude agent is live or a stretch is open.
+    "spend_mail": True,
+    "spend_step": 100,
+    "spend_check_seconds": 300,
 }
 LIMIT_PROMPT = ("[agent-failover] Your Claude login '{src}' hit its usage limit ({why}), so this session was moved "
-                "to login '{dst}' and resumed here. Carry on with your task from where you stopped.")
-NO_PROMPT_JOBS = "[agent-failover] This session was moved to login '{dst}' ({why}). Nothing else changed."
+                "to {dst} and resumed here. Carry on with your task from where you stopped.")
+NO_PROMPT_JOBS = "[agent-failover] This session was moved to {dst} ({why}). Nothing else changed."
 REBALANCE_WHY = "its window is used up and it bills extra usage"
 CREDITS_ERROR = "model_requires_usage_credits"   # Claude Code's apiError when a model's own bucket is used up
 CREDITS_TEXT = "You're out of usage credits"
-MODEL_WINDOW_SECONDS = 7 * 86400                 # a per-model window is weekly
-BG = "bg"   # movable()'s handle for a background session: the claude daemon runs it, not a tmux pane
+LIMIT_NOTICE = "Usage limit reached"             # how Claude Code's system line starts when a limit ends a turn
+AUTO_CONTINUE = re.compile(r"continuing automatically at (1[0-2]|[1-9])(?::([0-5]\d))?([ap]m)\s*(?:·|$)")
+# What record() and switched_by_hand() keep, under "spend" each login's open extra-usage stretch (spend_watch), and
+# under "spend_unreadable" why each login's spend could not be checked last time (so agent-failover logs it once).
+# Deleting it when damaged forgets each agent's first login (no switch back), its recent moves (the ping-pong guard)
+# and when it was last moved or switched by hand, and starts any open stretch again with a new first mail.
+STATE = jsonfile.JsonFile(config.STATE_DIR / "failover.json", jsonfile.PLAIN, 1)
 
 
 def settings(cfg):
@@ -91,22 +112,6 @@ def pinned(sess, f):
 
 
 # ------------------------------------------------------------------ reading a session (pure where possible)
-def home_dir(sess):
-    return Path(sess["config_dir"]) if sess.get("config_dir") else registry.DEFAULT_CLAUDE_HOME
-
-
-def transcript(sess):
-    """The session's transcript under its own login, or None."""
-    hits = sorted(home_dir(sess).glob("projects/*/%s.jsonl" % sess["id"]), key=lambda p: p.stat().st_mtime)
-    return hits[-1] if hits else None
-
-
-def read_tail(path, nbytes):
-    with open(path, "rb") as fh:
-        fh.seek(max(0, os.path.getsize(path) - nbytes))
-        return fh.read().decode("utf-8", "replace").splitlines()
-
-
 def entry_text(d):
     content = (d.get("message") or {}).get("content")
     if isinstance(content, list):
@@ -120,71 +125,60 @@ def credits_model(text):
     return m.group(1).strip() if m else None
 
 
+def auto_continue_at(text, at):
+    """The epoch of the local time in "continuing automatically at 4:30pm": the first such time after `at`, the
+    epoch of the line. None when the line gives no time of day this reads."""
+    m = AUTO_CONTINUE.search(text)
+    if not (m and at):
+        return None
+    hour = int(m.group(1)) % 12 + (12 if m.group(3) == "pm" else 0)
+    t = datetime.datetime.fromtimestamp(at).replace(hour=hour, minute=int(m.group(2) or 0), second=0, microsecond=0)
+    if t.timestamp() <= at:
+        t += datetime.timedelta(days=1)
+    return t.timestamp()
+
+
+def limit_record(d):
+    """Claude Code's own record of a limit stopping a turn, read from one transcript entry, its reset past or not:
+    {"window": "five_hour" | "seven_day" | ... | "model_credits" | "plan" (a "Usage limit reached" line),
+    "resets_at": epoch or None, "at": epoch of the record, "model": "Fable 5.1" (credits only), "text": ...}.
+    None for any other entry."""
+    at = usage.iso_epoch(d.get("timestamp"))
+    if d.get("type") == "system" and d.get("subtype") == "informational":
+        text = str(d.get("content") or "")
+        if not text.startswith(LIMIT_NOTICE):
+            return None
+        return {"window": "plan", "resets_at": auto_continue_at(text, at), "at": at, "text": text[:160]}
+    if not (d.get("type") == "assistant" and d.get("isApiErrorMessage")):
+        return None
+    text = entry_text(d)
+    q = d.get("quotaLimits") or {}
+    if d.get("error") == "rate_limit" and q.get("status") == "rejected":
+        return {"window": q.get("rateLimitType") or "limit", "resets_at": q.get("resetsAt"), "at": at,
+                "text": text[:160]}
+    if d.get("apiError") == CREDITS_ERROR or text.startswith(CREDITS_TEXT):
+        return {"window": "model_credits", "resets_at": None, "at": at, "model": credits_model(text),
+                "text": text[:160]}
+    return None
+
+
 def limit_hit(lines, now=None):
-    """The limit that stopped this session, if its last conversation entry is Claude Code's record of one and
-    the reset is not known to be past: {"window": "five_hour" | "model_credits", "resets_at": epoch or None,
-    "at": epoch of the record, "model": "Fable 5.1" (credits only), "text": ...}. None otherwise."""
+    """The limit that stopped this session: its latest limit_record, if no good reply came after it and its reset
+    is not known to be past. User lines after it do not matter. None otherwise."""
     now = time.time() if now is None else now
     for line in reversed(lines):
         try:
             d = json.loads(line)
         except ValueError:
             continue
-        if d.get("type") not in ("assistant", "user") or d.get("isMeta"):
-            continue
-        if not (d.get("type") == "assistant" and d.get("isApiErrorMessage")):
-            return None
-        text = entry_text(d)
-        at = usage.iso_epoch(d.get("timestamp"))
-        q = d.get("quotaLimits") or {}
-        if d.get("error") == "rate_limit" and q.get("status") == "rejected":
-            resets = q.get("resetsAt")
-            if resets and resets <= now:
+        hit = limit_record(d)
+        if hit:
+            if hit["resets_at"] and hit["resets_at"] <= now:
                 return None   # reset already: Claude Code's own auto-continue (or the next input) carries on
-            return {"window": q.get("rateLimitType") or "limit", "resets_at": resets, "at": at, "text": text[:160]}
-        if d.get("apiError") == CREDITS_ERROR or text.startswith(CREDITS_TEXT):
-            return {"window": "model_credits", "resets_at": None, "at": at, "model": credits_model(text),
-                    "text": text[:160]}
-        return None
+            return hit
+        if d.get("type") == "assistant" and not d.get("isApiErrorMessage") and not d.get("isMeta"):
+            return None       # a good reply since the latest limit record
     return None
-
-
-def session_model(lines):
-    """The model of the last real reply in these transcript lines ("claude-fable-5-1"), or None. Error records
-    say "<synthetic>"."""
-    for line in reversed(lines):
-        if '"assistant"' not in line:
-            continue
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
-        model = (d.get("message") or {}).get("model") if d.get("type") == "assistant" else None
-        if model and not model.startswith("<"):
-            return model
-    return None
-
-
-def transcript_flags(lines):
-    """--model, --effort and --permission-mode as the transcript last recorded them: what a background session
-    resumes with, since its process (a daemon's spare) has none on its command line."""
-    model, effort, mode = session_model(lines), None, None
-    for line in reversed(lines):
-        if effort and mode:
-            break
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
-        if not mode and d.get("type") == "permission-mode":
-            mode = d.get("permissionMode")
-        if not effort and d.get("type") == "assistant":
-            effort = d.get("perTurnEffort") or d.get("effort")
-    out = []
-    for flag, value in (("--model", model), ("--effort", effort), ("--permission-mode", mode)):
-        if value:
-            out += [flag, value]
-    return out
 
 
 VALUE_FLAGS = ("--model", "--effort", "--permission-mode", "--agent")
@@ -208,28 +202,6 @@ def relaunch_flags(argv):
     return out
 
 
-def background_jobs(pid, ppids=None):
-    """The Bash-tool commands a claude process is running in the background: [{"pid", "command", "output"}].
-    They are its children that eval a command (MCP servers and other helpers are not); stdout is the task's
-    output file. An agent between turns has no foreground command, so every one of these is a background job."""
-    if ppids is None:
-        from . import memcap
-        ppids = memcap.parents()
-    jobs = []
-    for child in sorted(p for p, pp in ppids.items() if pp == pid):
-        m = re.search(r"eval '(.*)' < /dev/null", " ".join(cmdline(child)), re.S)
-        if not m:
-            continue
-        try:
-            out = os.readlink("/proc/%d/fd/1" % child)
-        except OSError:
-            out = ""
-        cmd = m.group(1).replace("'\"'\"'", "'").replace("'\\''", "'")   # Claude Code's two quote escapes
-        jobs.append({"pid": child, "command": cmd[:200],
-                     "output": out if out.startswith("/") else ""})
-    return jobs
-
-
 def jobs_note(jobs, killed):
     if not jobs:
         return ""
@@ -244,10 +216,9 @@ def jobs_note(jobs, killed):
 
 
 def stop_jobs(jobs):
-    from . import memcap
-    ppids = memcap.parents()
+    ppids = procs.parents()
     for j in jobs:
-        for p in reversed(memcap.tree(j["pid"], ppids)):
+        for p in reversed(procs.tree(j["pid"], ppids)):
             try:
                 os.kill(p, signal.SIGTERM)
             except OSError:
@@ -273,15 +244,15 @@ def override_flags(flags, overrides):
     return out
 
 
-def pane_id(sess):
-    """'%17' from the registry's tmux field ('name:@7.%17'), or None."""
-    m = re.search(r"(%\d+)$", sess.get("tmux") or "")
-    return m.group(1) if m else None
-
-
 # ------------------------------------------------------------------ deciding (pure)
 def recent_moves(entry, now, window=3600):
     return [m for m in (entry or {}).get("moves", []) if now - m[0] < window]
+
+
+def last_move(entry):
+    """When this agent was last moved (record) or switched by hand (switched_by_hand), as an epoch; 0 for never."""
+    entry = entry or {}
+    return max([m[0] for m in entry.get("moves", [])] + [entry.get("switched_at", 0)])
 
 
 def stuck_key(hit):
@@ -289,26 +260,57 @@ def stuck_key(hit):
     return hit.get("resets_at") or hit.get("at") or hit.get("text")
 
 
-def best_other(snaps, cfg, current, now=None, model=None):
-    """The first Claude login in usage.order, other than `current`, with headroom for `model` (default: the
-    spawn model). None if there is none."""
+def where(login, model=None):
+    """How a move's note names where the agent went: "login 'work'", and its new model when it changes."""
+    return "login '%s'" % login + (" on model %s" % model if model else "")
+
+
+def models_from(cfg, model, manual):
+    """(models, bills) for an agent that started on `model`: the models it may be moved onto, best first (that model
+    and each after it in config.claude_model_order), and True, as it may then go where it bills extra usage on the
+    last of them; or only its own model and False when it was switched by hand or `model` is not on that list."""
+    models = config.claude_model_order(cfg)
+    if manual or model not in models:
+        return [model], False
+    return models[models.index(model):], True
+
+
+def next_place(snaps, cfg, current, model, models, now=None, bills=False):
+    """(login, model, passed over): the first place with headroom, each Claude login in usage.order on models[0], then
+    each on models[1] and so on, other than the agent's own (`current`, `model`); else, with `bills`, the first one
+    usage.last_resort allows; else (None, None, passed). passed: "login: why" for each place skipped (not set up,
+    used up, or its usage could not be read)."""
     s = usage.settings(cfg)
-    model = model or cfg.get("spawn_claude_model")
-    for t in usage.ranked(s):
-        if not t.startswith("claude:") or t == "claude:" + current:
+    passed, ready = [], {}
+    rungs = usage.places(s, models, None)
+    for t, m in rungs:
+        acct = usage.account_of(t)
+        if acct is None or (acct, m) == (current, model):
             continue
-        acct = t.split(":", 1)[1]
-        if not usage.account_ready(usage.account(s, acct))[0]:
+        name = acct if len(models) == 1 else "%s on %s" % (acct, m)
+        if acct not in ready:
+            ready[acct] = accounts.account_ready(accounts.account(s, acct))
+        if not ready[acct][0]:
+            passed.append("%s: %s" % (name, ready[acct][1]))
             continue
-        if usage.assess(snaps.get(t) or {"windows": []}, s, model, now)["status"] == "ok":
-            return acct
-    return None
+        a = usage.assess(snaps.get(t) or {"windows": []}, s, m, now)
+        if a["status"] == "ok":
+            return acct, m, passed
+        passed.append("%s: %s" % (name, "; ".join(a["why"]) or a["status"]))
+    if bills:
+        for t, m in rungs:
+            acct = usage.account_of(t)
+            if acct and (acct, m) != (current, model) and ready.get(acct, (False,))[0] \
+                    and usage.last_resort(snaps.get(t) or {}, m, models):
+                return acct, m, passed
+    return None, None, passed
 
 
-def rank(cfg, acct):
+def rank(cfg, acct, model, models):
+    """Where (acct, model) comes among the places of `models` (models_from): lower is better."""
     order = usage.ranked(usage.settings(cfg))
-    t = "claude:" + acct
-    return order.index(t) if t in order else len(order)
+    t = usage.claude_target(acct)
+    return (models.index(model) if model in models else len(models), order.index(t) if t in order else len(order))
 
 
 def model_window(snap, model):
@@ -325,11 +327,29 @@ def credits_hit(hit, snap, model, now):
     w = model_window(snap, model)
     if not w:
         return hit   # no per-model window known (or usage unread): the transcript is the only verdict
-    resets = w.get("resets_at")
-    if w["remaining_pct"] > 0 and resets and hit.get("at") and hit["at"] < resets - MODEL_WINDOW_SECONDS:
+    last = usage.claude_last_reset(w)
+    if w["remaining_pct"] > 0 and last and hit.get("at") and hit["at"] < last:
         return None  # written before the window's last reset, and it has headroom now: the next input carries on
-    return dict(hit, resets_at=resets if w["remaining_pct"] <= 0 else None,
+    return dict(hit, resets_at=w.get("resets_at") if w["remaining_pct"] <= 0 else None,
                 window_name=w.get("name") or "model window")
+
+
+def reset_from_usage(hit, snap, model):
+    """A limit record that gives no reset time (a "Usage limit reached" line with no time this reads), read against
+    the login's counted windows: the hit with the name and reset of the used-up window that resets last. With none
+    used up, None when the record is older than the latest of their last resets (usage.claude_last_reset): the
+    window that ran out has reset since, so the next input carries on. Unchanged otherwise, and when usage is
+    unread (the transcript is then the only verdict)."""
+    windows = [w for w in (snap or {}).get("windows") or [] if usage.counted(w, model)]
+    out = [w for w in windows if w["remaining_pct"] <= 0]
+    if not out:
+        last = max(filter(None, map(usage.claude_last_reset, windows)), default=None)
+        return None if last and hit.get("at") and hit["at"] < last else hit
+    timed = [w for w in out if w.get("resets_at")]
+    if not timed:
+        return hit
+    w = max(timed, key=lambda w: w["resets_at"])
+    return dict(hit, window=w["name"], resets_at=w["resets_at"])
 
 
 def limit_why(hit, now):
@@ -341,10 +361,16 @@ def limit_why(hit, now):
     return "%s limit, resets %s" % (hit["window"].replace("_", "-"), usage.fmt_reset(hit["resets_at"], now))
 
 
+def bills_extra(snap, s, model, now):
+    """Whether an agent running `model` on the login of this usage snapshot bills extra usage: the login's extra usage
+    is on and a window counted for the model is used up (usage.assess)."""
+    return bool((snap.get("extra_usage") or {}).get("enabled")) and usage.assess(snap, s, model, now)["status"] == "out"
+
+
 def decide(sessions, limits, snaps, state, cfg, now):
     """-> (moves, notes). moves: [{"session", "to", "reason", "prompt", "resets_at"}]; notes: lines to log once.
-    sessions: live Claude sessions movable here, each with the "model" it runs if known; limits: {session id:
-    limit_hit(...)}."""
+    sessions: live Claude sessions movable here, each with the "model" of its last reply if known and that reply's
+    time ("model_at"); limits: {session id: limit_hit(...)}."""
     f = settings(cfg)
     s = usage.settings(cfg)
     moves, notes = [], []
@@ -352,11 +378,35 @@ def decide(sessions, limits, snaps, state, cfg, now):
         sid, cur = sess["id"], sess.get("account")
         model = sess.get("model") or cfg.get("spawn_claude_model")
         entry = (state.get("sessions") or {}).get(sid) or {}
-        if cur is None or len(recent_moves(entry, now)) >= f["max_moves_per_hour"]:
+        if cur is None:
             continue
+        if entry.get("model") and entry.get("current") == cur and (sess.get("model_at") or 0) < last_move(entry):
+            model = entry["model"]   # moved onto it, with no reply since: the transcript still shows the old one
+        # the place it started on (its first move's origin), and where it may go: from that model down
+        home, home_model = entry.get("home"), entry.get("home_model") or model
+        models, bills = models_from(cfg, home_model, "switched_at" in entry)
+
+        def move(to, to_model, reason, limit, resets_at):
+            """A move to (to, to_model); `limit` is why its limit moves it (its prompt says so), None for none."""
+            changed = to_model if to_model != model else None
+            return {"session": sess, "to": to, "model": changed, "from_model": model, "resets_at": resets_at,
+                    "reason": reason + (" (model %s)" % changed if changed else ""),
+                    "prompt": None if limit is None else LIMIT_PROMPT.format(src=cur, dst=where(to, changed),
+                                                                             why=limit)}
         hit = limits.get(sid)
+        if hit and hit.get("at") and hit["at"] < last_move(entry):
+            hit = None   # the login it left: still the latest record until the resumed agent's first reply
         if hit and hit["window"] == "model_credits":
-            hit = credits_hit(hit, snaps.get("claude:" + cur), model, now)
+            hit = credits_hit(hit, snaps.get(usage.claude_target(cur)), model, now)
+        elif hit and not hit["resets_at"]:
+            hit = reset_from_usage(hit, snaps.get(usage.claude_target(cur)), model)
+        moved = len(recent_moves(entry, now))
+        if moved >= f["max_moves_per_hour"]:
+            if hit and entry.get("stuck_until") != stuck_key(hit):
+                notes.append((sid, stuck_key(hit), "%s (%s) hit its limit on %s (%s) but was moved %d times in the "
+                              "last hour, the most failover.max_moves_per_hour allows; it waits" % (
+                                  sess.get("name") or sid[:8], sid[:8], cur, limit_why(hit, now), moved)))
+            continue
         if pinned(sess, f):
             if hit and entry.get("stuck_until") != stuck_key(hit):
                 notes.append((sid, stuck_key(hit), "%s (%s) hit its limit on %s (%s); it is pinned there"
@@ -364,129 +414,187 @@ def decide(sessions, limits, snaps, state, cfg, now):
                                                                                  limit_why(hit, now))))
             continue
         if hit:
-            dst = best_other(snaps, cfg, cur, now, model)
+            dst, dst_model, passed = next_place(snaps, cfg, cur, model, models, now, bills)
             why = limit_why(hit, now)
             if dst:
-                moves.append({"session": sess, "to": dst, "reason": "limit: " + why, "resets_at": hit["resets_at"],
-                              "prompt": LIMIT_PROMPT.format(src=cur, dst=dst, why=why)})
+                moves.append(move(dst, dst_model, "limit: " + why, why, hit["resets_at"]))
             elif entry.get("stuck_until") != stuck_key(hit):
                 notes.append((sid, stuck_key(hit), "%s (%s) hit its limit on %s (%s) and no other Claude login has "
-                              "headroom for %s; it waits for the reset" % (sess.get("name") or sid[:8], sid[:8], cur,
-                                                                         why, model)))
+                              "headroom for %s%s%s; it waits for the reset" % (
+                                  sess.get("name") or sid[:8], sid[:8], cur, why, " or ".join(map(str, models)),
+                                  (" (%s)" % "; ".join(passed)) if passed else "",
+                                  ", and none bills extra usage for %s" % models[-1] if bills else "")))
             continue
         idle = sess.get("status") == "idle" and not sess.get("waiting_for") and \
             now - (sess.get("updated_at") or now) >= f["idle_seconds"]
         if not (f["switch_back"] and idle):
             continue
-        home = entry.get("home")
-        if home and home != cur and now >= (entry.get("resets_at") or 0) and rank(cfg, home) < rank(cfg, cur):
-            if usage.assess(snaps.get("claude:" + home) or {"windows": []}, s, model, now)["status"] == "ok":
-                moves.append({"session": sess, "to": home, "reason": "switch back: %s has reset" % home,
-                              "prompt": None, "resets_at": None})
+        if home and (home, home_model) != (cur, model) and now >= (entry.get("resets_at") or 0) \
+                and rank(cfg, home, home_model, models) < rank(cfg, cur, model, models):
+            if usage.assess(snaps.get(usage.claude_target(home)) or {"windows": []}, s, home_model, now)["status"] == "ok":
+                moves.append(move(home, home_model, "switch back: %s has reset" % home, None, None))
                 continue
-        snap = snaps.get("claude:" + cur) or {"windows": []}
-        if usage.assess(snap, s, model, now)["status"] == "out" and (snap.get("extra_usage") or {}).get("enabled"):
-            dst = best_other(snaps, cfg, cur, now, model)
+        snap = snaps.get(usage.claude_target(cur)) or {"windows": []}
+        if bills_extra(snap, s, model, now):
+            dst, dst_model, _ = next_place(snaps, cfg, cur, model, models, now)
             if dst:
-                moves.append({"session": sess, "to": dst, "reason": "rebalance: %s %s" % (cur, REBALANCE_WHY),
-                              "prompt": None, "resets_at": None})
+                moves.append(move(dst, dst_model, "rebalance: %s %s" % (cur, REBALANCE_WHY), None, None))
     return moves, notes
 
 
 def record(state, move, now):
-    """The state after a successful move. `home` is the first login the agent was moved off."""
-    st = json.loads(json.dumps(state or {}))
+    """The state after a successful move. `home` and `home_model` are the login and model the agent was first moved
+    off; `resets_at` is when the limit that moved it off them resets."""
+    st = copy.deepcopy(state or {})
     sid = move["session"]["id"]
+    src, src_model = move["session"].get("account"), move.get("from_model")
     entry = st.setdefault("sessions", {}).setdefault(sid, {})
-    entry.setdefault("home", move["session"].get("account"))
+    entry.setdefault("home", src)
+    if not entry.get("home_model"):   # its first move; or a record from before moves changed models, whose model
+        entry["home_model"] = src_model   # has never changed
     entry["current"] = move["to"]
+    entry["model"] = move.get("model") or src_model
     entry["name"] = move["session"].get("name") or ""
-    if move.get("resets_at"):
+    if move.get("resets_at") and (src, src_model) == (entry["home"], entry["home_model"]):
         entry["resets_at"] = move["resets_at"]
-    entry["moves"] = recent_moves(entry, now, 86400) + [[now, move["session"].get("account"), move["to"], move["reason"]]]
-    if entry["home"] == move["to"]:
+    entry["moves"] = recent_moves(entry, now, 86400) + [[now, src, move["to"], move["reason"]]]
+    if (entry["home"], entry["home_model"]) == (move["to"], entry["model"]):
         entry.pop("resets_at", None)
     return st
 
 
+def switched_by_hand(state, sid, now):
+    """The state after agent-switch switched session sid by hand at `now`. That is the owner's choice, so the agent's
+    record is forgotten: no move back to its first login, and its earlier moves no longer count toward
+    max_moves_per_hour (nor does the switch). Only the switch's time is kept: for last_move, so a limit record from
+    before the switch belongs to the login it left, and as the mark that keeps the agent on its model
+    (models_from)."""
+    st = copy.deepcopy(state or {})
+    st.setdefault("sessions", {})[sid] = {"switched_at": now}
+    return st
+
+
+# ------------------------------------------------------------------ extra-usage spend (pure)
+SPEND_ALERT = "extra-usage"   # the alerts.send_alert kind of the mails spend_watch writes (spend_alert)
+
+
+def spend_unreadable(snap):
+    """Why a login's usage reading cannot say who bills extra usage and how much, or None when it can: it must be a
+    fresh reading (not the stale fallback of a failed read) with windows, the login's extra-usage state and, while
+    extra usage is on, its spend this month."""
+    if not snap:
+        return "its usage was not read"
+    if snap.get("stale"):
+        return "its usage read failed (%s), leaving only an older reading" % snap.get("error")
+    if not snap.get("windows"):
+        return "its usage read failed (%s)" % (snap.get("error") or "no windows")
+    if snap.get("extra_usage") is None:
+        return "its reading has no extra-usage state"
+    if snap["extra_usage"]["enabled"] and snap["extra_usage"].get("used") is None:
+        return "its reading has no extra-usage spend"
+    return None
+
+
+def spend_alert(kind, login, st, eu, detail, cfg, now):
+    """(alert kind, key, subject, body) of one spend_watch mail about stretch st on login, whose extra_usage reading is
+    eu: kind "start" (detail: why its agents bill), "step", or "end" (detail: what ended it). The key is unique to the
+    stretch and its point, so alerts.send_alert sends each mail once."""
+    def money(v):
+        return usage.money(v, st["currency"])
+    agents = ", ".join(st["agents"])
+    month = "Extra usage on %s this month: %s." % (login, usage.extra_spend(eu))
+    nxt = ("You will get another mail at each further %s they spend, and one with the total when they stop."
+           % money(settings(cfg)["spend_step"]))
+    since = usage.fmt_reset(st["since"], now)
+    if kind == "start":
+        n = len(st["agents"])
+        who = ("%d agents" % n, "bill", "are") if n > 1 else ("1 agent", "bills", "is")
+        subject = "%s now %s extra usage on Claude login %s" % (who[0], who[1], login)
+        body = ("%s %s running on the Claude login %s, whose %s. Its extra usage is on, so their work is now paid for "
+                "as extra usage.\n\n%s\n\nAgents on it: %s.\n\n%s"
+                % (who[0], who[2], login, detail, month, agents, nxt))
+    elif kind == "step":
+        subject = "%s of extra usage spent on Claude login %s since %s" % (money(st["spent"]), login, since)
+        body = ("Agents on the Claude login %s have spent %s of extra usage since %s, when they started billing it."
+                "\n\n%s\n\nStill on it: %s.\n\n%s" % (login, money(st["spent"]), since, month, agents, nxt))
+    else:
+        subject = "Agents stopped billing extra usage on Claude login %s: %s spent" % (login, money(st["spent"]))
+        body = ("No agent bills extra usage on the Claude login %s any more: %s. From %s to %s they spent %s of extra "
+                "usage.\n\n%s" % (login, detail, since, usage.fmt_reset(now, now), money(st["spent"]), month))
+    return SPEND_ALERT, "%s:%s:%d:%s" % (login, kind, st["since"], st["mailed"]), subject, body
+
+
+def used_up_text(snap, models, now):
+    """Which of the login's windows counted for these models are used up (usage.used_up), and until when: "5-hour
+    window is used up until 16:30" (the windows joined with "and")."""
+    gone = {w["name"]: w for m in sorted(models) for w in usage.used_up(snap, m)}
+    return " and ".join("%s window is used up until %s" % (name, usage.fmt_reset(w.get("resets_at"), now))
+                        for name, w in gone.items())
+
+
+def spend_watch(sessions, snaps, state, cfg, now):
+    """What the owner hears about extra usage: ([(login, stretch, mail)] for each Claude login with live agents or an
+    open stretch whose usage reading can tell, {login: why} for the others (spend_unreadable)). A stretch opens when
+    a live agent on the login bills extra usage (bills_extra) and ends when none does: its agents have left, its
+    window has reset or its extra usage was turned off. stretch is the login's new record for state "spend" (None
+    once it has ended): when it began ("since"), the month's spend at the last reading ("last_used"), the stretch's
+    spend ("spent", which counts on from zero when a new month resets the month's spend), the spend its last step
+    mail marked ("mailed"), the currency, and the agents billing (their names, and their session ids in "ids"). mail
+    is spend_alert's (kind, key, subject, body), or None when there is nothing to say. sessions: the live Claude
+    sessions, each with the "model" it runs if known."""
+    f, s = settings(cfg), usage.settings(cfg)
+    on = {}
+    for x in sessions:
+        if x.get("account"):
+            on.setdefault(x["account"], []).append(x)
+    stretches = state.get("spend") or {}
+    out, unreadable = [], {}
+    for login in sorted(set(on) | set(stretches)):
+        snap = snaps.get(usage.claude_target(login))
+        why_not = spend_unreadable(snap)
+        if why_not:
+            unreadable[login] = why_not
+            continue
+        models = {x["id"]: x.get("model") or cfg.get("spawn_claude_model") for x in on.get(login, [])}
+        billing = [x for x in on.get(login, []) if bills_extra(snap, s, models[x["id"]], now)]
+        names, ids = sorted(x.get("name") or x["id"][:8] for x in billing), sorted(x["id"] for x in billing)
+        eu = snap["extra_usage"]
+        old = stretches.get(login)
+        if old is None:
+            if billing:   # extra usage is on, so the reading has its spend (spend_unreadable)
+                st = {"since": now, "last_used": eu["used"], "spent": 0.0, "mailed": 0.0, "currency": eu["currency"],
+                      "agents": names, "ids": ids}
+                why = used_up_text(snap, {models[x["id"]] for x in billing}, now)
+                out.append((login, st, spend_alert("start", login, st, eu, why, cfg, now)))
+            continue
+        if eu.get("used") is None:   # only with extra usage off (spend_unreadable): the last reading stands
+            eu = dict(eu, used=old["last_used"])
+        used = eu["used"]
+        grew = used - old["last_used"] if used >= old["last_used"] else used
+        st = dict(old, last_used=used, spent=round(old["spent"] + grew, 2), agents=names, ids=ids)
+        if not billing:
+            here = {x["id"] for x in on.get(login, [])}
+            why = ("its extra usage was turned off" if not eu["enabled"] else
+                   "its used-up window has reset" if here & set(old["ids"]) else
+                   "no agent runs on it any more" if not here else "the agents that billed it have left")
+            out.append((login, None, spend_alert("end", login, st, eu, why, cfg, now)))
+            continue
+        steps = int((st["spent"] - st["mailed"]) // f["spend_step"])
+        st["mailed"] += steps * f["spend_step"]
+        out.append((login, st, spend_alert("step", login, st, eu, None, cfg, now) if steps else None))
+    return out, unreadable
+
+
+def keep_stretch(state, login, stretch):
+    """The state with login's stretch (spend_watch) kept under "spend", or dropped when stretch is None (it ended)."""
+    if stretch:
+        state.setdefault("spend", {})[login] = stretch
+    else:
+        state.setdefault("spend", {}).pop(login, None)
+    return state
+
+
 # ------------------------------------------------------------------ acting
-def tmux(*args, check=False, timeout=15):
-    return subprocess.run(["tmux"] + list(args), capture_output=True, text=True, timeout=timeout, check=check)
-
-
-def pane_pid(pane):
-    r = tmux("display-message", "-p", "-t", pane, "#{pane_pid}")
-    try:
-        return int(r.stdout.strip())
-    except ValueError:
-        return None
-
-
-def parent_pid(pid):
-    try:
-        return int(Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()[1])
-    except (OSError, IndexError, ValueError):
-        return None
-
-
-def cmdline(pid):
-    try:
-        return [a.decode(errors="replace") for a in Path("/proc/%d/cmdline" % pid).read_bytes().split(b"\0") if a]
-    except OSError:
-        return []
-
-
-def movable(sess):
-    """(handle, why not). handle is the tmux pane ('%17') whose shell started the agent's claude, or BG for a
-    Claude Code background session, which its login's daemon runs; None (and why) for anything else."""
-    if not sess.get("live") or not sess.get("pid"):
-        return None, "not live"
-    if sess.get("kind") == "bg":
-        return BG, ""
-    pane = pane_id(sess)
-    if not pane:
-        return None, "not in tmux"
-    shell, parent = pane_pid(pane), parent_pid(int(sess["pid"]))
-    if shell is None or parent is None:
-        return None, "pane or process gone"
-    if shell != parent:
-        return None, "claude is not the pane shell's child (not agent-spawn's layout)"
-    return pane, ""
-
-
-def copy_transcript(src, dst_home, sid):
-    """Copy the transcript (and its session folder) to the same project folder under dst_home. Refuses to
-    overwrite a newer copy there. Returns the new path."""
-    dst = Path(dst_home) / "projects" / src.parent.name / src.name
-    if dst.exists() and dst.stat().st_mtime > src.stat().st_mtime + 1:
-        raise RuntimeError("%s is newer than the transcript being moved; not overwriting it" % dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(src), str(dst))
-    folder = src.parent / sid
-    if folder.is_dir():
-        shutil.copytree(str(folder), str(dst.parent / sid), dirs_exist_ok=True)
-    return dst
-
-
-def wait_dead(pid, timeout=10.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.2)
-    return False
-
-
-def launch_line(claude, sid, name, flags, config_dir, prompt):
-    env = ("export CLAUDE_CONFIG_DIR=%s" % shlex.quote(config_dir)) if config_dir else "unset CLAUDE_CONFIG_DIR"
-    cmd = [claude, "--resume", sid] + (["--name", name] if name else []) + list(flags)
-    if prompt:
-        cmd.append(prompt)
-    return "stty sane; %s; %s" % (env, " ".join(shlex.quote(c) for c in cmd))
-
-
 def fill_flags(flags, defaults):
     """flags plus each of defaults [flag, value, ...] it does not set already (a skip-permissions flag counts as
     setting the permission mode)."""
@@ -500,166 +608,86 @@ def fill_flags(flags, defaults):
     return out
 
 
-def claude_env(config_dir):
-    """The environment for a claude command run for one login: that login's config dir (none: the default
-    login), and nothing inherited from a session this may run inside (agent-switch from an agent)."""
-    env = usage.claude_env({"config_dir": config_dir})
-    for k in list(env):
-        if k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_KIND") or k.startswith("CLAUDE_BG_"):
-            env.pop(k)
-    return env
-
-
-def bg_command(claude, sid, name, flags, prompt):
-    return [claude, "--resume", sid, "--bg"] + (["--name", name] if name else []) + list(flags) + \
-        ([prompt] if prompt else [])
-
-
-def bg_stop(claude, sess):
-    """`claude stop` for a background session, under its own login. (ok, output). It takes the short id that
-    `claude agents` lists; a full session id is "No job matching"."""
-    try:
-        r = subprocess.run([claude, "stop", sess["id"][:8]], capture_output=True, text=True, timeout=60,
-                           env=claude_env(sess.get("config_dir")))
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, "%s: %s" % (type(e).__name__, e)
-    return r.returncode == 0, (r.stdout + r.stderr).strip()[:300]
-
-
-def bg_saved_flags(config_dir, sid):
-    """The options a login's daemon saved for a background session it has run there (its jobs/<short id>/
-    state.json respawnFlags), or None if it has not run there. Given flags, `claude --resume ID --bg` on such a
-    login starts a copy under a new id ("keeps its own saved options"); with none it continues the session."""
-    home = Path(config_dir) if config_dir else registry.DEFAULT_CLAUDE_HOME
-    try:
-        d = json.loads((home / "jobs" / sid[:8] / "state.json").read_text())
-    except (OSError, ValueError):
-        return None
-    return list(d.get("respawnFlags") or [])
-
-
-def flag(flags, name):
-    for i, f in enumerate(flags):
-        if f == name and i + 1 < len(flags):
-            return flags[i + 1]
-        if f.startswith(name + "="):
-            return f.split("=", 1)[1]
-    return None
-
-
-COPY_RE = re.compile(r"started a copy as ([0-9a-f]{8})")
-
-
-def bg_resume(claude, sess, flags, config_dir, prompt):
-    """`claude --resume ID --bg` under config_dir, in the session's folder. (ok, output). A login whose daemon has
-    run the session before gets no flags (see bg_saved_flags); if claude starts a copy anyway, the copy is
-    stopped and the session resumed once more with no flags."""
-    cwd = sess.get("cwd") if sess.get("cwd") and os.path.isdir(sess["cwd"]) else None
-    name = sess.get("name")
-    if bg_saved_flags(config_dir, sess["id"]) is not None:
-        flags, name = [], None   # --name is a flag too: the saved options keep its name
-    out = ""
-    for a_flags, a_name in [(flags, name)] + ([([], None)] if flags or name else []):
-        try:
-            r = subprocess.run(bg_command(claude, sess["id"], a_name, a_flags, prompt),
-                               capture_output=True, text=True, timeout=120, cwd=cwd, env=claude_env(config_dir))
-        except (OSError, subprocess.SubprocessError) as e:
-            return False, "%s: %s" % (type(e).__name__, e)
-        said = " ".join((r.stdout + r.stderr).split())
-        copy = COPY_RE.search(said)
-        # its "backgrounded · ID · name" and "note: ..." lines; the rest is a usage hint
-        out = " ".join(ln.strip() for ln in (r.stdout + r.stderr).splitlines()
-                       if ln.strip().startswith(("backgrounded", "note:"))) or said[:300]
-        if r.returncode != 0:
-            return False, out
-        if not copy:
-            break
-        if a_flags or a_name:   # it started a copy because of the flags: drop the copy, resume the session itself
-            for verb in ("stop", "rm"):
-                subprocess.run([claude, verb, copy.group(1)], capture_output=True, text=True, timeout=60,
-                               env=claude_env(config_dir))
-            continue
-        return False, "claude resumed it as a copy (%s), which is left running: %s" % (copy.group(1), out)
-    return True, out
-
-
 def bg_launch(claude, sess, flags, config_dir, prompt, cfg):
     """Resume a background session under config_dir (bg_resume), then move the daemon out of this process's
-    cgroup (and the session into its own capped scope), as agent-send does for a resume. (ok, output)."""
-    ok, out = bg_resume(claude, sess, flags, config_dir, prompt)
+    cgroup (and the session into its own capped scope), as agent-send does for a resume. (ok, output). A cap
+    config does not allow (memcap.limits) leaves the scope uncapped, and the output says why."""
+    ok, out = claude_session.bg_resume(claude, sess, flags, config_dir, prompt)
     if not ok:
         return False, out
-    from . import memcap
     try:
-        props = memcap.limits(cfg)
-    except ValueError:
-        props = {}
-    want = usage.expand(config_dir) if config_dir else None
+        props, uncapped = memcap.limits(cfg), ""
+    except ValueError as e:
+        props, uncapped = {}, "uncapped: %s; " % e
 
     def live_pid():
-        return next((x["pid"] for x in registry.claude_sessions()
-                     if x["id"] == sess["id"] and x["live"] and (x.get("config_dir") or None) == want), None)
-    return True, out + "; memory: " + memcap.cap_bg_session(sess["id"], sess.get("name") or sess["id"][:8], props,
-                                                             session_pid=live_pid)
+        return next((x["pid"] for x in registry.live_on(config_dir) if x["id"] == sess["id"]), None)
+    return True, out + "; memory: " + uncapped + memcap.cap_bg_session(sess["id"], sess.get("name") or sess["id"][:8],
+                                                                       props, session_pid=live_pid)
 
 
 def migrate(sess, to, prompt, cfg, trust=None, claude=None, dry_run=False, why="", overrides=None):
-    """Move one live agent to login `to`. Returns (ok, detail). Never leaves it without a launch attempt once
-    its process has been stopped. `why` names the reason in the note sent when only background jobs need one."""
+    """Move one live agent to login `to`. Returns (ok, detail); once its process has been stopped, the detail ends
+    with the background jobs the move stopped or left running. Never leaves it without a launch attempt once its
+    process has been stopped. `why` names the reason in the note sent when only background jobs need one."""
     f = settings(cfg)
     s = usage.settings(cfg)
-    acct = usage.account(s, to)
-    ready, not_ready = usage.account_ready(acct)
+    acct = accounts.account(s, to)
+    ready, not_ready = accounts.account_ready(acct)
     if not ready:
         return False, "login %s not ready: %s" % (to, not_ready)
-    pane, not_movable = movable(sess)
+    pane, not_movable = claude_session.movable(sess)
     if not pane:
         return False, "not moved: %s" % not_movable
-    bg = pane == BG
-    src = transcript(sess)
+    bg = pane == claude_session.BG
+    src = claude_session.transcript(sess)
     if not src:
-        return False, "not moved: no transcript under %s" % home_dir(sess)
+        return False, "not moved: no transcript under %s" % registry.claude_home(sess.get("config_dir"))
     pid = int(sess["pid"])
     claude = claude or registry.claude_bin() or "claude"
-    dst_dir = usage.expand(acct.get("config_dir"))
-    flags = relaunch_flags(cmdline(pid))   # now: its command line goes with it
+    dst_dir = accounts.expand(acct.get("config_dir"))
+    flags = relaunch_flags(procs.cmdline(pid))   # now: its command line goes with it
     if bg:   # a daemon's spare names no flags: take what the transcript last recorded
-        flags = fill_flags(flags, transcript_flags(read_tail(src, f["tail_bytes"])))
+        flags = fill_flags(flags, claude_session.transcript_flags(jsonfile.read_tail(src, f["tail_bytes"])))
     base, flags = flags, override_flags(flags, overrides)
-    saved = bg_saved_flags(dst_dir, sess["id"]) if bg else None
+    saved = claude_session.bg_saved_flags(dst_dir, sess["id"]) if bg else None
     if saved is not None:   # that daemon resumes it with these, whatever is asked
         asked = [(k, v) for k, v in (overrides or {}).items()
-                 if v is not None and v != flag(base, k) and v != flag(saved, k)]
+                 if v is not None and v != commands.flag_value(base, k) and v != commands.flag_value(saved, k)]
         if asked:
             return False, ("not moved: login %s's claude daemon has run this background session before and resumes "
                            "it there with its saved options (%s), so %s cannot be changed by moving it; use /model "
                            "inside the session" % (to, " ".join(saved) or "none",
                                                     " and ".join("%s %s" % (k[2:], v) for k, v in asked)))
         flags = []
-    same_login = (usage.expand(sess.get("config_dir")) or None) == (dst_dir or None)
-    jobs = background_jobs(pid)
+    same_login = (accounts.expand(sess.get("config_dir")) or None) == (dst_dir or None)
+    jobs = claude_session.background_jobs(pid)
     kill_jobs = bg or f["background"] == "kill"   # `claude stop` ends a background session's jobs
     if jobs:   # the agent must hear about them, even on a move that would otherwise send no prompt
-        prompt = (prompt or NO_PROMPT_JOBS.format(dst=to, why=why or "moved")) + jobs_note(jobs, kill_jobs)
+        prompt = (prompt or NO_PROMPT_JOBS.format(dst=where(to, (overrides or {}).get("--model")),
+                                                  why=why or "moved")) + jobs_note(jobs, kill_jobs)
+    # what the move does to them, for its detail (the journal and the status log)
+    jobs_done = ("; its background jobs %s: pid %s" % ("stopped" if kill_jobs else "left running",
+                                                        ", ".join(str(j["pid"]) for j in jobs))) if jobs else ""
     if dry_run:
         if bg:
             how = "claude stop %s, copy %s to %s and run in %s: %sclaude %s" % (
-                sess["id"][:8], src.name, dst_dir or str(registry.DEFAULT_CLAUDE_HOME), sess.get("cwd") or ".",
+                sess["id"][:8], src.name, registry.claude_home(dst_dir), sess.get("cwd") or ".",
                 ("CLAUDE_CONFIG_DIR=%s " % dst_dir) if dst_dir else "",
-                " ".join(shlex.quote(c) for c in bg_command(claude, sess["id"], None if saved is not None else
-                                                            sess.get("name"), flags, prompt)[1:]))
+                " ".join(shlex.quote(c) for c in claude_session.bg_command(
+                    claude, sess["id"], None if saved is not None else sess.get("name"), flags, prompt)[1:]))
             if saved is not None:
                 how += " (no flags: that login's daemon resumes it with its saved options, %s)" % (" ".join(saved) or "none")
             return True, "would %s%s" % (how, (" (ending %d background job(s))" % len(jobs)) if jobs else "")
         return True, "would stop pid %d%s, copy %s to %s and type: %s" % (
             pid, (" and %d background job(s)" % len(jobs)) if kill_jobs and jobs else "", src.name,
-            dst_dir or str(registry.DEFAULT_CLAUDE_HOME),
-            launch_line(claude, sess["id"], sess.get("name"), flags, dst_dir, prompt))
+            registry.claude_home(dst_dir),
+            launch.claude_line(claude, sess["id"], sess.get("name"), flags, dst_dir, prompt, None))
     if bg:
-        stopped, out = bg_stop(claude, sess)
-        if not stopped and not wait_dead(pid, 1.0):
+        stopped, out = claude_session.bg_job(claude, "stop", sess["id"], sess.get("config_dir"))
+        if not stopped and not claude_session.wait_dead(pid, 1.0):
             return False, "not moved: claude stop failed: %s" % out
-        if not wait_dead(pid):
+        if not claude_session.wait_dead(pid):
             return False, "pid %d still running after claude stop (%s)" % (pid, out)
         stop_jobs(jobs)   # any that outlived the stop
     else:
@@ -669,69 +697,53 @@ def migrate(sess, to, prompt, cfg, trust=None, claude=None, dry_run=False, why="
             os.kill(pid, signal.SIGKILL)   # keeps the agent's background jobs alive; see the module docstring
         except ProcessLookupError:
             pass   # gone already: relaunching it is all that is left to do
-        if not wait_dead(pid):
-            return False, "pid %d did not exit after SIGKILL" % pid
+        if not claude_session.wait_dead(pid):
+            return False, "pid %d did not exit after SIGKILL%s" % (pid, jobs_done)
     registry.remove_dead_entry(sess)   # claude removes its own on exit; left, it is a second entry for this id
     detail = ""
     try:
         if not same_login:   # a model or effort change on the same login keeps the transcript where it is
-            copy_transcript(src, dst_dir or registry.DEFAULT_CLAUDE_HOME, sess["id"])
+            claude_session.copy_transcript(src, registry.claude_home(dst_dir), sess["id"])
         cwd = sess.get("cwd") or ""
         if trust and cwd and os.path.isdir(cwd):
             trust(cwd, dst_dir)
         if dst_dir and cwd and os.path.isdir(cwd):
-            usage.link_memory(repo_root(cwd), dst_dir)
+            accounts.link_memory(commands.repo_root(cwd), dst_dir, registry.DEFAULT_CLAUDE_HOME)
     except Exception as e:  # noqa: BLE001 - relaunch where it was rather than leave the agent stopped
+        detail = "moving it to %s failed (%s: %s); relaunched on %s instead" % (to, type(e).__name__, e,
+                                                                               sess.get("account"))
         to, dst_dir = sess.get("account"), sess.get("config_dir")
-        detail = "copy failed (%s: %s); relaunched on %s instead" % (type(e).__name__, e, to)
     if bg:
         launched, said = bg_launch(claude, sess, flags, dst_dir, prompt, cfg)
         if not launched:
-            return False, "%sclaude --resume --bg on %s failed: %s" % ((detail + "; ") if detail else "", to, said)
+            return False, "%sclaude --resume --bg on %s failed: %s%s" % ((detail + "; ") if detail else "", to, said,
+                                                                         jobs_done)
     else:
-        session = (sess.get("tmux") or "").split(":", 1)[0]
-        if session:
-            if dst_dir:
-                tmux("set-environment", "-t", session, "CLAUDE_CONFIG_DIR", dst_dir)
-            else:
-                tmux("set-environment", "-t", session, "-r", "CLAUDE_CONFIG_DIR")
-        tmux("send-keys", "-t", pane, "-l", launch_line(claude, sess["id"], sess.get("name"), flags, dst_dir, prompt))
-        time.sleep(0.3)
-        tmux("send-keys", "-t", pane, "Enter")
-    want = usage.expand(dst_dir) if dst_dir else None
-    deadline = time.time() + f["launch_wait_seconds"]
-    while time.time() < deadline:
-        live = [x for x in registry.claude_sessions() if x["id"] == sess["id"] and x["live"]]
-        if any((x.get("config_dir") or None) == want for x in live):
-            return not detail, detail or "moved %s to %s%s" % (sess.get("name") or sess["id"][:8], to,
-                                                               (" (%s)" % said) if bg else "")
-        time.sleep(1)
+        try:
+            launch.type_line(pane, launch.claude_line(claude, sess["id"], sess.get("name"), flags, dst_dir, prompt, None),
+                             dst_dir)
+        except commands.CommandError as e:
+            return False, "%srelaunching it in pane %s failed: %s%s" % ((detail + "; ") if detail else "", pane, e,
+                                                                        jobs_done)
+
+    def live():
+        return any(x["id"] == sess["id"] for x in registry.live_on(dst_dir))
+    if launch.wait_for(live, f["launch_wait_seconds"]):
+        return not detail, (detail or "moved %s to %s%s" % (sess.get("name") or sess["id"][:8], to,
+                                                            (" (%s)" % said) if bg else "")) + jobs_done
     shows = ("claude said: " + said) if bg else \
-        "pane shows: " + " | ".join(tmux("capture-pane", "-p", "-t", pane).stdout.strip().splitlines()[-3:])
-    return False, "%srelaunched on %s but not live after %ds; %s" % (
-        (detail + "; ") if detail else "", to, f["launch_wait_seconds"], shows[:300])
-
-
-def repo_root(path):
-    r = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=path, capture_output=True, text=True, timeout=15)
-    root = r.stdout.strip()
-    return str(Path(os.path.join(path, root)).resolve().parent) if r.returncode == 0 and root else str(Path(path).resolve())
+        "pane shows: " + " | ".join(
+            commands.tmux("capture-pane", "-p", "-t", pane, check=False).stdout.strip().splitlines()[-3:])
+    return False, "%srelaunched on %s but not live after %ds; %s%s" % (
+        (detail + "; ") if detail else "", to, f["launch_wait_seconds"], shows[:300], jobs_done)
 
 
 # ------------------------------------------------------------------ resuming an offline session
-def copies(sid):
-    """The session's transcript under each login, newest first: [(mtime, account, config_dir, path)]. A move leaves
-    a copy on every login the session ran on; only the newest holds the whole conversation."""
-    found = [(p.stat().st_mtime, acct, cdir, p) for acct, home, cdir in registry.claude_homes()
-             for p in home.glob("projects/*/%s.jsonl" % sid)]
-    return sorted(found, key=lambda c: c[0], reverse=True)
-
-
 def resume_login(newest, model, owner, snaps, cfg, now=None):
-    """(account, why): the login an offline session resumes on. agent-spawn's rule for a new Claude agent: the first
-    login in usage.order with headroom for its model and allowed for its repo's owner, or with every login low, the
-    one with the most left. With no usage known, or every login used up, it stays on `newest`, the login holding
-    its newest copy."""
+    """(account, why): the login an offline session resumes on, on the model it runs (usage.recommend for that model
+    alone, so a resume never changes its model): the first login in usage.order with headroom for it and allowed
+    for its repo's owner, or with every login low, the one with the most left. With no usage known, or every login
+    used up, it stays on `newest`, the login holding its newest copy."""
     rec = usage.recommend(snaps, cfg, models={"claude": model}, owner=owner, only_cli="claude", now=now)
     pick = next((c for c in rec["candidates"] if c["target"] == rec["use"]), None)
     if pick and pick["status"] in ("ok", "low"):
@@ -740,11 +752,14 @@ def resume_login(newest, model, owner, snaps, cfg, now=None):
 
 
 def place_resume(sess, cfg, trust=None, snaps=None, now=None, dry_run=False):
-    """Get an offline Claude session ready to resume on the best login (resume_login): (config_dir, note). Unless
-    that login holds the newest copy of the conversation, the copy goes there (with its session folder), and the
-    folder is trusted and its memory linked there, as a move does. A session with no transcript stays where it is;
-    a failed copy resumes where the newest copy is."""
-    found = copies(sess["id"])
+    """Get an offline Claude session ready to resume on the best login (resume_login): (config_dir, note). Reads
+    the logins' usage (usage.snapshots: a login whose read fails counts as usage unknown, and the note says so).
+    Unless the chosen login holds the newest copy of the conversation, the copy goes there (with its session
+    folder), and the folder is trusted and its memory linked there, as a move does. A session with no transcript
+    stays where it is. Raises, so that nothing is resumed: commands.CommandError when git cannot say who owns the
+    session's repo (accounts.repo_owner), ValueError or OSError for a usage cache that cannot be read or written,
+    and OSError, RuntimeError or ValueError when the copy, the trust or the memory link fails."""
+    found = registry.transcript_copies(sess["id"])
     if not found:
         return sess.get("config_dir"), ""
     _, src_acct, src_dir, src = found[0]
@@ -752,25 +767,20 @@ def place_resume(sess, cfg, trust=None, snaps=None, now=None, dry_run=False):
         return src_dir, "on login %s: pinned (failover.pinned), so where its newest copy is" % src_acct
     cwd = sess.get("cwd") or ""
     has_cwd = bool(cwd) and os.path.isdir(cwd)
-    model = session_model(read_tail(src, settings(cfg)["tail_bytes"])) or cfg.get("spawn_claude_model")
-    try:
-        snaps = usage.snapshots(cfg) if snaps is None else snaps
-        acct, why = resume_login(src_acct, model, usage.repo_owner(cwd) if has_cwd else None, snaps, cfg, now)
-    except Exception as e:  # noqa: BLE001 - a failed usage read must not block the resume
-        acct, why = src_acct, "usage unread (%s: %s), so where its newest copy is" % (type(e).__name__, e)
-    dst_dir = src_dir if acct == src_acct else usage.expand(usage.account(usage.settings(cfg), acct).get("config_dir"))
+    model = (claude_session.session_model(jsonfile.read_tail(src, settings(cfg)["tail_bytes"]))
+             or cfg.get("spawn_claude_model"))
+    owner = accounts.repo_owner(cwd) if has_cwd else None
+    snaps = usage.snapshots(cfg) if snaps is None else snaps
+    acct, why = resume_login(src_acct, model, owner, snaps, cfg, now)
+    dst_dir = src_dir if acct == src_acct else accounts.expand(accounts.account(usage.settings(cfg), acct).get("config_dir"))
     note = "on login %s: %s" % (acct, why)
     if (dst_dir or None) == (src_dir or None):
         return dst_dir, note
     if dry_run:
         return dst_dir, note + "; would copy its conversation from %s" % src_acct
-    try:
-        copy_transcript(src, dst_dir or registry.DEFAULT_CLAUDE_HOME, sess["id"])
-        if trust and has_cwd:
-            trust(cwd, dst_dir)
-        if dst_dir and has_cwd:
-            usage.link_memory(repo_root(cwd), dst_dir)
-    except Exception as e:  # noqa: BLE001 - resume where the newest copy is rather than not at all
-        return src_dir, "on login %s, where its newest copy is: copying it to %s failed (%s: %s)" % (
-            src_acct, acct, type(e).__name__, e)
+    claude_session.copy_transcript(src, registry.claude_home(dst_dir), sess["id"])
+    if trust and has_cwd:
+        trust(cwd, dst_dir)
+    if dst_dir and has_cwd:
+        accounts.link_memory(commands.repo_root(cwd), dst_dir, registry.DEFAULT_CLAUDE_HOME)
     return dst_dir, note + "; conversation copied from %s" % src_acct

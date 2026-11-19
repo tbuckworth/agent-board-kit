@@ -1,9 +1,10 @@
 """Assemble one board snapshot from the cached readers. Cheap enough to run every few seconds."""
 import os
-import threading
+import re
 import time
+from pathlib import Path
 
-from . import SNAPSHOT_VERSION, actions, classify, config, sources
+from . import classify, config, sources
 
 EVENTS_PER_AGENT = 25
 NOTES_PER_AGENT = 8
@@ -11,20 +12,35 @@ TIMELINE_EVENTS = ("note", "spawn", "closed", "quota", "failover", "limit", "lim
 LIMIT_EVENTS = ("quota", "limit", "limit-wait")    # a turn stopped on a plan limit (hooks: Notification, StopFailure)
 
 
+_REAL = {}      # path -> real path, for one poll: free_worktrees asks about the same few hundred paths ~6,500 times
+
+
 def _realpath(p):
-    try:
-        return os.path.realpath(p)
-    except (OSError, ValueError):
-        return p
+    r = _REAL.get(p)
+    if r is None:
+        try:
+            r = os.path.realpath(p)
+        except (OSError, ValueError):
+            r = p
+        if len(_REAL) < 20000:
+            _REAL[p] = r
+    return r
 
 
-ORCHESTRATOR_DIRS = {_realpath(str(config.orchestrator_dir()))}    # mailroom config orchestrator_dir
+def forget_paths():
+    """Each poll starts here, so a symlink or directory made since the last one is seen within a poll."""
+    _REAL.clear()
 
 
-def is_orchestrator(sid, name, cwd):
-    """Orchestrator runs are not agents: no tiles, no timeline rows."""
-    return sid == "orchestrator" or (name or "").startswith("orchestrator") or (
-        bool(cwd) and _realpath(cwd) in ORCHESTRATOR_DIRS)
+def orchestrator_dir():
+    """Where the orchestrator's events run (config.orchestrator_dir: the mailroom config's orchestrator_dir, else
+    <repos_root>/orchestrator)."""
+    return _realpath(str(config.orchestrator_dir(sources.mail_config())))
+
+
+def is_orchestrator(sid, name, cwd, orch_dir):
+    """Whether a session is one of the orchestrator's (they are not tiles); orch_dir is orchestrator_dir()."""
+    return sid == "orchestrator" or (name or "").startswith("orchestrator") or (bool(cwd) and _realpath(cwd) == orch_dir)
 
 
 def aggregate_events(events, now):
@@ -78,75 +94,79 @@ def inside(path, root):
     return p == r or p.startswith(r + os.sep)
 
 
+def worktree_name(path):
+    """A worktree's name on the board (its folder's name): what its row shows and what a force remove must be
+    given."""
+    return os.path.basename(path.rstrip("/"))
+
+
+def is_subagent_tree(path):
+    """Whether a worktree is one of Claude Code's own subagent worktrees (<repo>/.claude/worktrees/...)."""
+    return os.sep + os.path.join(".claude", "worktrees") + os.sep in path
+
+
 def occupied(wt, live_cwds, tile_cwds, live_repos=()):
     """Is someone in this worktree? An agent working in it (or below it), a tile already showing it (Offline),
-    or, for Claude Code's own subagent worktrees (<repo>/.claude/worktrees/...), a live agent anywhere in that
-    repo (any of its worktrees), whose subagent may still be using it."""
+    or, for a subagent worktree (is_subagent_tree), a live agent anywhere in that repo (any of its worktrees),
+    whose subagent may still be using it."""
     if any(inside(c, wt["path"]) for c in list(live_cwds) + list(tile_cwds)):
         return True
-    if os.sep + os.path.join(".claude", "worktrees") + os.sep in wt["path"]:
+    if is_subagent_tree(wt["path"]):
         return wt["repo"] in live_repos or any(inside(c, wt["main"]) for c in live_cwds)
     return False
 
 
-class DesktopInfo:
-    """Pending updates / reboot needed / GPU, for the board's Desktop chip. apt-check takes a few seconds, so this
-    refreshes in the background every `interval` seconds and polls only read the cache."""
-
-    def __init__(self, interval=1800, reader=None):
-        from . import restart
-        self.interval, self.reader = interval, reader or restart.updates_info
-        self.info, self.at, self.busy = {}, 0, False
-
-    def refresh(self):
-        if self.busy:
-            return
-        self.busy = True
-        try:
-            self.info = self.reader()
-        except Exception:   # the board must not depend on apt
-            pass
-        finally:
-            self.busy = False
-
-    def maybe_refresh(self, now=None, force=False):
-        now = now or time.time()
-        if force or now - self.at > self.interval:
-            self.at = now
-            threading.Thread(target=self.refresh, daemon=True).start()
-        return self.info
+def free_worktrees(rows, worktrees):
+    """The worktrees (list_worktrees rows) that no agent in `rows` occupies: the board's bottom section, and all
+    that bulk clean-up offers. A live agent's repo is its row's "repo", or git_facts' for its directory when the row
+    has none (rows read without git: one git call each)."""
+    live = [a["cwd"] for a in rows if a.get("live") and a.get("cwd")]
+    tiles = [a["cwd"] for a in rows if not a.get("live") and a.get("cwd")]
+    repos = {a.get("repo") or (sources.git_facts(a["cwd"]) or {}).get("repo")
+             for a in rows if a.get("live") and a.get("cwd")}
+    return [w for w in worktrees if not occupied(w, live, tiles, repos)]
 
 
-class WorktreeScan:
-    """Linked worktrees and their git state. git for ~70 trees takes a few seconds, so this runs in a
-    background thread every `interval` seconds (and on a manual refresh); polls only read the cache."""
+def desktop_info(sync):
+    """Pending updates / reboot needed / GPU for the board's Desktop chip (updates_info), as a Periodic read every
+    30 minutes: apt-check takes a few seconds. In the background unless `sync`."""
+    return sources.Periodic(updates_info, 1800, {}, sync)
 
-    def __init__(self, interval=600, lister=sources.list_worktrees, facts=sources.git_facts):
-        self.interval, self.lister, self.facts = interval, lister, facts
-        self.items, self.at, self.busy = [], 0, False
-        self.lock = threading.Lock()
 
-    def refresh(self):
-        with self.lock:
-            if self.busy:
-                return
-            self.busy = True
-        try:
-            self.items = [dict(w, facts=self.facts(w["path"]) or {}) for w in self.lister()]
-        except Exception:      # a broken repo must not take the board down
-            pass
-        finally:
-            self.busy = False
+def scan_worktrees():
+    """Every linked worktree (list_worktrees) with its git_facts as "facts" ({} when git has none)."""
+    return [dict(w, facts=sources.git_facts(w["path"]) or {}) for w in sources.list_worktrees()]
 
-    def maybe_refresh(self, now=None, force=False, sync=False):
-        now = now or time.time()
-        if force or now - self.at > self.interval:
-            self.at = now
-            if sync:
-                self.refresh()
-            else:
-                threading.Thread(target=self.refresh, daemon=True).start()
-        return self.items
+
+def worktree_scan(sync):
+    """scan_worktrees() as a Periodic read every 10 minutes and on a manual refresh: git across every worktree takes
+    a few seconds. In the background unless `sync`."""
+    return sources.Periodic(scan_worktrees, 600, [], sync)
+
+
+class RetryMemo:
+    """One answer per key, asked for once: an unknown answer (None), or a failed ask, is asked for again `retry`
+    seconds later, and the memo's answer stands in between."""
+
+    def __init__(self, retry):
+        self.retry = retry
+        self.memo = {}         # key -> (answer, asked at, error)
+
+    def get(self, key, now, ask):
+        """(answer, error) for key: ask()'s answer, asked for when the memo has none due; error is why the last ask
+        failed (error_text, with answer None), else None."""
+        answer, at, err = self.memo.get(key, (None, 0, None))
+        if answer is None and now - at > self.retry:
+            try:
+                answer, err = ask(), None
+            except Exception as e:      # unknown for now; the caller reports err
+                answer, err = None, sources.error_text(e)
+            self.memo[key] = (answer, now, err)
+        return answer, err
+
+    def keep(self, keys):
+        """Forget every key not in `keys`."""
+        self.memo = {k: v for k, v in self.memo.items() if k in keys}
 
 
 def tmux_name(reg_tmux):
@@ -155,10 +175,18 @@ def tmux_name(reg_tmux):
 
 
 class Collector:
+    """Reads the agents (agents()) and assembles the board's snapshot (snapshot()). usage, gmail, worktrees,
+    desktop, meetings and mailbox are the caches whose sections the snapshot carries (Usage, GmailState, worktree_scan,
+    desktop_info, meetings.Meetings, a Periodic of mailbox.summary); prs (PullRequests) feeds the agents' git chips and
+    the worktree rows; sent and restart are the agentboard modules whose counts and status it carries.
+    Whether the owner has read an agent's mail (is_read) comes from gmail and mailbox together.
+    None leaves a section out. The other arguments replace the readers their defaults name."""
+
     def __init__(self, events=None, codex=None, mail=None, git=None, metrics=None, usage=None,
-                 claude=sources.claude_sessions_all, panes=sources.tmux_panes, prs=None, gmail=None, worktrees=None,
-                 desktop=None, restored=None, waits=sources.stuck_waits, routing=sources.claude_routing,
-                 stops=actions.last_turn_failed):
+                 claude=sources.claude_sessions_all, panes=sources.tmux_list_panes, prs=None, gmail=None,
+                 worktrees=None, desktop=None, restored=None, waits=sources.stuck_waits, routing=sources.claude_routing,
+                 stops=sources.last_turn_failed, stuck_mail=sources.stuck_mail, sent=None, restart=None,
+                 chats=None, meetings=None, mailbox=None):
         self.events = events or sources.EventLog()
         self.codex = codex or sources.CodexReader()
         self.mail = mail or sources.MailStore()
@@ -170,54 +198,73 @@ class Collector:
         self.gmail = gmail
         self.worktrees = worktrees
         self.desktop = desktop
+        self.sent, self.restart = sent, restart
+        self.chats = chats                     # a sources.Periodic of subchats.summary, for the Mac's Chats button
+        self.meetings = meetings               # for the Mac's meeting alerts (None: off, no meetings section)
+        self.mailbox = mailbox                 # the Mail tab's unread count, and what the owner has read there
         self.restored_fn = restored            # {id: (restored_at, activity before)}: keep quiet agents' colours
         self.panes_fn = panes
-        self.panes, self.panes_at = {}, 0
-        self.waits_fn = waits
+        self.panes, self.tmux_names = {}, {}   # pane pid -> session; session -> its panes' directories
+        self.tmux = sources.Periodic(self._read_tmux, 30, ({}, {}), sync=True)
+        self.waits_fn, self.waits_for = waits, []
+        self.waits = sources.Periodic(self._read_waits, 30, {}, sync=True)
+        self.mail_fn = stuck_mail
+        self.stuck = sources.Periodic(self._read_stuck_mail, 30, {}, sync=True)
         self.routing_fn = routing
-        self.models = {}                       # (session id, pid) -> model, for agents on a later login
+        self.models = RetryMemo(300)           # (session id, pid) -> model, for agents on a later login
         self.stops_fn = stops
-        self.stops = {}                        # (session id, limit/error ts) -> (transcript ends on it?, read at)
-        self.waits, self.waits_at = {}, 0
-        self.sessions_fn = sources.tmux_sessions
+        self.stops = RetryMemo(300)            # (session id, limit/error ts) -> transcript ends on a failed request?
+        # what a manual refresh reads again, and whose errors the snapshot lists, by the name it lists them under
+        self.caches = {name: c for name, c in (
+            ("usage", usage), ("Gmail", gmail), ("worktrees", worktrees), ("Desktop", desktop), ("pull requests", prs),
+            ("meetings", meetings), ("mailbox", mailbox), ("tmux", self.tmux),
+            ("background waits", self.waits),
+            ("stuck mail", self.stuck)) if c is not None}
+        self.problems = []                     # {source, error}: what failed in the last agents() and snapshot()
+        self.last_mail = {"by_session": {}}    # the mail the last agents() read, for tick_seen()
         self.subagent_ids = set()
         self.transient = set()
         self.owner = config.owner_name(default=None)   # "waiting on <name>" in a note reads as blocked
 
+    def _read_tmux(self):
+        rows = self.panes_fn()
+        return sources.tmux_panes(rows), sources.tmux_sessions(rows)
+
     def _panes(self, now):
-        if now - self.panes_at > 30:
-            self.panes, self.panes_at = self.panes_fn(), now
-            self.tmux_names = self.sessions_fn()
+        """{pane pid: session}, read every 30 s with tmux_names from the same tmux call."""
+        self.panes, self.tmux_names = self.tmux.maybe_refresh(now)
         return self.panes
+
+    def _read_waits(self, pids):
+        self.waits_for = list(pids)
+        return self.waits_fn(pids) if pids else {}
 
     def _waits(self, pids, now):
         """stuck_waits() for agents in Claude's `shell` state, re-read every 30 s or when a new one appears."""
-        if now - self.waits_at > 30 or not set(pids) <= set(self.waits_for):
-            self.waits, self.waits_at, self.waits_for = (self.waits_fn(pids) if pids else {}), now, list(pids)
-        return self.waits
+        return self.waits.maybe_refresh(now, force=not set(pids) <= set(self.waits_for), args=(pids,))
+
+    def _read_stuck_mail(self, pids, now):
+        return self.mail_fn(pids, now=now) if pids else {}
+
+    def _stuck_mail(self, pids, now):
+        """stuck_mail() for every live agent, re-read every 30 s."""
+        return self.stuck.maybe_refresh(now, args=(pids, now))
 
     def _unconfirmed_stop(self, a, now, kept):
         """The time of the limit or API-error event that would show a live Claude agent as blocked, when its
         transcript doesn't end on a failed request (a side request's StopFailure after a finished turn), else 0.
         The transcript is read once per event, from 30 s after it (Claude Code may still be writing its record);
-        an unreadable one is asked again after 5 minutes."""
+        an unreadable one keeps the agent blocked, is listed in problems and is asked again after 5 minutes."""
         stop = max(a.get("quota_ts") or 0, (a.get("error") or {}).get("ts") or 0)
         if not (a["live"] and a["cli"] == "claude" and stop and stop >= (a.get("last_turn_end") or 0)
                 and now - stop >= 30):
             return 0
         key = (a["id"], stop)
         kept.add(key)
-        failed, at = self.stops.get(key, (None, 0))
-        if failed is None and now - at > 300:
-            try:
-                failed = self.stops_fn(a["id"])
-            except Exception:                    # unreadable: keep showing it blocked
-                failed = None
-            self.stops[key] = (failed, now)
+        failed, err = self.stops.get(key, now, lambda: self.stops_fn(a["id"]))
+        if err:
+            self.problems.append({"source": "last turn of " + a["display"], "error": err})
         return stop if failed is False else 0
-
-    tmux_names = {}
-    waits_for = []
 
     def _own_tmux(self, cwd, name, recorded=""):
         """The agent's own tmux session if still open. `recorded` is the session its registry entry named
@@ -231,29 +278,29 @@ class Collector:
                 continue
             if t == recorded and want is None:      # directory gone: the registry's record is the only proof
                 return t
-            if want and any(p and (_realpath(p) == want or _realpath(p).startswith(want + os.sep)) for p in panes):
+            if want and any(p and inside(p, want) for p in panes):
                 return t
         return ""
 
     def refresh(self):
-        """A manual refresh: refetch git, PRs and tmux on the next poll."""
+        """A manual refresh: the next poll reads git and every cache in `caches` again (usage through agent-usage's
+        own cache, so no probe runs)."""
         self.git.invalidate()
-        if self.prs:
-            self.prs.invalidate()
-        if self.gmail is not None:
-            self.gmail.maybe_poll(force=True)
-        if self.worktrees is not None:
-            self.worktrees.maybe_refresh(force=True)
-        if self.desktop is not None:
-            self.desktop.maybe_refresh(force=True)
-        self.panes_at = 0
+        for c in self.caches.values():
+            c.invalidate()
 
     def agents(self, now=None, with_git=True):
+        """(rows, mail, events): the agents the board shows, the mailroom view and aggregate_events'. Starts a new
+        `problems` list with what failed to read."""
         now = now or time.time()
+        self.problems = []
+        forget_paths()
         evs = aggregate_events(self.events.poll(now), now)
         recent = {sid for sid, a in evs.items() if now - a["last_ts"] < classify.OFFLINE_WINDOW}
         reg = {}
         panes = self._panes(now)
+        if self.mailbox is not None:
+            self.mailbox.maybe_refresh(now)    # before the tiles ask is_read, so a one-shot snapshot has it too
         for s in self.claude():
             # `claude -p` / SDK runs (probes, orchestrator, preflights) are not agents; but one started straight from a
             # tmux pane's shell is an interactive agent that inherited CLAUDE_CODE_ENTRYPOINT from a tmux server an
@@ -264,7 +311,10 @@ class Collector:
             elif s["id"] and (s["live"] or s["id"] not in reg):
                 reg[s["id"]] = s
         subagents = {}
-        for s in self.codex.sessions(ids_of_interest=[sid for sid in recent if evs[sid]["cli"] == "codex"], now=now):
+        codex = self.codex.sessions(ids_of_interest=[sid for sid in recent if evs[sid]["cli"] == "codex"], now=now)
+        if self.codex.error:
+            self.problems.append({"source": "Codex sessions", "error": self.codex.error})
+        for s in codex:
             if s.get("parent"):          # a Codex subagent shares its parent's process: list it on the parent's tile
                 self.subagent_ids.add(s["id"])
                 if s["live"]:
@@ -279,15 +329,18 @@ class Collector:
                         "kind": "", "live": False, "pid": None, "tmux": "", "waiting_for": "",
                         "started_at": a["first_ts"], "status_at": a["last_ts"]}
 
-        mail = self.mail.read(now)
+        mail = self.last_mail = self.mail.read(now)
+        if mail.get("error"):
+            self.problems.append({"source": "mail", "error": mail["error"]})
         try:
             restored = self.restored_fn() if self.restored_fn else {}
-        except Exception:
+        except Exception as e:      # quiet agents lose their kept colour this poll; problems says why
+            self.problems.append({"source": "restored agents", "error": sources.error_text(e)})
             restored = {}
-        rows = []
+        rows, orch = [], orchestrator_dir()
         for sid, s in reg.items():
             ev = evs.get(sid, {})
-            if is_orchestrator(sid, s.get("name") or ev.get("name"), s.get("cwd") or ev.get("cwd")):
+            if is_orchestrator(sid, s.get("name") or ev.get("name"), s.get("cwd") or ev.get("cwd"), orch):
                 continue
             if sid in self.transient:
                 continue
@@ -302,8 +355,8 @@ class Collector:
                 last_activity = max([before, status_at] + real)
             m = mail["by_session"].get((s["cli"], sid), {"sent": [], "inbound": []})
             ms = classify.mail_state(m["sent"], m["inbound"], now, reviews=m.get("reviews"))
-            if self.gmail is not None and ms["unanswered"]:
-                ms["read"] = self.gmail.is_read(ms["last_out_id"])
+            if ms["unanswered"] and (self.gmail is not None or self.mailbox is not None):
+                ms["read"] = self.is_read(ms["last_out_id"])
             if self.gmail is not None and ms.get("last_out_id"):
                 self.gmail.is_read(ms["last_out_id"])            # also asks for its thread, for "open in Gmail"
                 ms["gmail_thread"] = self.gmail.thread_of(ms["last_out_id"])
@@ -325,7 +378,8 @@ class Collector:
                 "mail": ms,
                 "branch": ev.get("branch") or s.get("branch_hint") or "", "repo": "", "dirty": None, "last_commit": {},
                 "git": None, "bg": s.get("raw_status") == "shell", "account": s.get("account") or "",
-                "account_default": s.get("account_default", True), "config_dir": s.get("config_dir") or "",
+                "account_default": s.get("account_default", True), "account_label": s.get("account_label"),
+                "config_dir": s.get("config_dir") or "",
                 "subagents": sorted(subagents.get(sid, []), key=lambda x: x["nickname"]),
             }
             if not a["live"]:
@@ -349,30 +403,37 @@ class Collector:
                     a["git"].update({k: f.get(k) for k in ("upstream", "ahead", "behind", "untracked", "default", "not_in_default", "linked")})
         shell = [int(a["pid"]) for a in rows if a["live"] and a["cli"] == "claude" and a["bg"] and a["pid"]]
         waits = self._waits(shell, now)
+        stuck = self._stuck_mail([int(a["pid"]) for a in rows if a["live"] and a["pid"]], now)
         kept = set()
         for a in rows:
             if a["bg"] and a["pid"]:
                 a["bg_waits"] = waits.get(int(a["pid"]))
-            a["stop_unconfirmed"] = self._unconfirmed_stop(a, now, kept)
+            if a["live"] and a["pid"] and stuck.get(int(a["pid"])):
+                a["mail_stuck"] = stuck[int(a["pid"])]
             a["display"] = classify.display_name(a)
+            a["stop_unconfirmed"] = self._unconfirmed_stop(a, now, kept)
             a["state"], a["reason"] = classify.classify(a, now, owner=self.owner)
             a["fresh"] = round(classify.freshness(a["state"], now - (a["last_activity"] or 0)), 2)
             a["stranded"] = classify.stranded(a)
-        self.stops = {k: v for k, v in self.stops.items() if k in kept}
+        self.stops.keep(kept)
         classify.disambiguate(rows)
         order = {s: i for i, s in enumerate(classify.STATES)}
         rows.sort(key=lambda a: (order.get(a["state"], 99), -(a["last_activity"] or 0)))
         return rows, mail, evs
 
     def snapshot(self, now=None):
+        """The board's JSON snapshot: agents, timeline, summary, mail, and the section of each cache and module the
+        collector was given. It ticks no message off (tick_seen() does that); the one file it can write is the Codex
+        credits state, through the usage cache's annotate step. A source that fails is left out or kept at its last
+        reading, and listed in "problems" ({source, error})."""
         now = now or time.time()
         rows, mail, evs = self.agents(now)
         names = {a["id"]: a["display"] for a in rows}
-        timeline = []
+        timeline, orch = [], orchestrator_dir()
         recent = sorted((e for e in self.events.events if now - (e.get("ts") or 0) <= 86400),
                         key=lambda e: -(e.get("ts") or 0))
         for e in recent:
-            if e.get("event") in TIMELINE_EVENTS and not is_orchestrator(e.get("session_id"), e.get("name"), e.get("cwd")):
+            if e.get("event") in TIMELINE_EVENTS and not is_orchestrator(e.get("session_id"), e.get("name"), e.get("cwd"), orch):
                 timeline.append({"ts": e.get("ts"), "event": e.get("event"), "text": (e.get("text") or "")[:300],
                                  "id": e.get("session_id") or "",
                                  "name": names.get(e.get("session_id")) or e.get("name") or os.path.basename(e.get("cwd") or "")})
@@ -384,31 +445,77 @@ class Collector:
         summary["unanswered"] = sum(1 for a in rows if a["mail"]["unanswered"])
         summary["stranded"] = sum(1 for a in rows if a.get("stranded"))
         snap = {
-            "type": "snapshot", "v": SNAPSHOT_VERSION, "host": sources.os.uname().nodename, "generated": now,
+            "type": "snapshot", "host": sources.os.uname().nodename, "generated": now,
             "agents": rows, "timeline": timeline, "summary": summary,
             "mail": {"ok": mail.get("ok", False), "held": mail["held"][:30], "held_count": len(mail["held"]),
                      "held_owner": sum(1 for h in mail["held"] if h["owner"])},
             "states": classify.STATES,
-            "owner": (sources.owner_addresses() or [""])[0],
+            "owner": sources.owner(),
+            "problems": self.problems,
         }
+        problems = snap["problems"]
         if self.usage is not None:
             snap["usage"] = self.usage.maybe_refresh(now)
             self.mark_logins(rows, snap["usage"].get("accounts") or [], now)
+        if self.sent is not None:
+            try:
+                snap["sent"] = self.sent.counts()   # the Mac's "Sent" chip: messages to check, messages waiting
+            except Exception as e:
+                problems.append({"source": "sent", "error": sources.error_text(e)})
+        if self.chats is not None:
+            value = self.chats.maybe_refresh(now)
+            if self.chats.error:
+                problems.append({"source": "group chats", "error": self.chats.error})
+            if value is not None:
+                snap["chats"] = {"chats": value["chats"]}
+                problems += [{"source": "sub-group chats", "error": p} for p in value["problems"]]
         if self.gmail is not None:
-            snap["gmail"] = dict(self.gmail.maybe_poll(now))
+            snap["gmail"] = dict(self.gmail.maybe_refresh(now))
+        if self.mailbox is not None and self.mailbox.value is not None:   # None: no mailbox, so the Mac's tab says so
+            snap["mailbox"] = {k: self.mailbox.value[k] for k in ("unread", "inbox")}
+        if self.meetings is not None:
+            value = self.meetings.maybe_refresh(now)
+            if value is not None:             # until the first read ends, the Mac keeps the meetings it has
+                snap["meetings"] = {k: value[k] for k in ("notify_minutes", "fullscreen_minutes", "events")}
+                problems += [{"source": "meetings: %s calendar" % f["calendar"], "error": f["error"]} for f in value["failed"]]
         if self.worktrees is not None:
-            snap["worktrees"] = self.free_worktrees(rows, now)
+            snap["worktrees"] = self.worktree_section(rows, now)
         if self.desktop is not None:
-            from . import restart
             snap["desktop"] = dict(self.desktop.maybe_refresh(now))
-            st = restart.status()
-            snap["restart"] = st if st and not st.get("test") and now - (st.get("updated") or 0) < 2 * 86400 else {}
+        if self.restart is not None:
+            try:
+                st = self.restart.status()
+            except (OSError, ValueError) as e:      # a damaged status.json: no restart chip; problems says why
+                problems.append({"source": "restart", "error": sources.error_text(e)})
+            else:
+                snap["restart"] = st if st and not st.get("test") and now - (st.get("updated") or 0) < 2 * 86400 else {}
+        for name, c in self.caches.items():
+            if c.error:
+                problems.append({"source": name, "error": c.error})
         return snap
+
+    def tick_seen(self, now=None):
+        """Tick off the done messages whose agent's emails the owner has seen (sent.seen_ticks), from the mail the last
+        agents() read and whether the owner has read each (is_read: the Mail tab's or Gmail's read state); the refs ticked.
+        Needs `sent`. It writes the sent marks file, so the stream runs it after each snapshot. Raises what seen_ticks
+        raises (OSError, ValueError)."""
+        return self.sent.seen_ticks({k[1]: v for k, v in self.last_mail["by_session"].items()},
+                                    self.is_read if self.gmail is not None or self.mailbox is not None else None, now)
+
+    def is_read(self, message_id):
+        """Whether the owner has read the agent mail with this Message-ID: True when the Mail tab counts it read (the
+        mailbox's last summary) or Gmail does, else Gmail's answer (False, or None when Gmail cannot tell or is not
+        asked). Needs gmail or mailbox."""
+        tab = self.mailbox.value if self.mailbox is not None else None
+        if tab and sources.norm_id(message_id) in tab["read"]:
+            return True
+        return self.gmail.is_read(message_id) if self.gmail is not None else None
 
     def mark_logins(self, rows, accounts, now):
         """login_note on agents running on a later login while the first has room (a red star on the tile). The
         model comes from the process arguments or the transcript, read once per process; an unknown one is asked
-        again after 5 minutes (the transcript may not have a model line yet)."""
+        again after 5 minutes (the transcript may not have a model line yet). A failed read, or a usage reading or
+        routing config login_note cannot use, is listed in problems."""
         order, thresholds = self.routing_fn()
         live = set()
         for a in rows:
@@ -417,41 +524,71 @@ class Collector:
             if not a.get("model"):
                 key = (a["id"], a.get("pid"))
                 live.add(key)
-                model, at = self.models.get(key, ("", 0))
-                if not model and now - at > 300:
-                    from . import restart
-                    try:
-                        model = restart.model_effort(a)[0] or ""
-                    except Exception:            # an unreadable transcript only means "model unknown" for now
-                        model = ""
-                    self.models[key] = (model, now)
-                a["model"] = model
+                model, err = self.models.get(key, now, lambda: sources.model_effort(a)[0] or None)
+                if err:                          # "model unknown" for now: every model window must have room
+                    self.problems.append({"source": "model of " + a["display"], "error": err})
+                a["model"] = model or ""
             try:
                 note = classify.login_note(a, accounts, order, thresholds, now)
-            except Exception:                    # a malformed usage reading must never take the snapshot down
+            except Exception as e:               # no star this poll; problems says why
+                self.problems.append({"source": "login note of " + a["display"], "error": sources.error_text(e)})
                 note = None
             if note:
                 a["login_note"] = note
-        self.models = {k: v for k, v in self.models.items() if k in live}
+        self.models.keep(live)
 
-    def free_worktrees(self, rows, now):
-        """Linked worktrees with no agent in them: the board's bottom section."""
-        items = self.worktrees.maybe_refresh(now)
-        live = [a["cwd"] for a in rows if a["live"] and a["cwd"]]
-        tiles = [a["cwd"] for a in rows if not a["live"] and a["cwd"]]
-        repos = {a["repo"] for a in rows if a["live"] and a.get("repo")}
+    def worktree_section(self, rows, now):
+        """The board's bottom section: free_worktrees() of the latest worktree scan, each with its git stage, PR
+        and own tmux session, newest commit first."""
         out = []
-        for w in items:
-            if occupied(w, live, tiles, repos):
-                continue
+        for w in free_worktrees(rows, self.worktrees.maybe_refresh(now)):
             f = w.get("facts") or {}
             branch = f.get("branch") or w["branch"] or "HEAD"
             pr = self.prs.lookup(f.get("slug"), branch, now) if self.prs and branch not in classify.TRUNK else None
             g = classify.git_stage(f, pr) if f else None
             last = f.get("last_commit") or {}
-            out.append({"path": w["path"], "name": os.path.basename(w["path"].rstrip("/")), "repo": w["repo"],
+            out.append({"path": w["path"], "name": worktree_name(w["path"]), "repo": w["repo"],
                         "branch": "" if w["detached"] else branch, "locked": w["locked"], "git": g, "last_commit": last,
-                        "subagent_tree": os.sep + os.path.join(".claude", "worktrees") + os.sep in w["path"],
-                        "tmux": self._own_tmux(w["path"], os.path.basename(w["path"].rstrip("/")))})
+                        "tmux": self._own_tmux(w["path"], worktree_name(w["path"]))})
         out.sort(key=lambda w: -((w["last_commit"] or {}).get("ts") or 0))
         return out
+
+
+def _kver(name):
+    return [int(x) if x.isdigit() else 0 for x in re.split(r"[.-]", name)]
+
+
+def updates_info(run=sources.run):
+    """Pending apt and snap updates, whether a reboot is needed, the running and newest kernels, the GPU."""
+    out = {"checked": time.time()}
+    code, _, err = run(["/usr/lib/update-notifier/apt-check"], timeout=120)
+    m = re.match(r"\s*(\d+);(\d+)", err or "")
+    out["total"], out["security"] = (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    rr = Path("/var/run/reboot-required")
+    out["reboot_required"] = rr.exists()
+    out["reboot_since"] = rr.stat().st_mtime if rr.exists() else None
+    try:
+        pkgs = Path("/var/run/reboot-required.pkgs").read_text().split()
+        out["reboot_pkgs"] = sorted(set(pkgs))[:8]
+    except OSError:
+        out["reboot_pkgs"] = []
+    out["kernel"] = os.uname().release
+    try:
+        kernels = sorted((d for d in os.listdir("/lib/modules") if d[0].isdigit()), key=_kver)
+        out["newest_kernel"] = kernels[-1] if kernels else ""
+    except OSError:
+        out["newest_kernel"] = ""
+    smi = sources.find_bin("nvidia-smi")
+    if smi:
+        code, so, se = run([smi, "-L"], timeout=20)
+        out["gpu_ok"] = code == 0
+        out["gpu_message"] = "" if code == 0 else ((so or se).strip().splitlines() or [""])[0][:160]
+    else:                        # no NVIDIA tools: no GPU to check, which is not a fault
+        out["gpu_ok"], out["gpu_message"] = None, ""
+    code, so, se = run(["snap", "refresh", "--list"], timeout=60)
+    lines = [l for l in (so or "").splitlines()[1:] if l.strip()] if code == 0 else []
+    out["snaps"] = [l.split()[0] for l in lines]
+    code, so, _ = run(["apt", "list", "--upgradable"], timeout=120)
+    names = [l.split("/")[0] for l in (so or "").splitlines() if "/" in l]
+    out["highlights"] = [n for n in names if re.match(r"(linux-(image|generic|headers-generic)|nvidia-(driver|dkms|utils|kernel))", n)][:10]
+    return out

@@ -12,7 +12,8 @@ import { confirm, showModal } from '../components/modal.js';
 import { ratingControls } from '../components/rating-controls.js';
 import * as api from '../api.js';
 import * as db from '../db.js';
-import { parseIssue, titleCase, buildLabels, isRatedList } from '../parser.js';
+import { parseIssue, titleCase, buildLabels, isRatedList, withList } from '../parser.js';
+import { toggleWithUndo } from '../actions.js';
 
 export function renderList(container, { name }) {
   const tasks = getFilteredIssues(name);
@@ -39,7 +40,6 @@ export function renderList(container, { name }) {
   );
 
   // Add task button/form
-  let addFormVisible = false;
   const addFormContainer = el('div');
 
   const addBtn = el('button', {
@@ -220,41 +220,17 @@ export function renderList(container, { name }) {
   }
 
   async function toggleTask(task) {
-    const wasOpen = task.state === 'OPEN';
-    // Optimistic update
-    const { issues } = getState();
-    const updated = issues.map(i =>
-      i.number === task.number ? { ...i, state: wasOpen ? 'CLOSED' : 'OPEN' } : i
-    );
-    setState({ issues: updated });
-    renderList(container, { name }); // Re-render
-
-    const undoAction = () => {
-      const current = getState().issues.map(i =>
-        i.number === task.number ? { ...i, state: wasOpen ? 'OPEN' : 'CLOSED' } : i
-      );
-      setState({ issues: current });
-      renderList(container, { name });
-    };
-
-    showToast(
-      wasOpen ? 'Task completed' : 'Task reopened',
-      { action: undoAction, actionLabel: 'Undo' }
-    );
-
+    const { wasOpen, pending, undo } = toggleWithUndo(task.number);
+    renderList(container, { name });
+    showToast(wasOpen ? 'Task completed' : 'Task reopened', {
+      action: () => undo().catch(err => showToast(`Error: ${err.message}`)).finally(() => renderList(container, { name })),
+      actionLabel: 'Undo',
+    });
     try {
-      if (wasOpen) {
-        await api.closeIssue(task.number);
-      } else {
-        await api.reopenIssue(task.number);
-      }
-      // Update cache
-      const final = getState().issues.find(i => i.number === task.number);
-      if (final) await db.issues.put(final);
+      await pending;
     } catch (err) {
-      // Revert on error
-      undoAction();
       showToast(`Error: ${err.message}`);
+      renderList(container, { name });
     }
   }
 }
@@ -281,17 +257,14 @@ async function deleteList(container, name) {
   try {
     // Move tasks to "tasks" list (update on GitHub + local cache)
     for (const task of tasksInList) {
-      const newLabels = task.labels
-        .filter(l => !l.toLowerCase().startsWith('list:'))
-        .concat('list:tasks');
-      await api.updateIssue(task.number, { labels: newLabels });
+      await api.updateIssue(task.number, { labels: withList(task.labels, 'tasks') });
     }
 
     // Update all matching issues in local state + IndexedDB
     const { issues } = getState();
     const updated = issues.map(i =>
       i.listName?.toLowerCase() === name.toLowerCase()
-        ? { ...i, listName: 'tasks', labels: i.labels.filter(l => !l.toLowerCase().startsWith('list:')).concat('list:tasks') }
+        ? { ...i, listName: 'tasks', labels: withList(i.labels, 'tasks') }
         : i
     );
     setState({ issues: updated });

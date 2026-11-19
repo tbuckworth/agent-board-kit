@@ -1,9 +1,9 @@
 # The upstream commit each part of the kit was last brought up to date with (for the maintainer's refresh).
 # component       upstream repo          commit    synced
-mailroom          agent-mailroom         e35e8ec   2026-10-26
-board             agent-board            7ff4802   2026-10-21
-todo              to-do                  afdbde0   2026-10-21
-cloud-watchdog    cloud-watchdog         4a1ddda   2026-10-16
+mailroom          agent-mailroom         a50c3f0   2026-11-19
+board             agent-board            38f97c0   2026-11-19
+todo              to-do                  adb9732   2026-11-19
+cloud-watchdog    cloud-watchdog         5bc91ab   2026-11-19
 # Hand-ported text, not merged by script:
-orchestrator      orchestrator           ff9b8ef   2026-10-21   AGENTS.md -> orchestrator/AGENTS.md
-templates         claude-remote-setup    a85b6b7   2026-10-21   config/AGENTS.email.md -> templates/AGENTS.agents.md
+orchestrator      orchestrator           dae4ecf   2026-11-19   AGENTS.md -> orchestrator/AGENTS.md
+templates         claude-remote-setup    c6bc82f   2026-11-19   config/AGENTS.email.md -> templates/AGENTS.agents.md

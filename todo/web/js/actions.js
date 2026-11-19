@@ -1,15 +1,15 @@
-// Online task mutations used by Triage, Archived and the "This week" section. Each shows its change at once,
-// keeps GitHub's answer, and on failure undoes only the fields it changed, so a change to the same task that
-// succeeded meanwhile is kept.
+// Online task mutations used by the task page, lists, search, Triage, Archived and the "This week" section.
+// Each shows its change at once, keeps GitHub's answer, and on failure undoes only the fields it changed, so a
+// change to the same task that succeeded meanwhile is kept.
 
 import { getState, setState, getIssueByNumber } from './state.js';
 import * as api from './api.js';
 import * as db from './db.js';
 import {
-  parseIssue, agentRequestBody, AGENT_REQUESTED_LABEL, buildPushBody, bodyFields, extractChecklist, extractClaudeNotes,
+  parseIssue, agentRequestBody, AGENT_REQUESTED_LABEL, buildPushBody, bodyFields, extractChecklist, extractClaudeNotes, withList,
 } from './parser.js';
 import { withTags, withWaiting, normaliseTag } from './tags.js';
-import { FOCUS_LABEL, withFocus, withRating } from './triage.js';
+import { FOCUS_LABEL, withFocus, withRating } from './labels.js';
 
 // A mutation's answer doesn't say which group the task is in; the number already known stays
 export function replaceLocal(task) {
@@ -82,13 +82,28 @@ export function reopenTask(number) {
     () => api.reopenIssue(number));
 }
 
+// Complete an open task, reopen a closed one
+export function toggleComplete(number) {
+  const task = getIssueByNumber(number);
+  if (!task) return Promise.reject(new Error(`Task #${number} is not loaded`));
+  return task.state === 'OPEN' ? completeTask(number) : reopenTask(number);
+}
+
+// toggleComplete with its Undo. Undo waits for the change to reach GitHub, so the two arrive in order, then puts back
+// the state before the click; after a failed change (already rolled back, and the caller reports it) it does nothing.
+export function toggleWithUndo(number) {
+  const wasOpen = getIssueByNumber(number)?.state === 'OPEN';
+  const pending = toggleComplete(number);
+  const undo = () => pending.then(() => (wasOpen ? reopenTask(number) : completeTask(number)), () => undefined);
+  return { wasOpen, pending, undo };
+}
+
 // The apps' delete: close and remove the list: label (keeping every other label as GitHub has it now),
 // then forget the task locally. Nothing changes locally until GitHub has accepted it.
 export async function deleteTask(number) {
   const task = getIssueByNumber(number);
   if (!task) return;
-  const current = await api.getIssueLabels(number);
-  const labels = current.filter(l => !l.toLowerCase().startsWith('list:'));
+  const labels = withList(await api.getIssueLabels(number), null);
   // Always sent: the cached state may be stale (the issue reopened elsewhere), and closing twice is harmless
   await api.updateIssue(number, { state: 'CLOSED', labels });
   setState({ issues: getState().issues.filter(i => i.number !== number) });

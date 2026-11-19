@@ -31,7 +31,7 @@ The facts are gathered with no model. You add a short narrative.
 
    ```bash
    agent-status report --format html --since 24h --narrative "${TMPDIR:-/tmp}/narrative.txt" \
-     --email {{OWNER_EMAIL}} --session orchestrator
+     --email owner --session orchestrator
    ```
 
 4. If the request came by email, also `agent-mail reply N` with one line saying the report was

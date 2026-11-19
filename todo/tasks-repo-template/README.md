@@ -41,7 +41,7 @@ except `.todo/config.json`; the desktop also writes `.todo/agents.json` (below).
 | `importance:high`, `importance:medium`, `importance:low` | how much it matters (one per task) |
 | `urgency:high`, `urgency:low` | how soon it matters (one per task) |
 | `due:YYYY-MM-DD` | due date (one per task; a date within 14 days counts as urgent) |
-| `priority:high`, `priority:medium`, `priority:low` | legacy priority, still set by the Mac app's editor |
+| `priority:high`, `priority:medium`, `priority:low` | retired: importance and urgency replaced it; no app writes it, and edits remove it |
 | `source:app`, `source:claude`, `source:import` | where the task came from |
 | `status:agent-requested` | the web app asked for an agent; the desktop's `todo-desk dispatch` picks it up |
 | `status:agent-assigned` | an agent was started on it from a to-do app, or it was sent to a running agent |

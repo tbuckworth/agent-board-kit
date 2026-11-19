@@ -3,46 +3,37 @@
 Only a *linked* worktree is ever removed, never a main checkout or a plain directory; for those
 only the session ends. Nothing is closed while the worktree has uncommitted or untracked files,
 or commits whose changes are not on origin's default branch (a squash or rebase merge counts as
-landed), unless forced. Git-ignored files (downloads, PDFs) go with the worktree.
+landed), unless forced; a git error in either check counts as unlanded work. A failed `git fetch`
+is said in the output (the check then uses the last fetched refs), and a stale worktree git would
+not prune is an error. Git-ignored files (downloads, PDFs) go with the worktree.
 """
 import os
 import subprocess
 import time
 
-from . import registry, statuslog
-
-
-def run(*cmd, cwd=None, timeout=60):
-    try:
-        return subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+from . import commands, registry, statuslog
 
 
 def git(repo, *args, timeout=60):
-    return run("git", "-C", str(repo), *args, timeout=timeout)
+    return commands.run(["git", "-C", repo] + list(args), timeout=timeout)
 
 
 def gitd(common, *args, timeout=60):
     """git against a repository's common dir: right for normal, bare and gitdir-file layouts."""
-    return run("git", "--git-dir", str(common), *args, timeout=timeout)
-
-
-def tmux_has(name):
-    return bool(name) and run("tmux", "has-session", "-t", "=" + name, timeout=10).returncode == 0
+    return commands.run(["git", "--git-dir", common] + list(args), timeout=timeout)
 
 
 def tmux_self():
     """The tmux session this process runs in, or None."""
     if not os.environ.get("TMUX"):
         return None
-    r = run("tmux", "display-message", "-p", "-t", os.environ.get("TMUX_PANE", ""), "#S", timeout=10)
+    r = commands.run(["tmux", "display-message", "-p", "-t", os.environ.get("TMUX_PANE", ""), "#S"], timeout=10)
     return r.stdout.strip() or None
 
 
 def tmux_cwd(name):
     # "=name:" (session, current window); a bare "=name" is read as a pane and matches nothing
-    r = run("tmux", "display-message", "-p", "-t", "=%s:" % name, "#{pane_current_path}", timeout=10)
+    r = commands.run(["tmux", "display-message", "-p", "-t", "=%s:" % name, "#{pane_current_path}"], timeout=10)
     return r.stdout.strip() or None
 
 
@@ -55,7 +46,7 @@ def find(target=None, self_=False):
         return {"name": sess.get("name") or tm or "", "tmux": tm, "cli": sess.get("cli", "?"),
                 "session_id": sess.get("id", ""), "cwd": os.getcwd()}, None
     sess, code, cands = registry.resolve(target)
-    exact_tmux = tmux_has(target)
+    exact_tmux = commands.tmux_has(target)
     if code == 3 and not exact_tmux:
         return None, "%r is ambiguous: %s" % (target, ", ".join(sorted({c.get("name") or c["id"][:8] for c in cands})))
     if sess and target not in (sess.get("name"), sess.get("id")):
@@ -63,17 +54,12 @@ def find(target=None, self_=False):
             return None, "%r only partly matches %s; agent-close needs the exact session name or id" % (
                 target, sess.get("name") or sess["id"][:8])
         sess = None   # an exact tmux name beats a fuzzy registry hit
-    tm = target if exact_tmux else (sess["name"] if sess and tmux_has(sess.get("name")) else None)
+    tm = target if exact_tmux else (sess["name"] if sess and commands.tmux_has(sess.get("name")) else None)
     if not sess and not tm:
         return None, "no session or tmux session named %r" % target
     cwd = (sess or {}).get("cwd") or (tmux_cwd(tm) if tm else None)
     return {"name": (sess or {}).get("name") or tm, "tmux": tm, "cli": (sess or {}).get("cli", "?"),
             "session_id": (sess or {}).get("id", ""), "cwd": cwd}, None
-
-
-def _common(top):
-    c = git(top, "rev-parse", "--git-common-dir").stdout.strip()
-    return os.path.realpath(c if os.path.isabs(c) else os.path.join(top, c))
 
 
 def worktree(cwd):
@@ -87,7 +73,7 @@ def worktree(cwd):
         return {"kind": "plain", "path": cwd}
     top = top.stdout.strip()
     gitdir = os.path.realpath(git(top, "rev-parse", "--absolute-git-dir").stdout.strip())
-    common = _common(top)
+    common = commands.common_dir(top)
     return {"kind": "linked" if gitdir != common else "main", "path": top, "common": common,
             "branch": git(top, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()}
 
@@ -107,21 +93,44 @@ def contained(g, base, ref):
 
 
 def unmerged(g, base, ref):
-    """Commits on ref not landed in base: 0 if ancestors or squash/rebase-merged, -1 if unknown."""
+    """(count, why): commits on ref not landed in base, 0 if ancestors or squash/rebase-merged. An unknown
+    count is -1, and why says why: no base branch, or git's error."""
     if not base:
-        return -1
-    n = int(g("rev-list", "--count", "%s..%s" % (base, ref)).stdout.strip() or 0)
-    return 0 if n and contained(g, base, ref) else n
+        return -1, "no base branch"
+    r = g("rev-list", "--count", "%s..%s" % (base, ref))
+    if r.returncode != 0:
+        return -1, "git rev-list failed: %s" % (r.stderr or r.stdout).strip()[:200]
+    n = int(r.stdout.strip())
+    return (0 if n and contained(g, base, ref) else n), None
+
+
+def commits_text(ahead, why):
+    """A commit count from unmerged() for messages: the number, or "unknown (why)"."""
+    return str(ahead) if ahead >= 0 else "unknown (%s)" % why
+
+
+def fetch_origin(run):
+    """`git fetch --quiet origin` through run(*args, timeout=...) (git or gitd for one repo). None if it worked,
+    else the line that says so: the landed check then uses the refs of the last fetch."""
+    r = run("fetch", "--quiet", "origin", timeout=120)
+    if r.returncode == 0:
+        return None
+    said = (r.stderr or r.stdout).strip().splitlines() or ["exit %d" % r.returncode]
+    return "could not fetch origin (%s); checked against the last fetched refs" % said[0][:200]
 
 
 def unlanded(wt, fetch=True):
-    """What would be lost by removing a linked worktree: (dirty lines, unmerged commit count, base)."""
-    g = lambda *a: git(wt["path"], *a)  # noqa: E731
-    if fetch:
-        git(wt["path"], "fetch", "--quiet", "origin", timeout=120)
+    """What would be lost by removing a linked worktree, after `git fetch origin` unless fetch is False:
+    (dirty lines, unmerged commit count, why the count is unknown or None, base, git's error if git status
+    failed, else None, fetch_origin's line if the fetch failed, else None)."""
+    g = lambda *a, **kw: git(wt["path"], *a, **kw)  # noqa: E731
+    fetch_note = fetch_origin(g) if fetch else None
     base = default_base(g)
-    dirty = [l for l in g("status", "--porcelain").stdout.splitlines() if l.strip()]
-    return dirty, unmerged(g, base, "HEAD"), base
+    st = g("status", "--porcelain")
+    dirty = [l for l in st.stdout.splitlines() if l.strip()]
+    status_error = (st.stderr or st.stdout).strip()[:200] if st.returncode != 0 else None
+    ahead, why = unmerged(g, base, "HEAD")
+    return dirty, ahead, why, base, status_error, fetch_note
 
 
 def _dirs(d):
@@ -129,6 +138,16 @@ def _dirs(d):
         return sorted(e.path for e in os.scandir(d) if e.is_dir() and not e.name.startswith("."))
     except OSError:
         return []
+
+
+def registered(common):
+    """[(root, branch)] for each worktree the repository at common dir lists (git worktree list)."""
+    out = []
+    for block in gitd(common, "worktree", "list", "--porcelain").stdout.split("\n\n"):
+        fields = dict(l.split(" ", 1) for l in block.splitlines() if " " in l)
+        if fields.get("worktree"):
+            out.append((fields["worktree"], fields.get("branch", "").replace("refs/heads/", "")))
+    return out
 
 
 def find_registration(path, limit=400):
@@ -141,17 +160,13 @@ def find_registration(path, limit=400):
         anc = os.path.dirname(anc)
     seen = set()
     for c in ([anc] + _dirs(anc) + _dirs(os.path.dirname(anc)))[:limit]:
-        if git(c, "rev-parse", "--git-dir", timeout=10).returncode != 0:
-            continue
-        common = _common(c)
-        if common in seen:
+        common = commands.common_dir(c)
+        if not common or common in seen:   # not a git repo, or one already searched
             continue
         seen.add(common)
-        for block in gitd(common, "worktree", "list", "--porcelain").stdout.split("\n\n"):
-            fields = dict(l.split(" ", 1) for l in block.splitlines() if " " in l)
-            root = fields.get("worktree")
-            if root and (p == root or p.startswith(root.rstrip("/") + "/")):
-                return common, root, fields.get("branch", "").replace("refs/heads/", "")
+        for root, branch in registered(common):
+            if p == root or p.startswith(root.rstrip("/") + "/"):
+                return common, root, branch
     return None
 
 
@@ -164,9 +179,9 @@ def end_session(info, delay=0):
         subprocess.Popen(["sh", "-c", "sleep %d; tmux kill-session -t '=%s'" % (delay, info["tmux"].replace("'", ""))],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return "tmux session %s ends in %ds" % (info["tmux"], delay)
-    run("tmux", "kill-session", "-t", "=" + info["tmux"], timeout=10)
+    commands.run(["tmux", "kill-session", "-t", "=" + info["tmux"]], timeout=10)
     for _ in range(20):
-        if not tmux_has(info["tmux"]):
+        if not commands.tmux_has(info["tmux"]):
             return "ended tmux session %s" % info["tmux"]
         time.sleep(0.25)
     return "tmux session %s did not end" % info["tmux"]
@@ -199,14 +214,19 @@ def close(info, force=False, dry_run=False, self_=False, fetch=True):
     wt = worktree(info.get("cwd"))
     lines, stale = [], None
     if wt["kind"] == "linked":
-        dirty, ahead, base = unlanded(wt, fetch=fetch)
+        dirty, ahead, why, base, status_error, fetch_note = unlanded(wt, fetch=fetch)
+        if fetch_note:
+            lines.append(fetch_note)
         problems = []
+        if status_error:
+            problems.append("git status failed, so uncommitted work can't be ruled out (%s)" % status_error)
         if dirty:
             problems.append("%d uncommitted/untracked path(s): %s" % (len(dirty), "; ".join(l[3:] for l in dirty[:5])))
         if ahead != 0:
-            problems.append("%s commit(s) on %s not in %s" % (ahead if ahead > 0 else "unknown", wt["branch"], base or "origin"))
+            problems.append("%s commit(s) on %s not in %s" % (commits_text(ahead, why), wt["branch"], base or "origin"))
         if problems and not force:
-            return 2, ["not closing %s: %s. Land the work first, or pass --force to discard it." % (who, " and ".join(problems))]
+            return 2, ["not closing %s: %s. Land the work first, or pass --force to discard it." % (
+                who, " and ".join(problems))] + lines
         if problems:
             lines.append("discarding (--force): " + " and ".join(problems))
     elif wt["kind"] == "unknown":
@@ -218,11 +238,12 @@ def close(info, force=False, dry_run=False, self_=False, fetch=True):
         reg = find_registration(wt["path"])
         if reg:
             common, root, branch = reg
-            g = lambda *a: gitd(common, *a)  # noqa: E731
-            if fetch:
-                gitd(common, "fetch", "--quiet", "origin", timeout=120)
-            ahead = unmerged(g, default_base(g), branch) if branch else 0
-            stale = (common, root, branch, ahead == 0 or force, ahead)
+            g = lambda *a, **kw: gitd(common, *a, **kw)  # noqa: E731
+            fetch_note = fetch_origin(g) if fetch else None
+            if fetch_note:
+                lines.append(fetch_note)
+            ahead, why = unmerged(g, default_base(g), branch) if branch else (0, None)
+            stale = (common, root, branch, ahead == 0 or force, commits_text(ahead, why))
         else:
             lines.append("%s is already gone and no repo still lists it" % wt["path"])
     else:
@@ -238,13 +259,18 @@ def close(info, force=False, dry_run=False, self_=False, fetch=True):
         ok, msg = remove(wt, force=force)
         lines.append(msg)
     elif stale:
-        common, root, branch, drop, ahead = stale
-        gitd(common, "worktree", "prune")
-        msg = "pruned stale worktree %s" % root
-        if branch:
-            msg += "; " + (delete_branch(common, branch) if drop else
-                           "kept branch %s: %s commit(s) not landed (--force to delete)" % (branch, ahead))
-        lines.append(msg)
+        common, root, branch, drop, ahead_text = stale
+        r = gitd(common, "worktree", "prune")
+        if r.returncode != 0 or root in [w for w, _ in registered(common)]:   # prune can warn and still exit 0
+            ok = False
+            lines.append("stale worktree %s not pruned: %s" % (root, (r.stderr or r.stdout).strip()[:200]
+                                                               or "git still lists it"))
+        else:
+            msg = "pruned stale worktree %s" % root
+            if branch:
+                msg += "; " + (delete_branch(common, branch) if drop else
+                               "kept branch %s: %s commit(s) not landed (--force to delete)" % (branch, ahead_text))
+            lines.append(msg)
     statuslog.append({"cli": info.get("cli", "?"), "session_id": info.get("session_id", ""), "name": info.get("name") or "",
                       "cwd": info.get("cwd") or "", "branch": wt.get("branch", ""), "event": "closed",
                       "text": "; ".join(lines)})

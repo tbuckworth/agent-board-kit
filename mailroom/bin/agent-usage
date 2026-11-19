@@ -3,20 +3,10 @@
 
     agent-usage [--json] [--refresh] [--repo PATH] [--cli claude|codex]
     agent-usage --pick [--repo PATH] [--cli claude|codex]     # just the target, e.g. claude:work or codex
-    agent-usage init-account NAME --config-dir DIR [--copy-mcp a,b] [--dry-run]
+    agent-usage init-account NAME --config-dir DIR [--copy-mcp a,b] [--dry-run]   # prepare a second Claude login
 
-Percentages are REMAINING, as each provider's server reports them, read through the CLIs themselves:
-Claude Code answers a `get_usage` control request (what /usage shows) and Codex's app-server answers
-account/rateLimits/read (what /status shows). Neither sends a prompt, so no quota is spent; about 2 s per
-account, in parallel, then cached for 2 minutes. No token or credential is read, printed or stored here.
-
-The recommendation takes accounts in config order (usage.order) and picks the first whose 5-hour and weekly
-windows (and the weekly window of the model agents run, if there is one) all keep at least usage.min_remaining
-percent. --repo applies per-account exclude_owners/only_owners to that repo's GitHub owner.
-
-init-account prepares a second Claude login: a new config dir that shares CLAUDE.md, settings, skills, hooks
-and plugins with ~/.claude by symlink, and keeps credentials, sessions and transcripts separate. You then log
-in yourself: CLAUDE_CONFIG_DIR=DIR claude, then /login. Settings: config key "usage", agentmail/usage.py.
+Details: README.md, section "Usage-aware routing and a second Claude login"; settings: config key "usage"
+(agentmail/usage.py DEFAULTS).
 """
 import argparse
 import json
@@ -25,7 +15,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import config, usage  # noqa: E402
+from agentmail import accounts, config, registry, usage  # noqa: E402
+from agentmail.commands import CommandError  # noqa: E402
 
 
 def resolve_repo(repo, cfg):
@@ -38,8 +29,12 @@ def resolve_repo(repo, cfg):
 
 def cmd_report(a):
     cfg = config.load()
+    try:
+        owner = accounts.repo_owner(a.repo) if a.repo else None
+    except CommandError as e:
+        print("agent-usage: %s" % e, file=sys.stderr)
+        return 1
     snaps = usage.snapshots(cfg, refresh=a.refresh)
-    owner = usage.repo_owner(resolve_repo(a.repo, cfg)) if a.repo else None
     rec = usage.recommend(snaps, cfg, owner=owner, only_cli=a.cli)
     if a.pick:
         print(rec["use"] or "")
@@ -59,7 +54,8 @@ def cmd_init(a):
         return 1
     mcp = [m.strip() for m in (a.copy_mcp or "").split(",") if m.strip()]
     try:
-        done = usage.init_account(a.config_dir, copy_mcp=mcp, dry_run=a.dry_run)
+        done = accounts.init_account(a.config_dir, registry.DEFAULT_CLAUDE_HOME, registry.CLAUDE_JSON, copy_mcp=mcp,
+                                     dry_run=a.dry_run)
     except (ValueError, OSError) as e:
         print("agent-usage: %s" % e, file=sys.stderr)
         return 1
@@ -67,11 +63,11 @@ def cmd_init(a):
     for line in done or ["nothing to do: %s is already set up" % d]:
         print(("would " if a.dry_run else "") + line)
     s = usage.settings(config.load())
-    dflt = usage.default_account(s) or "personal"
+    dflt = accounts.default_account(s) or "default"
     accts = {n: v for n, v in s["claude_accounts"].items() if n != a.name}
     accts.setdefault(dflt, {"config_dir": None})
     snippet = {"usage": {"claude_accounts": dict({a.name: {"config_dir": d, "label": a.name}}, **accts),
-                         "order": ["claude:" + a.name] + ["claude:" + n for n in accts] + ["codex"]}}
+                         "order": [usage.claude_target(n) for n in [a.name] + list(accts)] + [usage.CODEX]}}
     print("\nNext steps (you, not an agent):\n"
           "  1. CLAUDE_CONFIG_DIR=%s claude      # pick a theme, then /login with the %s account\n"
           "  2. set in ~/.config/agent-mail/config.json (rename the default login's account if you like):\n"
@@ -99,7 +95,7 @@ def main(argv=None):
     ap.add_argument("--refresh", action="store_true", help="ignore the cache and read every account now")
     ap.add_argument("--pick", action="store_true", help="print only the recommended target")
     ap.add_argument("--repo", help="the repo the agent will work on (account owner rules)")
-    ap.add_argument("--cli", choices=["claude", "codex"], help="recommend only among this CLI's accounts")
+    ap.add_argument("--cli", choices=config.CLIS, help="recommend only among this CLI's accounts")
     return cmd_report(ap.parse_args(argv))
 
 

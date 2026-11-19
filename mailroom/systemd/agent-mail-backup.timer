@@ -1,0 +1,10 @@
+[Unit]
+Description=agent-mail-backup: every hour (README.md, "The Mail tab's mailbox")
+
+[Timer]
+OnCalendar=hourly
+# A run missed while the desktop was off starts at the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

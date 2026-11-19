@@ -4,3 +4,4 @@ mac/.build/
 mac/build/
 *.app
 shots/
+.venv/

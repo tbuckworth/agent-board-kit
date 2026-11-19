@@ -137,6 +137,9 @@ struct Sidebar: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 1) {
+                SidebarRow(title: "Triage", count: TriageDeck.shared.poolCount(store), icon: "rectangle.stack",
+                           selected: store.route == .triage) { store.route = .triage; store.query = "" }
+                    .padding(.bottom, store.agentTasks.isEmpty ? 6 : 0)
                 if !store.agentTasks.isEmpty {
                     SidebarRow(title: "With agents", count: store.agentTasks.count, icon: "person.crop.circle.badge.clock",
                                selected: store.route == .agents, tint: Palette.caramel) { store.route = .agents }
@@ -333,6 +336,7 @@ struct MainColumn: View {
             case .list(let name): ListColumn(store: store, name: name)
             case .agents: AgentsColumn(store: store)
             case .search: SearchColumn(store: store)
+            case .triage: TriageColumn(store: store)
             }
             if !store.marked.isEmpty {
                 Divider()
@@ -390,7 +394,7 @@ struct RateMenu: View {
     var body: some View {
         Menu {
             Section("Importance") {
-                ForEach(["high", "medium", "low"], id: \.self) { i in Button(i.capitalized) { store.rateMany(numbers, importance: i) } }
+                ForEach(Rating.importances, id: \.self) { i in Button(i.capitalized) { store.rateMany(numbers, importance: i) } }
             }
             Section("Urgency") {
                 Button("Urgent") { store.rateMany(numbers, urgency: "high") }
@@ -592,7 +596,12 @@ struct FilterChips: View {
             }
             ForEach(secs, id: \.self) { s in chip(s, store.filters.section == s) { store.filters.section = store.filters.section == s ? nil : s } }
             divider
-            ForEach(priorities, id: \.self) { p in chip(p, store.filters.priority == p) { store.filters.priority = store.filters.priority == p ? nil : p } }
+            ForEach(Rating.importances + [Rating.unrated], id: \.self) { i in
+                chip(i, store.filters.importance == i) { store.filters.importance = store.filters.importance == i ? nil : i }
+                    .help(i == Rating.unrated ? "No importance rating" : "Importance: \(i)")
+            }
+            chip("urgent", store.filters.urgent) { store.filters.urgent.toggle() }
+                .help(Rating.urgentHelp)
             if store.filters.active {
                 Button { store.filters = Filters() } label: {
                     Text("Filtered · Clear").font(.system(size: 11 * z, weight: .semibold)).foregroundColor(Palette.attention)
@@ -705,7 +714,8 @@ struct TaskRows: View {
                             store.click(t.number, shift: mods.contains(.shift), command: mods.contains(.command))
                         },
                         edit: { store.selection = t.number; store.editing = t.number },
-                        fold: { store.toggleFold(t.number) })
+                        fold: { store.toggleFold(t.number) },
+                        openMail: { store.openAgentMail(t) })
                     .id(t.number)
                     .draggable("task:\(t.number)") {
                         TaskDragPreview(task: t, count: picked ? store.marked.count : 1)
@@ -760,8 +770,7 @@ struct TaskMenu: View {
         Menu("Move to list") {
             ForEach(store.allLists, id: \.self) { l in
                 Button(titleCase(l)) {
-                    store.saveEdit(task.number, title: task.title, notes: task.notes, list: l, section: task.section,
-                                   priority: task.priority)
+                    store.saveEdit(task.number, title: task.title, notes: task.notes, list: l, section: task.section)
                 }
             }
         }
@@ -781,18 +790,19 @@ struct TaskMenu: View {
 struct CheckCircle: View {
     @Environment(\.zoom) private var z
     let done: Bool
-    let priority: String
+    let importance: String?
     var onCaramel = false
     var size: CGFloat = 18
 
     var body: some View {
-        let ring: Color = onCaramel ? .white.opacity(0.85) : priority == "high" ? Palette.red : Color.secondary.opacity(priority == "low" ? 0.45 : 0.8)
+        let style = Rating.Ring(importance: importance)
+        let ring: Color = onCaramel ? .white.opacity(0.85) : style == .strong ? Palette.red : Color.secondary.opacity(style == .faint ? 0.45 : 0.8)
         ZStack {
             if done {
                 Circle().fill(Palette.green)
                 Image(systemName: "checkmark").font(.system(size: size * 0.5 * z, weight: .bold)).foregroundColor(.white)
             } else {
-                Circle().strokeBorder(ring, style: StrokeStyle(lineWidth: priority == "high" ? 2 : 1.5, dash: priority == "low" ? [2.5, 2] : []))
+                Circle().strokeBorder(ring, style: StrokeStyle(lineWidth: style == .strong ? 2 : 1.5, dash: style == .faint ? [2.5, 2] : []))
             }
         }
         .frame(width: size * z, height: size * z)
@@ -811,7 +821,9 @@ struct TaskRow: View {
     var select: () -> Void
     var edit: () -> Void
     var fold: (() -> Void)? = nil
+    var openMail: (() -> Void)? = nil               // double-click the agent: its latest mail to the owner
     @State private var ticking = false              // ticked on screen at once; leaves the list a moment later
+    @State private var mailClick = false            // this double-click was on the agent's name, not for editing
 
     var body: some View {
         let caramel = task.agentActive
@@ -830,7 +842,7 @@ struct TaskRow: View {
                 .padding(.trailing, -6)
                 .help(entry?.expanded == true ? "Fold the group" : "Show the group's tasks")
             }
-            Button(action: tick) { CheckCircle(done: done, priority: task.priority, onCaramel: caramel) }
+            Button(action: tick) { CheckCircle(done: done, importance: task.importance, onCaramel: caramel) }
                 .buttonStyle(.plain)
                 .help(task.isOpen ? (group ? "Complete the group and its tasks (space)" : "Complete (space)") : "Reopen")
             Text(task.title)
@@ -860,8 +872,22 @@ struct TaskRow: View {
         .contentShape(Rectangle())
         // one gesture, reading the click count: a double-tap recogniser would hold every single click back
         .simultaneousGesture(TapGesture().onEnded {
-            if (NSApp.currentEvent?.clickCount ?? 1) >= 2 { edit() } else { select() }
+            if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                // after the agent tag's own gesture, which fires for the same click: that one opens the mail instead
+                DispatchQueue.main.async { if mailClick { mailClick = false } else { edit() } }
+            } else { select() }
         })
+    }
+
+    /// The agent's tag: a double-click opens its latest mail to the owner, as on the agent board.
+    func agentTag<V: View>(_ v: V) -> some View {
+        v.contentShape(Rectangle())
+            .simultaneousGesture(TapGesture().onEnded {
+                guard (NSApp.currentEvent?.clickCount ?? 1) >= 2, let open = openMail else { return }
+                mailClick = true
+                open()
+            })
+            .help("Double-click to open the agent's latest email")
     }
 
     func tick() {
@@ -881,6 +907,13 @@ struct TaskRow: View {
                 Image(systemName: "exclamationmark.circle.fill").foregroundColor(Palette.red).help("Couldn't save: \(task.failed ?? "")")
             } else if task.pending {
                 Image(systemName: "icloud.and.arrow.up").help("Waiting to reach GitHub")
+            }
+            let marks = Rating.marks(task, now: now)
+            if marks.urgent {
+                tag("urgent", caramel, color: caramel ? nil : Palette.red).help(Rating.urgentHelp)
+            }
+            if let d = marks.due {
+                Text(d).foregroundColor(marks.overdue && !caramel ? Palette.red : nil)
             }
             if showList { Text(titleCase(task.list)) }
             if !task.allChecklist.isEmpty {
@@ -903,10 +936,10 @@ struct TaskRow: View {
             if task.assigned {
                 if caramel {
                     PulseDot()
-                    tag(task.agent?.name ?? "agent", true, bold: true)
+                    agentTag(tag(task.agent?.name ?? "agent", true, bold: true))
                     Text(task.agent?.status == "started" ? "working" : "starting")
                 } else {
-                    tag("agent " + (task.agent?.status ?? "assigned"), false, color: Palette.caramel)
+                    agentTag(tag("agent " + (task.agent?.status ?? "assigned"), false, color: Palette.caramel))
                 }
             }
             Text(Fmt.age(task.issue.updatedAt, now: now)).monospacedDigit()
@@ -959,16 +992,6 @@ struct TaskDragPreview: View {
     }
 }
 
-struct PulseDot: View {
-    @Environment(\.zoom) private var z
-    @State private var on = false
-    var body: some View {
-        Circle().fill(Color.white).frame(width: 6 * z, height: 6 * z)
-            .opacity(on ? 1 : 0.3)
-            .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { on = true } }
-    }
-}
-
 // MARK: - footer
 
 struct FooterBar: View {
@@ -977,7 +1000,7 @@ struct FooterBar: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            legend(Palette.red, "high priority", store.live.filter { $0.isOpen && $0.priority == "high" }.count)
+            legend(Palette.red, "high importance", store.live.filter { $0.isOpen && $0.importance == "high" }.count)
             legend(Palette.caramel, "with an agent", store.activeAgents)
             if !store.pending.isEmpty { legend(Palette.ok, "waiting to save", store.pending.count) }
             if !store.conflicts.isEmpty { legend(Palette.attention, "to resolve", store.conflicts.count) }

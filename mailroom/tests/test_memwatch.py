@@ -1,5 +1,5 @@
-import importlib.machinery
-import importlib.util
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -11,20 +11,14 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agentmail import memwatch  # noqa: E402
+import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
+from scripts import load_script  # noqa: E402
+from agentmail import config, memwatch  # noqa: E402
 
 G = 1 << 30
-S = dict(memwatch.DEFAULTS)
-EXP1 = {"cli": "claude", "id": "c0c0c0c0-0000", "name": "exp1", "live": True, "pid": 100}
+S = memwatch.settings(config.load())
+RUN_A = {"cli": "claude", "id": "c0c0c0c0-0000", "name": "run-a", "live": True, "pid": 100}
 RM = {"cli": "claude", "id": "rm-0000", "name": "rm-280", "live": True, "pid": 200}
-
-
-def load_script(name):
-    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(ROOT / "bin" / name))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
 
 
 def proc(pid, ppid, comm, gb, cgroup="/user.slice/app.slice/tmux-spawn-1.scope"):
@@ -36,7 +30,7 @@ def use(ram_pct, swap_pct=0.0, total=64 * G, swap_total=16 * G):
             "swap_used": swap_total * swap_pct / 100, "swap_pct": swap_pct}
 
 
-# An OOM storm, roughly: an agent's batch, a docker container, two small agents.
+# A night of memory pressure, roughly: an agent's batch, a docker container, two small agents.
 PROCS = [proc(100, 1, "claude", 0.4), proc(101, 100, "bash", 0.0), proc(102, 101, "pp", 5.3),
          proc(103, 1, "pp", 5.2, "/user.slice/app.slice/pp-rejudge.scope"),           # nohup'd, own scope
          proc(104, 1, "pp", 5.1),                                                       # nohup'd, agent's pane
@@ -45,8 +39,14 @@ PROCS = [proc(100, 1, "claude", 0.4), proc(101, 100, "bash", 0.0), proc(102, 101
 
 
 def own(procs=PROCS, env=None):
-    env = {103: EXP1["id"]} if env is None else env
-    return memwatch.owners(procs, {100: EXP1, 200: RM}, [EXP1, RM], env_of=env.get, env_min=0)
+    env = {103: RUN_A["id"]} if env is None else env
+    return memwatch.owners(procs, {100: RUN_A, 200: RM}, [RUN_A, RM], env_of=env.get, env_min=0)
+
+
+def sent(state, u, own_, caps, s, now):
+    """memwatch.decide, then every action it returns recorded as sent: agent-memwatch's pass when each send works."""
+    acts, st = memwatch.decide(state, u, own_, caps, s, now)
+    return acts, memwatch.record(st, [a[-1] for a in acts], now)
 
 
 class Reading(unittest.TestCase):
@@ -69,7 +69,7 @@ class Reading(unittest.TestCase):
 class Attribution(unittest.TestCase):
     def test_batch_is_charged_to_the_agent_that_started_it(self):
         o = own()
-        self.assertEqual(o[0]["label"], "claude exp1")
+        self.assertEqual(o[0]["label"], "claude run-a")
         # ancestry (102), environment after nohup into its own scope (103), the agent's pane cgroup (104)
         self.assertAlmostEqual(o[0]["mem"] / G, 0.4 + 5.3 + 5.2 + 5.1, places=3)
         self.assertEqual(o[0]["top"][0][:2], ("pp", 3))
@@ -94,23 +94,24 @@ class Decisions(unittest.TestCase):
 
     def test_warn_pings_the_majority_holder_once_per_half_hour(self):
         u = use(82)
-        acts, st = memwatch.decide({}, u, own(), [], S, 1000)
-        self.assertEqual([(a[0], a[1]["label"], a[2]) for a in acts], [("ping", "claude exp1", 1)])
+        acts, st = sent({}, u, own(), [], S, 1000)
+        self.assertEqual([(a[0], a[1]["label"], a[2]) for a in acts], [("ping", "claude run-a", 1)])
         self.assertIn("16.0 GB", acts[0][3])
         self.assertIn("pp x3", acts[0][3])
-        self.assertEqual(memwatch.decide(st, u, own(), [], S, 1000 + 29 * 60)[0], [])
-        self.assertEqual(len(memwatch.decide(st, u, own(), [], S, 1000 + 31 * 60)[0]), 1)
+        self.assertEqual(sent(st, u, own(), [], S, 1000 + 29 * 60)[0], [])
+        self.assertEqual(len(sent(st, u, own(), [], S, 1000 + 31 * 60)[0]), 1)
 
     def test_urgent_pings_again_and_emails_once_an_hour(self):
-        _, st = memwatch.decide({}, use(82), own(), [], S, 1000)
-        acts, st = memwatch.decide(st, use(91), own(), [], S, 1060)
+        _, st = sent({}, use(82), own(), [], S, 1000)
+        acts, st = sent(st, use(91), own(), [], S, 1060)
         self.assertEqual([a[0] for a in acts], ["ping", "email"])
         self.assertIn("URGENT", acts[0][3])
-        self.assertIn("claude exp1 holds 16.0 GB", acts[1][1])
+        self.assertIn("it can kill the user manager, which ends every session.", acts[0][3])
+        self.assertIn("claude run-a holds 16.0 GB", acts[1][1])
         self.assertIn("docker-6ac6.scope", acts[1][2])
-        self.assertIn("Messaged: claude exp1.", acts[1][2])
-        self.assertEqual(memwatch.decide(st, use(91), own(), [], S, 1060 + 1800)[0][0][0], "ping")
-        self.assertNotIn("email", [a[0] for a in memwatch.decide(st, use(91), own(), [], S, 1060 + 1800)[0]])
+        self.assertIn("Messaged: claude run-a.", acts[1][2])
+        self.assertEqual(sent(st, use(91), own(), [], S, 1060 + 1800)[0][0][0], "ping")
+        self.assertNotIn("email", [a[0] for a in sent(st, use(91), own(), [], S, 1060 + 1800)[0]])
 
     def test_swap_half_full_makes_a_warning_urgent(self):
         self.assertEqual(memwatch.level(use(82, swap_pct=55), S), 2)
@@ -118,34 +119,34 @@ class Decisions(unittest.TestCase):
         self.assertEqual(memwatch.level(use(82, swap_pct=55, swap_total=0), S), 1)
 
     def test_swap_alone_is_quiet(self):
-        # 2026-10-25 17:30 to 08:31: RAM 13-19%, swap 50-61% left over from earlier pressure, no memory pressure.
-        # Counting swap alone as urgent emailed the owner 16 times, once an hour, and pinged two agents 12 times.
+        # A whole night: RAM 13-19%, swap 50-61% left over from earlier pressure, no memory pressure.
+        # Counting swap alone as urgent emailed Alex 16 times, once an hour, and pinged two agents 12 times.
         self.assertEqual(memwatch.level(use(14, swap_pct=61), S), 0)
         self.assertEqual(memwatch.level(use(60, swap_pct=100), S), 0)
         procs = PROCS + [proc(201, 200, "vllm", 3.5, "/user.slice/app.slice/tmux-spawn-2.scope")]
-        st, sent = {}, []
+        st, went = {}, []
         for t in range(0, 16 * 3600, 15):
-            acts, st = memwatch.decide(st, use(14, swap_pct=61), own(procs), [], S, t)
-            sent += acts
-        self.assertEqual(sent, [])
+            acts, st = sent(st, use(14, swap_pct=61), own(procs), [], S, t)
+            went += acts
+        self.assertEqual(went, [])
 
     def test_rearms_below_75(self):
-        _, st = memwatch.decide({}, use(82), own(), [], S, 1000)
-        _, st = memwatch.decide(st, use(70), own(), [], S, 1100)
-        self.assertEqual(len(memwatch.decide(st, use(82), own(), [], S, 1200)[0]), 1)
+        _, st = sent({}, use(82), own(), [], S, 1000)
+        _, st = sent(st, use(70), own(), [], S, 1100)
+        self.assertEqual(len(sent(st, use(82), own(), [], S, 1200)[0]), 1)
 
     def test_rearm_with_swap_still_full(self):
-        _, st = memwatch.decide({}, use(82, swap_pct=60), own(), [], S, 1000)
-        _, st = memwatch.decide(st, use(70, swap_pct=60), own(), [], S, 1100)
+        _, st = sent({}, use(82, swap_pct=60), own(), [], S, 1000)
+        _, st = sent(st, use(70, swap_pct=60), own(), [], S, 1100)
         self.assertEqual(st["sent"].keys(), {"email"})
 
     def test_rearm_keeps_the_email_to_once_an_hour(self):
-        acts, st = memwatch.decide({}, use(91), own(), [], S, 1000)
+        acts, st = sent({}, use(91), own(), [], S, 1000)
         self.assertEqual([a[0] for a in acts], ["ping", "email"])
-        _, st = memwatch.decide(st, use(70), own(), [], S, 1100)
-        acts, st = memwatch.decide(st, use(91), own(), [], S, 1200)
+        _, st = sent(st, use(70), own(), [], S, 1100)
+        acts, st = sent(st, use(91), own(), [], S, 1200)
         self.assertEqual([a[0] for a in acts], ["ping"])
-        self.assertIn("email", [a[0] for a in memwatch.decide(st, use(91), own(), [], S, 1000 + 3600)[0]])
+        self.assertIn("email", [a[0] for a in sent(st, use(91), own(), [], S, 1000 + 3600)[0]])
 
     def test_email_says_when_no_agent_was_messaged(self):
         procs = [proc(300, 1, "uvicorn", 40, "/system.slice/docker-6ac6.scope"), proc(200, 1, "claude", 1.0)]
@@ -161,12 +162,20 @@ class Decisions(unittest.TestCase):
 
     def test_cap_warning_independent_of_desktop_level(self):
         g = own()[0]
-        acts, st = memwatch.decide({}, use(40), own(), [(g, 29 * G, 32 * G)], S, 0)
+        acts, st = sent({}, use(40), own(), [(g, 29 * G, 32 * G)], S, 0)
         self.assertEqual([(a[0], a[2]) for a in acts], [("ping", "cap")])
         self.assertIn("29.0 GB of its 32.0 GB", acts[0][3])
-        self.assertEqual(memwatch.decide({}, use(40), own(), [(g, 20 * G, 32 * G)], S, 0)[0], [])
-        _, st = memwatch.decide(st, use(40), own(), [], S, 60)  # a re-arm keeps the cap's repeat limit
+        self.assertEqual(sent({}, use(40), own(), [(g, 20 * G, 32 * G)], S, 0)[0], [])
+        _, st = sent(st, use(40), own(), [], S, 60)  # a re-arm keeps the cap's repeat limit
         self.assertIn("cap:" + g["key"], st["sent"])
+
+    def test_only_what_was_sent_is_recorded(self):
+        """An urgent email that agent-mail failed to send is due again on the next pass; the ping that went is not."""
+        acts, st = memwatch.decide({}, use(91), own(), [], S, 1000)
+        self.assertEqual([(a[0], a[-1]) for a in acts], [("ping", "session:%s:2" % RUN_A["id"]), ("email", "email")])
+        self.assertEqual(st, {"sent": {}})   # deciding records nothing
+        st = memwatch.record(st, [acts[0][-1]], 1000)
+        self.assertEqual([a[0] for a in memwatch.decide(st, use(91), own(), [], S, 1015)[0]], ["email"])
 
 
 class Command(unittest.TestCase):
@@ -182,16 +191,31 @@ class Command(unittest.TestCase):
         mw = load_script("agent-memwatch")
         o = own()
         calls = []
+        # agent-send and agent-mail, which would reach a live session and Gmail
         with mock.patch.object(mw.subprocess, "run", side_effect=lambda cmd, **k: calls.append((cmd, k.get("input")))
                                or subprocess.CompletedProcess(cmd, 0, "ok", "")), \
-                mock.patch.object(mw, "log"):
-            mw.act([("ping", o[0], 1, "hello"), ("email", "subj", "body")], {"allowlist": ["t@x"]})
-        # siblings run under this interpreter (the kit venv), never whatever python3 is first on PATH
-        self.assertEqual([c[0][0] for c in calls], [sys.executable, sys.executable])
-        self.assertEqual([Path(c[0][1]).name for c in calls], ["agent-send", "agent-mail"])
-        self.assertEqual(calls[0][0][2:], ["--from", "agent-memwatch", EXP1["id"], "hello"])
+                contextlib.redirect_stdout(io.StringIO()):
+            done = mw.act([("ping", o[0], 1, "hello", "k1"), ("email", "subj", "body", "email")],
+                          dict(config.load(), allowlist=["t@x"]))
+        self.assertEqual(done, ["k1", "email"])
+        self.assertEqual(calls[0][0][1:], ["--from", "agent-memwatch", RUN_A["id"], "hello"])
+        # agent-mail runs under this interpreter (the kit's venv, which holds the Google client libraries)
+        self.assertEqual(calls[1][0][0], sys.executable)
         self.assertEqual(calls[1][0][2:], ["send", "--unrouted", "--to", "t@x", "--subject", "[agent-memwatch] subj"])
         self.assertEqual(calls[1][1], "body")
+
+    def test_a_pass_saves_only_the_sends_that_worked(self):
+        """agent-mail fails (exit 1): the urgent email is not saved as sent, so the next pass tries it again."""
+        mw = load_script("agent-memwatch")
+        state = mw.jsonfile.JsonFile(Path(tempfile.mkdtemp()) / "memwatch.json", mw.jsonfile.PLAIN, None)
+
+        def run(cmd, **kw):   # agent-send and agent-mail: they reach live agents and Gmail
+            return subprocess.CompletedProcess(cmd, 1 if "send" in cmd[1:3] else 0, "", "boom")
+        with mock.patch.object(mw, "sample", return_value=(use(91), own(), [])), \
+                mock.patch.object(mw.subprocess, "run", side_effect=run), mock.patch.object(mw, "STATE", state), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mw.main(["--once"]), 0)
+        self.assertEqual(list(state.read()["sent"]), ["session:%s:2" % RUN_A["id"]])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 // Simple pub/sub state management
 import { isEffectivelyUrgent, isRatedList, localDateString } from './parser.js';
-import { matchesTagFilter, loadTagFilter, saveTagFilter, waitingLast } from './tags.js';
+import { matchesTagFilter, loadTagFilter, saveTagFilter, waitingLast, TAG_PREFIX } from './tags.js';
 
 const listeners = new Map();
 let state = {
@@ -97,7 +97,9 @@ export function getAllTags() {
   for (const issue of state.issues) for (const t of issue.tags || []) tags.add(t);
   for (const l of state.labels || []) {
     const name = l.name || l;
-    if (typeof name === 'string' && name.toLowerCase().startsWith('tag:')) tags.add(name.slice(4).toLowerCase());
+    if (typeof name === 'string' && name.toLowerCase().startsWith(TAG_PREFIX)) {
+      tags.add(name.slice(TAG_PREFIX.length).toLowerCase());
+    }
   }
   return [...tags].sort();
 }

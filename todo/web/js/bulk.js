@@ -4,7 +4,7 @@
 
 import { getState, setState, getIssueByNumber } from './state.js';
 import * as api from './api.js';
-import { parseIssue, buildLabels } from './parser.js';
+import { parseIssue, buildLabels, withList } from './parser.js';
 import {
   completeTask, reopenTask, deleteTask, saveRating, requestAgent, replaceLocal, cache, setTags, setWaiting,
 } from './actions.js';
@@ -74,8 +74,7 @@ export async function deleteTasks(numbers) {
 
 async function setList(number, listName) {
   const current = await api.getIssueLabels(number);
-  const labels = current.filter(l => !l.toLowerCase().startsWith('list:')).concat(`list:${listName}`);
-  const parsed = parseIssue(await api.updateIssue(number, { labels }));
+  const parsed = parseIssue(await api.updateIssue(number, { labels: withList(current, listName) }));
   replaceLocal(parsed);
   await cache(parsed);
 }
@@ -169,10 +168,12 @@ function setParentLocal(n, parentNumber) {
 }
 
 // Links a task into a group. The subtask label is what makes other devices notice: linking alone doesn't change
-// a task's updatedAt, and they only fetch tasks updated since their last sync.
+// a task's updatedAt, and they only fetch tasks updated since their last sync. A task moving from another group has
+// the label already, so it comes off first.
 async function link(parentNumber, childNumber) {
   const [pid, cid] = await Promise.all([nodeId(parentNumber), nodeId(childNumber)]);
   await api.addSubIssue(pid, cid);
+  if (getIssueByNumber(childNumber)?.labels.includes(SUBTASK_LABEL)) await api.removeLabels(cid, [SUBTASK_LABEL]);
   await api.addLabels(cid, [SUBTASK_LABEL]);
   setParentLocal(childNumber, parentNumber);
 }

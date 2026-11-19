@@ -12,7 +12,8 @@ from agentboard import cliupdate  # noqa: E402
 
 
 class FakeCli:
-    """`--version` answers from a list (before, after; None: it fails); `update` exits with `code`."""
+    """The runner for a CLI, standing in for `claude` or `codex`: a real `update` would reinstall this machine's CLI
+    over the network. `--version` answers from a list (before, after; None: it fails); `update` exits with `code`."""
     def __init__(self, versions, code=0, said=""):
         self.versions, self.code, self.said, self.calls = list(versions), code, said, []
 
@@ -27,7 +28,7 @@ class FakeCli:
 
 
 class UpdateTest(unittest.TestCase):
-    def one(self, fake, find=lambda n: "/bin/" + n):
+    def one(self, fake, find=lambda n: "/bin/" + n):        # find: where this machine has the CLI
         return cliupdate.update_one("claude", ["update"], fake, find)
 
     def test_up_to_date_changed_and_failed(self):

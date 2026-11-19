@@ -3,6 +3,9 @@ import { uuid } from './uuid.js';
 import {
   splitWaitingLine, withWaitingLine, tagFields, TAG_PREFIX, WAITING_LABEL, WAITING_CLEARED_LABEL, FOLLOW_UP_PREFIX,
 } from './tags.js';
+import {
+  LIST_PREFIX, IMPORTANCE_PREFIX, URGENCY_PREFIX, DUE_PREFIX, RATING_PREFIXES, ratingLabels,
+} from './labels.js';
 
 // Title case for list names ("to-buy" -> "To Buy"), as every client shows them
 export function titleCase(str) {
@@ -113,15 +116,15 @@ function extractChoice(labels, prefix, allowed) {
 }
 
 export function extractImportance(labels) {
-  return extractChoice(labels, 'importance:', IMPORTANCES);
+  return extractChoice(labels, IMPORTANCE_PREFIX, IMPORTANCES);
 }
 
 export function extractUrgency(labels) {
-  return extractChoice(labels, 'urgency:', URGENCIES);
+  return extractChoice(labels, URGENCY_PREFIX, URGENCIES);
 }
 
 export function extractDue(labels) {
-  const val = extractLabel(labels, 'due:');
+  const val = extractLabel(labels, DUE_PREFIX);
   return val && DUE_RE.test(val) ? val : null;
 }
 
@@ -228,7 +231,7 @@ export function parseIssue(raw) {
     checklist: extractChecklist(raw.body),
     claudeNotes: extractClaudeNotes(raw.body),
     section: extractLabel(labelNames, 'section:'),
-    listName: extractLabel(labelNames, 'list:') || 'tasks',
+    listName: extractLabel(labelNames, LIST_PREFIX) || 'tasks',
     groupName: extractLabel(labelNames, 'group:'),
     actionType: extractActionType(labelNames),
     ...ratingFields(labelNames),
@@ -243,24 +246,26 @@ export function parseIssue(raw) {
   };
 }
 
+// Labels with the list: label replaced by `listName`'s, or removed when it is null
+export function withList(labels, listName) {
+  const rest = (labels || []).filter(l => !l.toLowerCase().startsWith(LIST_PREFIX));
+  return listName ? [...rest, LIST_PREFIX + listName] : rest;
+}
+
 // Build labels for a task edit while preserving labels the app does not manage.
 // action: is no longer written; an existing action label is kept as it is.
 export function buildLabels(issue, groupName = undefined) {
-  // priority: is retired but stays managed, so an edit drops any old priority label
-  const managedPrefixes = ['section:', 'list:', 'group:', 'priority:', 'importance:', 'urgency:', 'due:',
-    TAG_PREFIX, FOLLOW_UP_PREFIX];
+  const managedPrefixes = ['section:', LIST_PREFIX, 'group:', ...RATING_PREFIXES, TAG_PREFIX, FOLLOW_UP_PREFIX];
   const labels = (issue.labels || []).filter(label =>
     !managedPrefixes.some(prefix => label.toLowerCase().startsWith(prefix))
     && ![WAITING_LABEL, WAITING_CLEARED_LABEL].includes(label.toLowerCase())
   );
 
   if (issue.section) labels.push(`section:${issue.section}`);
-  if (issue.listName) labels.push(`list:${issue.listName}`);
+  if (issue.listName) labels.push(LIST_PREFIX + issue.listName);
   const gn = groupName === undefined ? issue.groupName : groupName;
   if (gn) labels.push(`group:${gn}`);
-  if (issue.importance) labels.push(`importance:${issue.importance}`);
-  if (issue.urgency) labels.push(`urgency:${issue.urgency}`);
-  if (issue.due) labels.push(`due:${issue.due}`);
+  labels.push(...ratingLabels(issue));
   // Fields not set on `issue` (a task cached by an older version) come from its labels
   const fromLabels = tagFields(issue.labels || []);
   for (const tag of issue.tags ?? fromLabels.tags) labels.push(TAG_PREFIX + tag);

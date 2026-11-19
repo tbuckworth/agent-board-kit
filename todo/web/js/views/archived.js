@@ -6,7 +6,7 @@ import { navigate, getCurrentRoute } from '../router.js';
 import { taskRow } from '../components/task-row.js';
 import { showToast } from '../components/toast.js';
 import { titleCase } from '../parser.js';
-import { isArchived, needsStateReason } from '../triage.js';
+import { isArchived, needsStateReason } from '../labels.js';
 import * as actions from '../actions.js';
 
 let refreshedThisSession = false;

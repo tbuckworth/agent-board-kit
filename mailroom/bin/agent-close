@@ -2,13 +2,10 @@
 """agent-close: end an agent's session and remove its git worktree, once its work is landed.
 
     agent-close NAME [--force] [--dry-run]     # a session name/id (agent-send --list) or tmux name
-    agent-close --self [--force]               # from inside the agent, as its very last step
+    agent-close --self [--force] [--dry-run]   # from inside the agent, as its very last step
 
-Refuses (exit 2) while the worktree has uncommitted or untracked files, or commits that are not
-on origin's default branch; --force discards them. Only a linked worktree is removed (never a
-main checkout or a plain directory), with its branch; git-ignored files go with it. With --self
-the tmux session ends two seconds after this prints, so the agent sees the result.
 Exit codes: 0 closed, 1 error, 2 refused, 4 not found.
+Details: README.md, section "Closing an agent".
 """
 import argparse
 import sys

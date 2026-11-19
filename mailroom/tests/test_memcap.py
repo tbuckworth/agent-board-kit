@@ -1,6 +1,4 @@
 import contextlib
-import importlib.machinery
-import importlib.util
 import json
 import os
 import subprocess
@@ -15,17 +13,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agentmail import memcap  # noqa: E402
+import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
+import homes  # noqa: E402
+from scripts import load_script  # noqa: E402
+from agentmail import launch, memcap, procs, send  # noqa: E402
 
 G = 1 << 30
-
-
-def load_script(name):
-    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(ROOT / "bin" / name))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
 
 
 class Sizes(unittest.TestCase):
@@ -56,7 +49,32 @@ class Sizes(unittest.TestCase):
         self.assertTrue(len(memcap.unit_name("agent", "x" * 500)) < 200)
 
 
+@unittest.skipUnless(os.path.isdir("/proc"), "reads /proc")
+class Processes(unittest.TestCase):
+    def test_parent_children_and_command_line(self):
+        # a command name with a space and ") " in it: /proc/PID/stat shows it in parentheses before the parent pid
+        odd = Path(tempfile.mkdtemp()) / "s) 9 p"
+        odd.symlink_to("/bin/sleep")
+        kid = subprocess.Popen([str(odd), "30"])
+        self.addCleanup(kid.wait)
+        self.addCleanup(kid.kill)
+        self.assertEqual(procs.ppid(os.getpid()), os.getppid())
+        self.assertEqual(procs.ppid(kid.pid), os.getpid())
+        self.assertIn(kid.pid, procs.children(os.getpid()))
+        self.assertEqual(procs.parents()[kid.pid], os.getpid())
+        self.assertEqual(procs.children(10, {11: 10, 12: 99, 13: 10}), [11, 13])
+        self.assertEqual(procs.cmdline(kid.pid), [str(odd), "30"])
+        kid.kill()
+        kid.wait()
+        self.assertIsNone(procs.ppid(kid.pid))
+        self.assertEqual(procs.cmdline(kid.pid), [])
+
+
 class Scopes(unittest.TestCase):
+    """Scopes with systemd and the processes made up: `call` stands in for systemd's D-Bus API, and available,
+    cgroup and procs.tree for the bus and /proc, so no real process is moved; a test of adopt's order replaces
+    start_scope and attach too. RealScope runs them against the real user manager."""
+
     def test_start_scope_call_and_name_collision(self):
         calls = []
 
@@ -89,7 +107,7 @@ class Scopes(unittest.TestCase):
         started, attached = [], []
         with mock.patch.object(memcap, "available", return_value=True), \
                 mock.patch.object(memcap, "cgroup", side_effect=groups.get), \
-                mock.patch.object(memcap, "tree", return_value=[10, 11, 12, 13]), \
+                mock.patch.object(procs, "tree", return_value=[10, 11, 12, 13]), \
                 mock.patch.object(memcap, "wait_moved", return_value=True), \
                 mock.patch.object(memcap, "attach", side_effect=lambda u, p: attached.append((u, p)) or (True, "")), \
                 mock.patch.object(memcap, "start_scope",
@@ -109,7 +127,7 @@ class Scopes(unittest.TestCase):
         started = []
         with mock.patch.object(memcap, "available", return_value=True), \
                 mock.patch.object(memcap, "cgroup", side_effect=groups.get), \
-                mock.patch.object(memcap, "tree", return_value=[10, 11, 12]), \
+                mock.patch.object(procs, "tree", return_value=[10, 11, 12]), \
                 mock.patch.object(memcap, "wait_moved", return_value=True), \
                 mock.patch.object(memcap, "attach", return_value=(True, "")), \
                 mock.patch.object(memcap, "start_scope", side_effect=lambda u, p, *a: started.append((u, p)) or (u, "")):
@@ -132,13 +150,39 @@ class Scopes(unittest.TestCase):
             return u, u
         with mock.patch.object(memcap, "available", return_value=True), \
                 mock.patch.object(memcap, "cgroup", side_effect=groups.get), \
-                mock.patch.object(memcap, "tree", return_value=[20, 21, 22]), \
+                mock.patch.object(procs, "tree", return_value=[20, 21, 22]), \
                 mock.patch.object(memcap, "start_scope", side_effect=start), \
                 mock.patch.object(memcap, "attach", side_effect=lambda u, p, **k: swept.append(p) or (True, "")):
             unit, msg = memcap.adopt(20, "a", {}, "a", settle=0)
         self.assertEqual(unit, "agent-a.scope")
         self.assertEqual(started, [[20]])
         self.assertEqual(swept, [[21, 22]])
+
+    def test_processes_left_outside_are_reported_not_hidden(self):
+        """A sweep or attach systemd refuses, or a move not seen within 5 s, is in the message, not dropped."""
+        groups = {20: "/u/tmux-spawn-1.scope", 21: "/u/tmux-spawn-1.scope"}
+
+        def start(u, pids, *a):
+            groups[20] = "/u/" + u
+            return u, u
+        with mock.patch.object(memcap, "available", return_value=True), \
+                mock.patch.object(memcap, "cgroup", side_effect=groups.get), \
+                mock.patch.object(procs, "tree", return_value=[20, 21]), \
+                mock.patch.object(memcap, "start_scope", side_effect=start), \
+                mock.patch.object(memcap, "attach", return_value=(False, "21: Access denied")):
+            unit, msg = memcap.adopt(20, "a", {}, "a", settle=0)
+        self.assertEqual(unit, "agent-a.scope")
+        self.assertEqual(msg, "agent-a.scope; some of its processes stayed outside it: 21: Access denied")
+        svc = "/u/app.slice/agent-mailroom.service"
+        with mock.patch.object(memcap, "available", return_value=True), \
+                mock.patch.object(memcap, "cgroup", side_effect={10: svc, 11: svc}.get), \
+                mock.patch.object(procs, "tree", return_value=[10, 11]), \
+                mock.patch.object(memcap, "wait_moved", return_value=False), \
+                mock.patch.object(memcap, "attach", return_value=(False, "11: Access denied")), \
+                mock.patch.object(memcap, "start_scope", side_effect=lambda u, p, *a: (u, "")):
+            unit, how = memcap.free_from_service(10, "tmux-server", "tmux server")
+        self.assertEqual(how, "moved out of agent-mailroom.service into tmux-server.scope; but 10 was not seen in it "
+                              "within 5 s; and some of its processes stayed in agent-mailroom.service: 11: Access denied")
 
     def test_attach_survives_a_pid_that_exited(self):
         visible = {31, 32, 33}            # 34 is already gone: filtered out before any call
@@ -172,7 +216,7 @@ class BackgroundSession(unittest.TestCase):
             self.assertEqual(memcap.find_bg_session(sid, timeout=5), p.pid)
             self.assertIsNone(memcap.find_bg_session(str(uuid.uuid4()), timeout=0))
         finally:
-            for pid in memcap.tree(p.pid):
+            for pid in procs.tree(p.pid):
                 with contextlib.suppress(OSError):
                     os.kill(pid, 9)
             p.wait()
@@ -185,7 +229,7 @@ class BackgroundSession(unittest.TestCase):
         host = subprocess.Popen([sys.executable, "-c", code, "bg-pty-host", "--bg-pty-host", "/x/spare/1.pty.sock"])
         try:
             for _ in range(100):
-                kids = [p for p in memcap.tree(host.pid) if p != host.pid]
+                kids = [p for p in procs.tree(host.pid) if p != host.pid]
                 if kids:
                     break
                 time.sleep(0.05)
@@ -193,18 +237,19 @@ class BackgroundSession(unittest.TestCase):
             self.assertEqual(memcap.find_bg_session(sid, timeout=2, session_pid=lambda: kids[0]), host.pid)
             self.assertIsNone(memcap.find_bg_session(sid, timeout=0, session_pid=lambda: None))
         finally:
-            for pid in memcap.tree(host.pid):
+            for pid in procs.tree(host.pid):
                 with contextlib.suppress(OSError):
                     os.kill(pid, 9)
             host.wait()
 
     def test_bg_daemon_is_freed_before_the_session_is_adopted(self):
         events = []
+        # the session's processes and the systemd moves are made up, as in Scopes
         with mock.patch.object(memcap, "available", return_value=True), \
                 mock.patch.object(memcap, "find_bg_session", return_value=50), \
-                mock.patch.object(memcap, "parents", return_value={50: 40}), \
+                mock.patch.object(procs, "parents", return_value={50: 40}), \
                 mock.patch.object(memcap, "is_claude_daemon", return_value=True), \
-                mock.patch.object(memcap, "tree", return_value=[50, 51]), \
+                mock.patch.object(procs, "tree", return_value=[50, 51]), \
                 mock.patch.object(memcap, "free_from_service",
                                   side_effect=lambda pid, *a, **k: events.append(("free", pid, k["exclude"]))
                                   or ("claude-bg-daemon.scope", "moved out of x.service")), \
@@ -215,10 +260,9 @@ class BackgroundSession(unittest.TestCase):
         self.assertEqual(msg, "agent-s.scope (MemoryMax=1G); daemon moved out of x.service")
 
 
-@unittest.skipUnless(os.environ.get("MEMCAP_REAL_TESTS") == "1" and memcap.available(),
-                     "opt-in: set MEMCAP_REAL_TESTS=1 to run against the real systemd user manager")
+@unittest.skipUnless(memcap.available(), "needs a systemd user bus")
 class RealScope(unittest.TestCase):
-    """Against the real user manager: the cap is applied and enforced. Opt-in, since it starts real scopes."""
+    """Against the real user manager: the cap is applied and enforced."""
 
     def test_runaway_is_killed_inside_its_scope(self):
         hog = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.readline(); b = bytearray(400 << 20); "
@@ -255,7 +299,7 @@ class RealScope(unittest.TestCase):
                                    "time.sleep(60)"])
         try:
             for _ in range(100):
-                kids = [p for p in memcap.tree(parent.pid) if p != parent.pid]
+                kids = [p for p in procs.tree(parent.pid) if p != parent.pid]
                 if kids:
                     break
                 time.sleep(0.05)
@@ -265,7 +309,7 @@ class RealScope(unittest.TestCase):
             for pid in [parent.pid] + kids:
                 self.assertTrue(memcap.cgroup(pid).endswith("/" + unit), (pid, memcap.cgroup(pid)))
         finally:
-            for pid in memcap.tree(parent.pid):
+            for pid in procs.tree(parent.pid):
                 with contextlib.suppress(OSError):
                     os.kill(pid, 9)
             parent.wait()
@@ -287,48 +331,49 @@ class SpawnIntegration(unittest.TestCase):
         self.assertNotEqual(self.plan("--memory-max", "lots").returncode, 0)
 
     def test_pane_is_capped_before_the_agent_is_typed(self):
-        sp = load_script("agent-spawn")
         events = []
 
-        def fake_tmux(*args, check=True):
+        def fake_tmux(*args, check):   # tmux is the boundary: a pane whose shell is pid 123, the server 456
             events.append(args[0])
             return subprocess.CompletedProcess(args, 0, "123 456\n" if args[0] == "display-message" else "", "")
 
-        sp.tmux = fake_tmux
-        sp.time.sleep = lambda s: None
-        sp.registry.claude_bin = lambda: "claude"
-        with mock.patch.object(sp.memcap, "adopt", side_effect=lambda pid, *a, **k: events.append(("adopt", pid))
-                               or ("agent-n.scope", "agent-n.scope (MemoryMax=32G)")), \
-                mock.patch.object(sp.memcap, "tree", return_value=[123, 124]), \
-                mock.patch.object(sp.memcap, "free_from_service",
+        sp = load_script("agent-spawn")
+        plan = {"name": "n", "path": "/p", "cli": "claude", "config_dir": None, "model": None, "effort": None}
+        # also made up: the pane's process tree (/proc), the systemd moves, and an installed claude
+        with mock.patch.object(launch.commands, "tmux", fake_tmux), mock.patch.object(launch.time, "sleep"), \
+                mock.patch.object(sp.registry, "claude_bin", return_value="claude"), \
+                mock.patch.object(sp, "tmux_has", return_value=False), \
+                mock.patch.object(launch.memcap, "adopt", side_effect=lambda pid, *a, **k: events.append(("adopt", pid))
+                                  or ("agent-n.scope", "agent-n.scope (MemoryMax=32G)")), \
+                mock.patch.object(launch.procs, "tree", return_value=[123, 124]), \
+                mock.patch.object(launch.memcap, "free_from_service",
                                   side_effect=lambda pid, *a, **k: events.append(("free", pid, k.get("exclude")))
                                   or (None, "")):
-            out = sp.launch_claude("n", "/p", "/b", None, None, {"MemoryMax": 32 * G})
-        # set-environment: the default login keeps CLAUDE_CONFIG_DIR out of the session (agent-spawn launch_claude).
-        # The server is freed first, excluding the pane's tree, so the pane's own move is the last one.
-        self.assertEqual(events, ["new-session", "set-environment", "display-message", ("free", 456, [123, 124]),
-                                  ("adopt", 123), "send-keys", "send-keys"])
-        self.assertEqual(out["memory"], "agent-n.scope (MemoryMax=32G)")
+            sp.start_agent(plan, Path("/b"), {"MemoryMax": 32 * G})
+        # The server is freed first, excluding the pane's tree, so the pane's own move is the last one; then the
+        # line is typed (set-environment: the default login keeps CLAUDE_CONFIG_DIR out of the session).
+        self.assertEqual(events, ["new-session", "display-message", ("free", 456, [123, 124]), ("adopt", 123),
+                                  "set-environment", "send-keys", "send-keys"])
+        self.assertEqual(plan["memory"], "agent-n.scope (MemoryMax=32G)")
 
 
 class SendIntegration(unittest.TestCase):
     def test_resume_claude_reports_the_cap(self):
-        snd = load_script("agent-send")
         sess = {"id": str(uuid.uuid4()), "name": "rm-1", "cwd": None}
-        with mock.patch.object(snd, "claude_bin", return_value="claude"), \
-                mock.patch.object(snd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")), \
-                mock.patch.object(snd, "agent_caps", return_value=({"MemoryMax": G}, None)), \
-                mock.patch.object(snd.memcap, "cap_bg_session", return_value="agent-rm-1.scope (MemoryMax=1G)") as cap:
-            ok, out = snd.resume_claude(sess, "hi", True)
+        # claude (its binary and its run) and the systemd scope are the boundary
+        with mock.patch.object(send, "claude_bin", return_value="claude"), \
+                mock.patch.object(send.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")), \
+                mock.patch.object(send, "agent_caps", return_value=({"MemoryMax": G}, None)), \
+                mock.patch.object(send.memcap, "cap_bg_session", return_value="agent-rm-1.scope (MemoryMax=1G)") as cap:
+            ok, out = send.resume_claude(sess, "hi", True, lambda: None)
         self.assertTrue(ok)
         self.assertEqual(cap.call_args[0], (sess["id"], "rm-1", {"MemoryMax": G}))
         self.assertTrue(callable(cap.call_args[1]["session_pid"]))
         self.assertIn("memory: agent-rm-1.scope", out)
 
     def test_bad_config_size_does_not_block_a_resume(self):
-        snd = load_script("agent-send")
-        with mock.patch.object(snd.config, "load", return_value={"agent_memory_max": "lots"}):
-            props, why = snd.agent_caps()
+        homes.config_file(self, {"agent_memory_max": "lots"})
+        props, why = send.agent_caps()
         self.assertIsNone(props)
         self.assertIn("uncapped", why)
 

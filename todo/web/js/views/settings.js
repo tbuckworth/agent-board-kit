@@ -7,6 +7,8 @@ import { showToast } from '../components/toast.js';
 import { confirm, showModal } from '../components/modal.js';
 import * as api from '../api.js';
 import * as db from '../db.js';
+import { syncAllIssues } from '../sync.js';
+import { forgetToken, reportSyncError } from '../auth.js';
 
 export function renderSettings(container) {
   const { groups, listMetadata } = getState();
@@ -65,7 +67,7 @@ export function renderSettings(container) {
           // Another repo: the cached tasks are the old repo's, so drop them and load the new one's
           if (await db.useRepo(repo)) {
             setState({ issues: [], labels: [], groups: [], listMetadata: [] });
-            import('../app.js').then(({ syncAllIssues }) => syncAllIssues(true)).catch(console.error);
+            syncAllIssues(true).catch(reportSyncError);
           }
           const remember = rememberCheck.checked;
           if (remember) {
@@ -99,9 +101,7 @@ export function renderSettings(container) {
   const disconnectBtn = currentToken ? el('button', {
     className: 'btn btn-danger',
     onClick: () => {
-      api.clearToken();
-      localStorage.removeItem('todo_pat');
-      sessionStorage.removeItem('todo_pat');
+      forgetToken();
       showToast('Disconnected');
       renderSettings(container);
     },
@@ -235,11 +235,10 @@ export function renderSettings(container) {
         onClick: async () => {
           showToast('Syncing...');
           try {
-            const { syncAllIssues } = await import('../app.js');
             await syncAllIssues(true);
             showToast('Sync complete');
           } catch (err) {
-            showToast(`Sync error: ${err.message}`);
+            reportSyncError(err);
           }
         },
       }, icon('refresh', 16), 'Force Sync'),

@@ -11,7 +11,14 @@ enum Renderer {
         if let p = obj["pending"], let pd = try? JSONSerialization.data(withJSONObject: p) {
             pending = (try? JSONDecoder().decode([PendingOp].self, from: pd)) ?? []
         }
-        return (decodeIssues(obj["issues"]), decodeConfig(obj["config"]), pending)
+        let issues = decodeIssues(obj["issues"])
+        if issues.unreadable > 0 { FileHandle.standardError.write("\(issues.unreadable) issues in \(path) couldn't be read\n".data(using: .utf8)!) }
+        do {
+            return (issues.issues, try decodeConfig(obj["config"]), pending)
+        } catch {
+            FileHandle.standardError.write("the config in \(path) couldn't be read: \(error)\n".data(using: .utf8)!)
+            return nil
+        }
     }
 
     static func render(data path: String, to out: String, size: CGSize, dark: Bool, list: String?, select: Int?,
@@ -21,7 +28,8 @@ enum Renderer {
             FileHandle.standardError.write("cannot read \(path)\n".data(using: .utf8)!)
             return 1
         }
-        let store = Store(persist: false)
+        let desk = FakeDesk()
+        let store = Store(channel: desk, persist: false)
         store.install(issues: d.issues, config: d.config, pending: d.pending)
         store.link = .live
         store.syncedAt = isoString(Date().addingTimeInterval(-4))
@@ -32,10 +40,12 @@ enum Renderer {
         store.selection = select ?? edit
         store.editing = edit
         if let g = store.items[select ?? 0]?.group { store.expanded.insert(g) }
+        TriageDeck.prepareRender(store)                 // --route triage [--seed N] [--snoozed]
         if let a = assign {
             guard let t = store.items[a] else { print("no task #\(a)"); return 1 }
-            store.previewStub = "[message from the owner via the to-do app (the Mac app, over SSH), not by email …]\n\nThe owner assigned this to-do to an agent from the to-do app. Start one agent to do it.\n\nTask #\(t.number): \(t.title)\nIssue: \(t.issue.url)\nList: \(t.list)    Labels: \(t.issue.labels.joined(separator: ", "))"
-            store.agentsStub = Renderer.sampleAgents
+            let preview = "[message from the owner via the to-do app (the Mac app, over SSH), not by email …]\n\nThe owner assigned this to-do to an agent from the to-do app. Start one agent to do it.\n\nTask #\(t.number): \(t.title)\nIssue: \(t.issue.url)\nList: \(t.list)    Labels: \(t.issue.labels.joined(separator: ", "))"
+            desk.answer("assign_preview") { _ in .success(["message": preview]) }
+            desk.answer("agents") { _ in .success(["agents": FakeDesk.json(Renderer.sampleAgents)]) }
             let sheet = AssignSheet(task: t, store: store, startRunning: running,
                                     startChosen: running ? Renderer.sampleAgents[1].id : nil).environment(\.zoom, zoom)
                 .background(Color(nsColor: .windowBackgroundColor))
@@ -145,7 +155,7 @@ func spin(_ seconds: Double, until done: () -> Bool) -> Bool {
 @MainActor
 enum Probe {
     static func run() -> Int32 {
-        let store = Store(persist: false)
+        let store = Store(channel: DeskLink(), persist: false)
         print("connecting: ssh \(Settings.host) \(Settings.remoteCommand)")
         store.connect()
         let t0 = Date()
@@ -201,14 +211,83 @@ enum SelfTest {
         let issue = Issue(number: 5, title: "Buy milk", body: body, state: "OPEN", url: "u", createdAt: "2026-10-01T00:00:00Z",
                           updatedAt: "2026-10-02T00:00:00Z", labels: ["list:tasks", "source:app", "status:waiting"], agent: nil)
         let t = TaskItem(issue, config: cfg)
-        check(t.list == "tasks" && t.priority == "medium" && t.action == "manual", "defaults")
+        check(t.list == "tasks" && t.importance == nil && t.action == "manual", "defaults")
         let linked = Issue(number: 9, title: "x", body: "", state: "OPEN", url: "https://github.com/example-user/tasks/issues/9",
                            createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-02T00:00:00Z", labels: [], agent: nil)
         check(linked.shortRef == "example-user/tasks #9" && issue.shortRef == "#5", "repo read from the issue URL: \(linked.shortRef)")
-        let d = labelDiff(from: t, list: "to-buy", section: "home", priority: "high", config: cfg)
-        check(Set(d.add) == ["list:to-buy", "group:To Do", "section:home", "priority:high"], "label diff adds \(d.add)")
+        let d = labelDiff(from: t, list: "to-buy", section: "home", config: cfg)
+        check(Set(d.add) == ["list:to-buy", "group:To Do", "section:home"], "label diff adds \(d.add)")
         check(d.remove == ["list:tasks"], "label diff removes \(d.remove)")
-        check(labelDiff(from: t, list: "tasks", section: nil, priority: "medium", config: cfg).add.isEmpty, "no-op diff")
+        check(labelDiff(from: t, list: "tasks", section: nil, config: cfg).add.isEmpty, "no-op diff")
+
+        // importance and urgency in place of the retired priority: the ring, the marks, the filter, saving
+        let rnow = Fmt.date("2026-10-30T12:00:00Z")!
+        func rt(_ n: Int, _ labels: [String], state: String = "OPEN") -> Issue {
+            Issue(number: n, title: "r\(n)", body: "", state: state, url: "", createdAt: "2026-10-01T00:00:00Z",
+                  updatedAt: "2026-10-01T00:00:00Z", labels: ["list:tasks"] + labels, agent: nil)
+        }
+        let rIssues = [rt(20, ["importance:high", "urgency:high"]), rt(21, ["importance:medium", "urgency:low", "due:2026-11-13"]),
+                       rt(22, ["importance:low", "due:2026-11-14"]), rt(23, ["priority:high", "tag:home"]),
+                       rt(24, ["importance:medium", "due:2026-10-29"]), rt(25, ["due:2026-10-29"], state: "CLOSED")]
+        let rated = Dictionary(uniqueKeysWithValues: rIssues.map { ($0.number, TaskItem($0, config: nil)) })
+        check(rated.mapValues { Rating.Ring(importance: $0.importance) }
+              == [20: .strong, 21: .plain, 22: .faint, 23: .plain, 24: .plain, 25: .plain],
+              "ring: high strong, low faint, medium and unrated (an old priority:high too) plain")
+        check(Rating.marks(rated[20]!, now: rnow) == Rating.Marks(urgent: true, due: nil, overdue: false), "urgency:high is urgent")
+        check(Rating.marks(rated[21]!, now: rnow) == Rating.Marks(urgent: true, due: "due 13 Nov", overdue: false), "due in 14 days is urgent")
+        check(Rating.marks(rated[22]!, now: rnow) == Rating.Marks(urgent: false, due: "due 14 Nov", overdue: false), "due in 15 days isn't")
+        check(Rating.marks(rated[24]!, now: rnow) == Rating.Marks(urgent: true, due: "due 29 Oct", overdue: true), "overdue: urgent, red")
+        check(Rating.marks(rated[25]!, now: rnow) == Rating.Marks(urgent: false, due: "due 29 Oct", overdue: false), "a done task: no marker")
+        func passing(_ f: Filters) -> [Int] { rated.values.filter { $0.isOpen && f.accepts($0, now: rnow) }.map { $0.number }.sorted() }
+        var rf = Filters()
+        check(passing(rf) == [20, 21, 22, 23, 24] && !rf.active, "no filter")
+        rf.importance = "high"
+        check(passing(rf) == [20] && rf.active, "importance high")
+        rf.importance = Rating.unrated
+        check(passing(rf) == [23], "unrated: no importance label (priority:high doesn't count)")
+        rf.importance = nil
+        rf.urgent = true
+        check(passing(rf) == [20, 21, 24] && rf.active, "the Urgent chip: urgency:high, or due within 14 days")
+        rf.importance = "medium"
+        check(passing(rf) == [21, 24], "importance and Urgent together")
+        let rd = ratingDiff(from: rated[23]!, to: Rating.Value(importance: "medium", urgency: nil, due: nil))
+        check(rd.add == ["importance:medium", "urgency:low"] && rd.remove == ["priority:high"],
+              "rating an old task: not urgent said, priority off: \(rd)")
+        let same = ratingDiff(from: rated[21]!, to: Rating.Value(rated[21]!))
+        check(same.add.isEmpty && same.remove.isEmpty, "no change, no labels: \(same)")
+        // The edit pane opened on #21 (medium, not urgent, due 13 Nov); meanwhile Triage made it urgent
+        let live21 = Rating.Value(importance: "medium", urgency: "high", due: "2026-11-13")
+        check(Rating.edited(live: live21, original: rated[21]!, importance: "high", urgent: false, due: "2026-11-13")
+              == Rating.Value(importance: "high", urgency: "high", due: "2026-11-13"),
+              "an edit to importance keeps an urgency changed elsewhere")
+        check(Rating.edited(live: Rating.Value(rated[20]!), original: rated[20]!, importance: "high", urgent: false, due: nil)?.urgency
+              == "low", "turning Urgent off writes urgency:low")
+        check(Rating.edited(live: Rating.Value(rated[24]!), original: rated[24]!, importance: "medium", urgent: false,
+                            due: "2026-10-29") == nil, "an edit that leaves the rating alone sends none (no urgency:low)")
+        let rcfg = TodoConfig(groups: [GroupMeta(name: "Digest", sortOrder: 5)],
+                              listMetadata: [ListMeta(listName: "books", groupName: "Digest", sortOrder: 0)],
+                              unratedGroups: ["Digest"])
+        check(Rating.rates(rated[21]!, inList: "tasks", config: rcfg) && !Rating.rates(rated[21]!, inList: "Books", config: rcfg),
+              "moving a task to an unrated list sends no rating")
+        let rs = Store(channel: FakeDesk(), persist: false)
+        rs.install(issues: rIssues, config: nil)
+        rs.link = .down("test")
+        rs.saveEdit(23, title: "r23", notes: "", list: "tasks", section: nil)
+        check(rs.items[23]?.issue.labels == ["list:tasks", "tag:home"], "saving takes off priority: \(rs.items[23]?.issue.labels ?? [])")
+        rs.saveEdit(24, title: "r24 renamed", notes: "", list: "tasks", section: nil)
+        check(!(rs.items[24]?.issue.labels.contains("urgency:low") ?? true),
+              "a save with no rating adds no urgency: \(rs.items[24]?.issue.labels ?? [])")
+        rs.saveEdit(23, title: "r23", notes: "", list: "tasks", section: nil,
+                    rating: Rating.Value(importance: "high", urgency: "high", due: "2026-11-02"))
+        check(Set(rs.items[23]?.issue.labels ?? []) == ["list:tasks", "tag:home", "importance:high", "urgency:high", "due:2026-11-02"],
+              "the edit pane rates: \(rs.items[23]?.issue.labels ?? [])")
+        rs.saveEdit(23, title: "r23", notes: "", list: "tasks", section: nil, rating: Rating.Value(importance: nil, urgency: "high", due: nil))
+        check(Set(rs.items[23]?.issue.labels ?? []) == ["list:tasks", "tag:home", "urgency:high"], "importance None and no due date")
+        rs.undo()
+        check(rs.items[23]?.importance == "high" && rs.items[23].flatMap { Rating.due($0) } == "2026-11-02", "undo the rating")
+        rs.rateMany([20, 21], importance: "low")
+        check(rs.items[20]?.issue.labels.contains("urgency:high") == true && rs.items[21]?.importance == "low"
+              && rs.pending.filter { $0.number == 20 || $0.number == 21 }.count == 2, "Rate keeps urgency: \(rs.items[20]?.issue.labels ?? [])")
 
         // tags and waiting on someone
         check(Tags.normalise("  Only At Home! ") == "only-at-home" && Tags.normalise("tag:Home") == "home"
@@ -251,12 +330,12 @@ enum SelfTest {
         check(!f.acceptsTags(wt) && f.acceptsTags(plain), "hide home")
         f.cycle("home")
         check(f.tags.isEmpty && !f.active, "filter off again")
-        let ws = Store(persist: false)
+        let ws = Store(channel: FakeDesk(), persist: false)
         ws.install(issues: [wi], config: nil)
         ws.link = .down("test")
-        ws.saveEdit(9, title: wi.title, notes: "Asked about the lease, again", list: "tasks", section: nil, priority: "medium")
+        ws.saveEdit(9, title: wi.title, notes: "Asked about the lease, again", list: "tasks", section: nil)
         check(ws.items[9]?.issue.body == "Waiting on: Sam\n\nAsked about the lease, again", "editing notes keeps the who line: \(ws.items[9]?.issue.body ?? "")")
-        ws.saveEdit(9, title: wi.title, notes: "Asked about the lease, again", list: "tasks", section: nil, priority: "medium",
+        ws.saveEdit(9, title: wi.title, notes: "Asked about the lease, again", list: "tasks", section: nil,
                     tags: ["home", "admin"], waiting: WaitingEdit(on: true, who: "Sam and Jo", followUp: "2026-10-30"))
         let we = ws.items[9]
         check(we?.waitingOn == "Sam and Jo" && we?.followUp == "2026-10-30" && we?.tags == ["admin", "home"]
@@ -277,7 +356,7 @@ enum SelfTest {
         let ct = TaskItem(ci, config: nil)
         check(ct.cameThrough && !ct.greyed(today: today) && ct.waitingOn == "Jo", "a cleared task is read")
         check(Store.waitingLast([plain, wt, ct, due], today: today).map { $0.number } == [12, 11, 10, 9], "a cleared task goes to the top")
-        let cs = Store(persist: false)
+        let cs = Store(channel: FakeDesk(), persist: false)
         cs.install(issues: [ci], config: nil)
         cs.link = .down("test")
         cs.answerCleared(12, stillWaiting: true)
@@ -294,18 +373,20 @@ enum SelfTest {
               "a new task gets no action label")
 
         // the queue, with no desktop
-        let s = Store(persist: false)
+        let s = Store(channel: FakeDesk(), persist: false)
         s.install(issues: [issue], config: cfg)
         s.link = .down("test")
         s.toggleItem(5, s.items[5]!.checklist[0])
         s.toggleComplete(5)
-        s.saveEdit(5, title: "Buy oat milk", notes: "Notes here", list: "to-buy", section: nil, priority: "high")
+        s.saveEdit(5, title: "Buy oat milk", notes: "Notes here", list: "to-buy", section: nil,
+                   rating: Rating.Value(importance: "high", urgency: nil, due: nil))
         check(s.pending.count == 1, "edits to one task fold into one request (\(s.pending.count))")
         let op = s.pending.first
         check(op?.base["body"] == body && op?.base["title"] == "Buy milk", "base is what it was before the first edit")
         check(op?.set["state"] == "CLOSED", "state carried")
         let shown = s.items[5]
-        check(shown?.title == "Buy oat milk" && shown?.isOpen == false && shown?.list == "to-buy" && shown?.priority == "high"
+        check(shown?.title == "Buy oat milk" && shown?.isOpen == false && shown?.list == "to-buy" && shown?.importance == "high"
+              && shown.map { Rating.urgent($0) } == false && shown?.issue.labels.contains("urgency:low") == true
               && shown?.checklist.first?.checked == true && shown?.issue.labels.contains("status:waiting") == true,
               "overlay shows every waiting edit and keeps other labels")
         check(shown?.pending == true, "marked as waiting")
@@ -326,7 +407,7 @@ enum SelfTest {
               "sidebar groups lists")
 
         // inline checklist edit, and undo
-        let u = Store(persist: false)
+        let u = Store(channel: FakeDesk(), persist: false)
         u.install(issues: [issue], config: cfg)
         u.link = .down("test")
         u.editItem(5, u.items[5]!.checklist[0], to: "one, see https://example.com")
@@ -355,7 +436,7 @@ enum SelfTest {
                                              ListMeta(listName: "to-sell", groupName: "To Do", sortOrder: 0),
                                              ListMeta(listName: "to-buy", groupName: "To Do", sortOrder: 1),
                                              ListMeta(listName: "books", groupName: "Digest", sortOrder: 0)])
-        let m = Store(persist: false)
+        let m = Store(channel: FakeDesk(), persist: false)
         m.install(issues: [iss(1, "tasks"), iss(2, "to-buy"), iss(3, "books"), iss(4, "to-sell")], config: mcfg)
         m.link = .down("test")
         check(!m.allLists.contains("to sell") && m.allLists.contains("to-sell"), "the stale “To Sell” is hidden")
@@ -387,7 +468,7 @@ enum SelfTest {
             i.parent = parent
             return i
         }
-        let g = Store(persist: false)
+        let g = Store(channel: FakeDesk(), persist: false)
         g.folded = []
         g.install(issues: [gi(1), gi(2, parent: 1), gi(3, parent: 1, state: "CLOSED"), gi(4, labels: ["importance:low"]),
                            gi(5, labels: ["importance:high", "urgency:high", "due:2026-11-02"])], config: nil)
@@ -462,6 +543,61 @@ enum SelfTest {
         check(Set(["busy", "background", "waiting", "blocked", "idle", "stale"].map { "\(Palette.agentState($0))" }).count == 6,
               "each agent state has its own colour")
 
+        // todo-desk's JSON: a bad issue is counted, a malformed config throws, a broken reply line keeps its id
+        let goodIssue: [String: Any] = ["number": 7, "title": "t", "body": "", "state": "OPEN", "url": "", "createdAt": "2026-10-01T00:00:00Z",
+                                        "updatedAt": "2026-10-01T00:00:00Z", "labels": ["list:tasks"]]
+        let decoded = decodeIssues([goodIssue, ["number": "seven"], "junk"])
+        check(decoded.issues.map { $0.number } == [7] && decoded.unreadable == 2, "unreadable issues are counted: \(decoded.unreadable)")
+        var emptyOK = false
+        do { emptyOK = try decodeConfig([String: Any]()) == TodoConfig() && decodeConfig(nil) == nil } catch {}
+        check(emptyOK, "a config with no groups or lists is empty; no config is nil")
+        var malformed = false
+        do { _ = try decodeConfig(["groups": [["sortOrder": 1]], "listMetadata": []]) } catch { malformed = true }
+        check(malformed, "a malformed config entry throws")
+        let helloDesk = FakeDesk()
+        helloDesk.answer("hello") { _ in .success(["ok": true, "full": true, "issues": [goodIssue, ["number": "seven"]], "known": [7]]) }
+        let hs = Store(channel: helloDesk, persist: false)
+        hs.connect()
+        check(hs.items[7] != nil && hs.toast?.text == "1 task couldn't be read" && hs.toast?.isError == true,
+              "the window says how many tasks couldn't be read: \(hs.toast?.text ?? "no message")")
+        helloDesk.send(event: ["type": "config", "config": ["groups": "not a list"]])
+        check(hs.toast?.text.hasPrefix("The lists' settings (.todo/config.json) couldn't be read") == true,
+              "a malformed config is reported: \(hs.toast?.text ?? "no message")")
+        hs.channel.stop()
+        check(DeskLink.replyID(#"{"issues": [{"id": 3, "ok": 1}], "id": 12, "ok": true, "trunc"#) == 12
+              && DeskLink.replyID(#"{"type": "ping", "x"#) == nil, "a broken reply line's request id")
+
+        // cache files: none is an empty cache; an unreadable one is kept aside and reported, never overwritten
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("ToDo-selftest-\(ProcessInfo.processInfo.processIdentifier)")
+        try? FileManager.default.removeItem(at: scratch)
+        try? FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        func asides(_ dir: URL, _ name: String) -> [String] {
+            ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasPrefix(name + ".bad-") }
+        }
+        let junk = Data("{\"issues\": [trunc".utf8)
+        let noFile = Store(channel: FakeDesk(), persist: false)
+        noFile.load(from: scratch.appendingPathComponent("missing.json"))
+        check(noFile.toast == nil && noFile.items.isEmpty, "no cache file: an empty cache, no message")
+        try? junk.write(to: scratch.appendingPathComponent("cache.json"))
+        let badCache = Store(channel: FakeDesk(), persist: false)
+        badCache.load(from: scratch.appendingPathComponent("cache.json"))
+        let kept = asides(scratch, "cache.json")
+        check(badCache.toast?.isError == true && badCache.toast?.text.contains("couldn't be read") == true
+              && kept.count == 1 && !FileManager.default.fileExists(atPath: scratch.appendingPathComponent("cache.json").path)
+              && FileManager.default.contents(atPath: scratch.appendingPathComponent(kept.first ?? "-").path) == junk,
+              "an unreadable task cache is kept aside and reported: \(badCache.toast?.text ?? "no message") \(kept)")
+        let blocked = scratch.appendingPathComponent("a-file")
+        try? Data().write(to: blocked)
+        do {
+            try CacheIO.save(blocked.appendingPathComponent("cache.json")) { Data("{}".utf8) }
+            check(false, "a save that can't write throws")
+        } catch {
+            check((error as? CacheError)?.message.hasPrefix("Couldn't save cache.json") == true, "a failed save says so: \(error)")
+        }
+        try? FileManager.default.removeItem(at: scratch)
+
+        fails += TriageSelfTest.failures()               // Triage.swift: the picker, snoozes, This week, archive
+        AgentMailSelfTest.run(check)
         print(fails.isEmpty ? "selftest OK" : "selftest FAILED:\n  " + fails.joined(separator: "\n  "))
         return fails.isEmpty ? 0 : 1
     }
@@ -474,7 +610,8 @@ enum RemoteTest {
     static func run() -> Int32 {
         var fails: [String] = []
         func check(_ ok: Bool, _ what: String) { print((ok ? "ok    " : "FAIL  ") + what); if !ok { fails.append(what) } }
-        let s = Store(persist: false)
+        let link = DeskLink()
+        let s = Store(channel: link, persist: false)
         s.connect()
         guard spin(200, until: { s.hasLoaded && s.link.isLive }) else { print("could not connect: \(s.link)"); return 1 }
         check(true, "connected; \(s.items.count) tasks")
@@ -487,17 +624,18 @@ enum RemoteTest {
         }
         check(s.server[n]?.body.contains("## Checklist\n- [ ] first item") == true, "#\(n) has its checklist")
         s.toggleItem(n, s.items[n]!.checklist[0])
-        s.saveEdit(n, title: title + " edited", notes: "Edited notes.", list: "tasks", section: nil, priority: "high",
-                   tags: ["home"], waiting: WaitingEdit(on: true, who: "the self-test", followUp: nil))
+        s.saveEdit(n, title: title + " edited", notes: "Edited notes.", list: "tasks", section: nil,
+                   tags: ["home"], waiting: WaitingEdit(on: true, who: "the self-test", followUp: nil),
+                   rating: Rating.Value(importance: "high", urgency: nil, due: nil))
         check(spin(60) { s.pending.isEmpty }, "edits reached GitHub")
         let e = s.server[n]
         check(e?.title == title + " edited", "title saved")
         check(e?.body.contains("- [x] first item") == true && e?.body.hasPrefix("Waiting on: the self-test\n\nEdited notes.") == true,
               "checklist tick, who and notes saved")
-        check(e?.labels.contains("priority:high") == true && e?.labels.contains("tag:home") == true
+        check(e?.labels.contains("importance:high") == true && e?.labels.contains("urgency:low") == true && e?.labels.contains("tag:home") == true
               && e?.labels.contains("status:waiting") == true && e?.labels.contains("source:app") == true, "labels saved: \(e?.labels ?? [])")
 
-        s.channel.disconnect()
+        link.disconnect()
         check(!s.link.isLive, "disconnected")
         s.addItem(n, "added while offline")
         s.toggleComplete(n)
@@ -525,7 +663,7 @@ enum RemoteTest {
 @MainActor
 enum AssignTest {
     static func run() -> Int32 {
-        let s = Store(persist: false)
+        let s = Store(channel: DeskLink(), persist: false)
         s.connect()
         guard spin(200, until: { s.hasLoaded && s.link.isLive }) else { print("could not connect: \(s.link)"); return 1 }
         let title = "Agent test from the Mac to-do app \(isoString(Date())) (safe to ignore)"
@@ -558,6 +696,18 @@ enum AssignTest {
     }
 }
 
+/// A titled window (so it takes clicks) that stays at (-20000, -20000), off every screen. AppKit puts a new titled
+/// window on a screen, and moves it back onto one when it is ordered front, which made the click test flash up on
+/// screen; this one is moved off after it is made and refuses the move back.
+final class OffscreenWindow: NSWindow {
+    init(size: NSSize) {
+        super.init(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled], backing: .buffered, defer: false)
+        setFrameOrigin(NSPoint(x: -20000, y: -20000))
+    }
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+
 /// Clicks the middle of a checklist box (not its border) in an offscreen window, through AppKit's event path,
 /// and checks the item gets ticked: it guards against a box that only took clicks on its 1.4 pt outline.
 @MainActor
@@ -565,19 +715,19 @@ enum ClickTest {
     static func run() -> Int32 {
         let issue = Issue(number: 5, title: "Click test", body: "## Checklist\n- [ ] first\n- [ ] second", state: "OPEN", url: "",
                           createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-02T00:00:00Z", labels: ["list:tasks"], agent: nil)
-        let s = Store(persist: false)
+        let s = Store(channel: FakeDesk(), persist: false)
         s.install(issues: [issue], config: nil)
         s.link = .down("test")
         let t = s.items[5]!
         let view = ChecklistRow(item: t.checklist[0], task: t, store: s).frame(width: 360, height: 30, alignment: .leading)
         let host = NSHostingView(rootView: view)
         host.frame = NSRect(x: 0, y: 0, width: 360, height: 30)
-        let win = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 360, height: 30), styleMask: [.titled],
-                           backing: .buffered, defer: false)
+        let win = OffscreenWindow(size: NSSize(width: 360, height: 30))
         win.contentView = host
         win.orderFront(nil)
         host.layoutSubtreeIfNeeded()
         RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        let hidden = offscreen(win)
         // the box is 15 pt inside a 24 pt target starting 4 pt left of the row: its centre is about x = 8
         let point = NSPoint(x: 8, y: 15)
         for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
@@ -590,6 +740,73 @@ enum ClickTest {
         RunLoop.current.run(until: Date().addingTimeInterval(0.3))
         let ok = s.items[5]?.checklist.first?.checked == true
         print(ok ? "click OK: a click in the middle of the box ticks the item" : "click FAILED: the item is still unticked")
-        return ok ? 0 : 1
+        let rowOK = agentDoubleClick()
+        return ok && rowOK && hidden ? 0 : 1
+    }
+
+    /// True when no part of the window is on any screen: a test window must never flash up in front of the user.
+    static func offscreen(_ win: NSWindow) -> Bool {
+        let ok = !NSScreen.screens.contains { $0.frame.intersects(win.frame) }
+        if !ok { print("click FAILED: the test window is on screen at \(win.frame)") }
+        return ok
+    }
+
+    /// Double-clicks across a task row with an agent on it, through the app's event queue (so clickCount is read as
+    /// in use): on the agent's name it opens the mail and doesn't edit; anywhere else it edits.
+    static func agentDoubleClick() -> Bool {
+        let info = AgentInfo(status: "started", name: "todo-9-agent", assignedAt: nil, events: [])
+        let issue = Issue(number: 9, title: "A task an agent is on", body: "", state: "OPEN", url: "",
+                          createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-02T00:00:00Z",
+                          labels: ["list:tasks", assignedLabel], agent: info)
+        let s = Store(channel: FakeDesk(), persist: false)
+        s.install(issues: [issue], config: nil)
+        var edits = 0, mails = 0
+        let width: CGFloat = 640
+        let row = TaskRow(task: s.items[9]!, selected: false, now: Date(), toggle: {}, select: {}, edit: { edits += 1 },
+                          openMail: { mails += 1 })
+            .padding(.horizontal, 10).frame(width: width, height: 36)
+        let host = NSHostingView(rootView: row)
+        host.frame = NSRect(x: 0, y: 0, width: width, height: 36)
+        let win = OffscreenWindow(size: NSSize(width: width, height: 36))
+        win.contentView = host
+        win.orderFront(nil)
+        host.layoutSubtreeIfNeeded()
+        pump(0.4)
+        let hidden = offscreen(win)
+        func doubleClick(_ x: CGFloat) -> (Int, Int) {
+            edits = 0; mails = 0
+            for (type, count) in [(NSEvent.EventType.leftMouseDown, 1), (.leftMouseUp, 1), (.leftMouseDown, 2), (.leftMouseUp, 2)] {
+                if let e = NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: 18), modifierFlags: [],
+                                              timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: win.windowNumber,
+                                              context: nil, eventNumber: 0, clickCount: count, pressure: 1) {
+                    NSApp.postEvent(e, atStart: false)
+                }
+                pump(0.03)
+            }
+            pump(0.35)
+            return (edits, mails)
+        }
+        var both: [CGFloat] = [], onName: [CGFloat] = []
+        for x in stride(from: width - 12, through: width / 2, by: -8) {
+            let (e, m) = doubleClick(x)
+            if e > 0 && m > 0 { both.append(x) }
+            if m > 0 { onName.append(x) }
+        }
+        let title = doubleClick(80)
+        win.orderOut(nil)
+        let ok = hidden && both.isEmpty && !onName.isEmpty && title == (1, 0)
+        print(ok ? "click OK: double-clicking the agent's name opens its mail (x \(Int(onName.last!))-\(Int(onName.first!))), elsewhere edits"
+                 : "click FAILED: agent double-click (mail and edit at \(both), mail at \(onName), title gave edits/mails \(title))")
+        return ok
+    }
+
+    /// Runs the app's event queue for a while, as NSApp.run would: events reach the views with NSApp.currentEvent set.
+    static func pump(_ seconds: TimeInterval) {
+        let until = Date().addingTimeInterval(seconds)
+        while Date() < until {
+            if let e = NSApp.nextEvent(matching: .any, until: Date().addingTimeInterval(0.01), inMode: .default, dequeue: true) {
+                NSApp.sendEvent(e)
+            }
+        }
     }
 }

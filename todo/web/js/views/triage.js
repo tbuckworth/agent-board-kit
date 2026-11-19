@@ -10,11 +10,11 @@ import { ratingControls } from '../components/rating-controls.js';
 import { showToast } from '../components/toast.js';
 import { confirm, showModal } from '../components/modal.js';
 import { showAssignDialog } from '../components/assign-dialog.js';
-import { titleCase } from '../parser.js';
+import { titleCase, AGENT_REQUESTED_LABEL } from '../parser.js';
 import {
-  pickTriage, triagePool, nextSnooze, snoozeDays, snoozeHint, pruneShown, firstStep,
-  hasFocus, focusTasks, FOCUS_CAP, loadTriageStore, saveTriageStore,
+  pickTriage, triagePool, nextSnooze, snoozeDays, snoozeHint, pruneShown, loadTriageStore, saveTriageStore,
 } from '../triage.js';
+import { firstStep, hasFocus, focusTasks, FOCUS_CAP } from '../labels.js';
 import * as actions from '../actions.js';
 
 const SWIPE_DISTANCE = 80; // px
@@ -239,11 +239,11 @@ export function renderTriage(container) {
   }
 
   async function handToAgent(task) {
-    if (task.labels.includes('status:agent-requested')) {
+    if (task.labels.includes(AGENT_REQUESTED_LABEL)) {
       showToast('An agent is already requested for this task');
       return;
     }
-    if (await showAssignDialog(task)) next();
+    if (await showAssignDialog(task, { again: false, idPrefix: 'triage-assign' })) next();
   }
 
   function rate(number, changed) {

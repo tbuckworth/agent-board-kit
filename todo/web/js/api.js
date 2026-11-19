@@ -272,11 +272,7 @@ export async function createIssue(title, body, labels) {
   await waitForMutationSlot();
   await ensureRepoMeta();
 
-  // Auto-create missing labels
-  for (const l of labels) {
-    if (!_labelMap.has(l)) await ensureLabel(l);
-  }
-  const labelIds = labels.map(l => _labelMap.get(l)).filter(Boolean);
+  const labelIds = await labelIdsFor(labels);
   const input = { repositoryId: _repoId, title };
   if (body) input.body = body;
   if (labelIds.length > 0) input.labelIds = labelIds;
@@ -317,11 +313,7 @@ export async function updateIssue(issueNumber, updates) {
   if (updates.body !== undefined) input.body = updates.body;
   if (updates.state !== undefined) input.state = updates.state;
   if (updates.labels !== undefined) {
-    // Auto-create missing labels
-    for (const l of updates.labels) {
-      if (!_labelMap.has(l)) await ensureLabel(l);
-    }
-    input.labelIds = updates.labels.map(l => _labelMap.get(l)).filter(Boolean);
+    input.labelIds = await labelIdsFor(updates.labels);
   }
 
   const data = await gql(`
@@ -353,12 +345,7 @@ export async function addLabels(issueId, names) {
   await waitForMutationSlot();
   await ensureRepoMeta();
 
-  const labelIds = [];
-  for (const name of names) {
-    const id = _labelMap.get(name) || await ensureLabel(name);
-    if (!id) throw new Error(`Could not create label ${name}`);
-    labelIds.push(id);
-  }
+  const labelIds = await labelIdsFor(names);
 
   const data = await gql(`
     mutation AddLabels($input: AddLabelsToLabelableInput!) {
@@ -437,7 +424,6 @@ export async function addComment(issueId, body) {
   return data.addComment.commentEdge.node;
 }
 
-// Close issue. stateReason: COMPLETED (done) or NOT_PLANNED (archive)
 // Groups are GitHub sub-issues: the group is the parent issue, its tasks are sub-issues
 export async function addSubIssue(parentId, childId) {
   await waitForMutationSlot();
@@ -457,7 +443,9 @@ export async function removeSubIssue(parentId, childId) {
   `, { input: { issueId: parentId, subIssueId: childId } });
 }
 
-export async function closeIssue(issueNumber, stateReason = 'COMPLETED') {
+// Close issue. stateReason: COMPLETED (done) or NOT_PLANNED (archive)
+export async function closeIssue(issueNumber, stateReason) {
+  if (!stateReason) throw new Error('closeIssue needs a stateReason');
   await waitForMutationSlot();
   const issueId = await getIssueNodeId(issueNumber);
   const data = await gql(`
@@ -488,7 +476,14 @@ export async function reopenIssue(issueNumber) {
   return updateIssue(issueNumber, { state: 'OPEN' });
 }
 
-// Create a label if it doesn't exist
+// Label ids for names, creating the missing labels; throws rather than leave one out
+async function labelIdsFor(names) {
+  const ids = [];
+  for (const name of names) ids.push(_labelMap.get(name) || await ensureLabel(name));
+  return ids;
+}
+
+// Create a label if it doesn't exist, and return its id
 export async function ensureLabel(name, color = labelColor(name)) {
   await ensureRepoMeta();
   if (_labelMap.has(name)) return _labelMap.get(name);
@@ -506,54 +501,31 @@ export async function ensureLabel(name, color = labelColor(name)) {
     const id = data.createLabel.label.id;
     _labelMap.set(name, id);
     return id;
-  } catch {
-    // Label may already exist, e.g. a due: label another client created since the map loaded
-    try {
-      const data = await gql(`
-        query FindLabel($name: String!) {
-          repository(owner: "${OWNER}", name: "${REPO}") {
-            label(name: $name) { id }
-          }
+  } catch (err) {
+    // Only a label that already exists (e.g. a due: label another client created since the map loaded) is looked up
+    if (!/already (been taken|exists)/i.test(err.message)) throw err;
+    const data = await gql(`
+      query FindLabel($name: String!) {
+        repository(owner: "${OWNER}", name: "${REPO}") {
+          label(name: $name) { id }
         }
-      `, { name });
-      const id = data.repository.label?.id || null;
-      if (id) _labelMap.set(name, id);
-      return id;
-    } catch {
-      return null;
-    }
+      }
+    `, { name });
+    const id = data.repository.label?.id;
+    if (!id) throw new Error(`Label ${name} exists but could not be found`);
+    _labelMap.set(name, id);
+    return id;
   }
 }
 
-// Fetch config file from .todo/config.json
-export async function fetchConfig() {
+// A JSON file in the tasks repo as { data, sha }, or null when it isn't there. Read through the contents API,
+// not the raw file, so the private repo's token works and it isn't cached; the content is UTF-8.
+export async function fetchRepoJson(path) {
   if (!_token) throw new AuthError('No token configured');
   requireRepo();
 
   const res = await fetch(
-    `https://api.github.com/repos/${OWNER}/${REPO}/contents/.todo/config.json`,
-    {
-      headers: {
-        'Authorization': `Bearer ${_token}`,
-        'Accept': 'application/vnd.github.v3+json',
-      },
-    }
-  );
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
-
-  const data = await res.json();
-  const content = JSON.parse(atob(data.content));
-  return { config: content, sha: data.sha };
-}
-
-// The running agents the desktop publishes for Assign to agent (.todo/agents.json); null until it has.
-// Read through the contents API, not the raw file, so the private repo's token works and it isn't cached.
-export async function fetchAgents() {
-  if (!_token) throw new AuthError('No token configured');
-
-  const res = await fetch(
-    `https://api.github.com/repos/${OWNER}/${REPO}/contents/.todo/agents.json`,
+    `https://api.github.com/repos/${OWNER}/${REPO}/contents/${path}`,
     {
       headers: {
         'Authorization': `Bearer ${_token}`,
@@ -563,11 +535,23 @@ export async function fetchAgents() {
     }
   );
   if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Agent list fetch failed: ${res.status}`);
+  if (!res.ok) throw new Error(`Fetching ${path} failed: ${res.status}`);
 
-  const data = await res.json();
-  const bytes = Uint8Array.from(atob((data.content || '').replace(/\s/g, '')), c => c.charCodeAt(0));
-  return JSON.parse(new TextDecoder().decode(bytes));
+  const json = await res.json();
+  const bytes = Uint8Array.from(atob((json.content || '').replace(/\s/g, '')), c => c.charCodeAt(0));
+  return { data: JSON.parse(new TextDecoder().decode(bytes)), sha: json.sha };
+}
+
+// The groups and list metadata (.todo/config.json) as { config, sha }, or null
+export async function fetchConfig() {
+  const file = await fetchRepoJson('.todo/config.json');
+  return file && { config: file.data, sha: file.sha };
+}
+
+// The running agents the desktop publishes for Assign to agent (.todo/agents.json); null until it has
+export async function fetchAgents() {
+  const file = await fetchRepoJson('.todo/agents.json');
+  return file && file.data;
 }
 
 // An issue's comments, oldest first (the first 100), for the agent status line

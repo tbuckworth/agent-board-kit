@@ -51,6 +51,27 @@ The Mac app: see [07-mac.md](07-mac.md).
 
 - "Add buy printer ink to my to-do" in any agent session creates an issue with `source:claude`.
 - Email the orchestrator "work on to-do #42" or press **Assign to agent**; add instructions in the
-  sheet. The agent's name is `todo-42-<slug>`, so the board and the apps can match it to the task.
+  sheet. The orchestrator names the agent for the task, as it names agents it starts from email (2 to
+  4 words, such as `invoice-export-fix`), and writes the name in its "started" comment on the issue,
+  which is how the board and the apps match agent to task.
+- Double-click an agent's name on a task (its row, the task panel, the Triage card) in the Mac app to
+  open the newest mail that agent sent you, in Gmail: the thread itself when the board's Gmail
+  read-check is on (`gmail_credentials`), otherwise a Gmail search for that message.
+  `todo-desk agent-mail N` shows what it finds.
 - Agents never close an assigned task; you tick it off. They draft, but do not send, buy or book,
   until you say yes (by email or the `approved` label).
+
+## Triage, importance and urgency
+
+**Triage**, in the web app and at the top of the Mac app's sidebar, shows one task at a time from your
+rated lists (unrated, important and long-untouched tasks come up most), with one key each for Archive
+(closed as "not planned", still found under its list), This week (at most five), Snooze, Done, Delete,
+Agent, importance, Urgent and a due date; every action can be undone. Lists in `unratedGroups` /
+`unratedLists` of the tasks repo's `.todo/config.json` (catalogues: books, films) get no rating and
+stay out of Triage, in both apps.
+
+Tasks are rated by **importance** (High, Medium, Low, None), **urgent** and **due**. The old
+`priority:` label is retired: no app writes it and any edit removes it; a task rated only with
+`priority:` shows as unrated until you rate it. `setup-labels.sh` still creates the `priority:` labels
+so old tasks keep a described label. Details: [todo/README.md](../todo/README.md), "The Mac app" and
+"`.todo/config.json`".

@@ -7,10 +7,11 @@ import SwiftUI
 /// clicking it or by the global hotkey (⌥⌘A, Carbon RegisterEventHotKey: no accessibility permission).
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    let model = BoardModel()
+    let model = BoardModel.saved()
     var window: NSWindow!
     var statusItem: NSStatusItem!
     var hotKey: HotKey?
+    var meetings: MeetingAlerts?
     var bag = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -26,6 +27,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !window.setFrameUsingName("AgentBoardWindow") { window.center() }
         window.delegate = self
         Dialogs.window = window
+        model.windowVisible = false             // until it is shown; then its occlusion state says
+        NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window,
+                                               queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                let visible = self.window.occlusionState.contains(.visible)
+                if self.model.windowVisible != visible { self.model.windowVisible = visible }
+            }
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let b = statusItem.button {
@@ -49,22 +59,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         installKeyMonitor(window: window, model: model)
         buildMainMenu()
+        let alerts = Alerts()
+        alerts.onOpen = { [weak self] id in
+            guard let self = self else { return }
+            self.showWindow()
+            if let id = id {
+                self.model.tab = .board
+                self.model.selectedID = id
+            }
+        }
+        alerts.onLink = { [weak self] link in self?.model.openMeeting(link) }
+        model.alerts = alerts
+        alerts.start()
+        let overlay = MeetingOverlay(open: { [weak self] link in self?.model.openMeeting(link) })
+        let meetings = MeetingAlerts(post: { Alerts.notify([$0]) }, show: { overlay.show($0) })
+        model.$snapshot.compactMap { $0?.meetings }.removeDuplicates()       // a snapshot without them keeps the last
+            .sink { meetings.take($0, now: Date()) }
+            .store(in: &bag)
+        meetings.start()
+        self.meetings = meetings
         model.connect()
+        ScreenTime.start { [weak self] problem in Task { @MainActor in self?.model.screenError = problem } }
         if !CommandLine.arguments.contains("--hidden") { showWindow() }   // the login item starts in the menu bar only
         watchForNewBuild()
     }
 
-    /// scripts/mac-build.sh replaces the binary under a running app; offer to relaunch into the new one.
+    /// mac/install.sh replaces /Applications/AgentBoard.app under the running app; offer to relaunch into the new one.
     func watchForNewBuild() {
         let exe = Bundle.main.executablePath ?? ""
         let mtime = { (try? FileManager.default.attributesOfItem(atPath: exe)[.modificationDate] as? Date) ?? nil }
         let started = mtime()
-        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+        let check = Timer(timeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self, let now = mtime(), let then = started, now > then else { return }
                 if !self.model.updateAvailable { self.model.updateAvailable = true }
             }
         }
+        check.tolerance = 5
+        RunLoop.main.add(check, forMode: .default)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -77,6 +109,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let menu = NSMenu()
             menu.addItem(withTitle: "Open Board   ⌥⌘A", action: #selector(openFromMenu), keyEquivalent: "").target = self
             menu.addItem(withTitle: "Message orchestrator…", action: #selector(messageOrchestrator), keyEquivalent: "").target = self
+            let toCheck = model.snapshot?.sent?.toCheck ?? 0
+            menu.addItem(withTitle: toCheck > 0 ? "Sent messages (\(toCheck) to check)…" : "Sent messages…",
+                         action: #selector(showSent), keyEquivalent: "").target = self
+            menu.addItem(withTitle: "Time…", action: #selector(showTime), keyEquivalent: "").target = self
+            if model.snapshot?.chats != nil {
+                menu.addItem(withTitle: "Group chats…", action: #selector(showChats), keyEquivalent: "").target = self
+            }
+            if let box = model.snapshot?.mailbox {
+                menu.addItem(withTitle: box.unread > 0 ? "Mail (\(box.unread) unread)" : "Mail",
+                             action: #selector(showMail), keyEquivalent: "").target = self
+            }
             menu.addItem(withTitle: "Refresh   ⌘R", action: #selector(refreshAll), keyEquivalent: "").target = self
             menu.addItem(withTitle: "Refresh usage", action: #selector(refreshUsage), keyEquivalent: "").target = self
             menu.addItem(withTitle: "Reconnect", action: #selector(reconnect), keyEquivalent: "").target = self
@@ -99,6 +142,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func refreshAll() { model.refreshAll() }
     @objc func relaunch() { model.relaunch() }
     @objc func messageOrchestrator() { showWindow(); Dialogs.orchestrator(model: model) }
+    @objc func showSent() { showWindow(); model.sheet = .sent }
+    @objc func showTime() { showWindow(); model.sheet = .time }
+    @objc func showChats() { showWindow(); model.sheet = .chats(nil) }
+    @objc func showMail() { showWindow(); model.tab = .mail }
     @objc func reconnect() { model.reconnect() }
     @objc func editHost() { showWindow(); Dialogs.host(model: model) }
 
@@ -130,7 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         main.addItem(viewItem)
         main.addItem(windowItem)
         // Text fields get ⌘C/⌘V/⌘X/⌘A/⌘Z from these key equivalents; without an Edit menu they do nothing,
-        // and dictation tools that insert by synthesising ⌘V (Wispr Flow) fail too.
+        // and dictation tools that insert by synthesising ⌘V fail too.
         let edit = NSMenu(title: "Edit")
         edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
         let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")

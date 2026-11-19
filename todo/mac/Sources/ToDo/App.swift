@@ -7,7 +7,7 @@ import SwiftUI
 /// window toggled by clicking it or by the global hotkey ⌥⌘T (Carbon RegisterEventHotKey: no accessibility permission).
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    let store = Store()
+    let store = Store(channel: DeskLink(), persist: true)       // the composition root: the real link
     var window: NSWindow!
     var statusItem: NSStatusItem!
     var hotKey: HotKey?
@@ -236,6 +236,7 @@ func installKeyMonitor(window: NSWindow, store: Store) -> Any? {
         }
         if mods == [.command, .shift] && chars.lowercased() == "r" { store.refresh(full: true); return nil }
         guard !typing, mods.isEmpty || mods == .shift else { return e }
+        if TriageKeys.handle(e, store: store) { return nil }      // the Triage page's keys (TriageView.swift)
         switch e.keyCode {
         case UInt16(kVK_DownArrow): store.move(1)
         case UInt16(kVK_UpArrow): store.move(-1)

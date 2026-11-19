@@ -14,6 +14,7 @@ export const FOLLOW_UP_PREFIX = 'follow-up:';
 export const WAITING_CLEARED_LABEL = 'status:waiting-cleared';
 export const TAG_COLOR = '5319e7';
 export const WAITING_COLOR = 'fbca04';
+export const WAITING_CLEARED_COLOR = '0e8a16';
 
 const DATE_RE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 const WAITING_LINE_RE = /^waiting on:[ \t]*(.*)$/i;
@@ -199,7 +200,7 @@ export function withWaiting(labels, { waiting, followUp }) {
 export function labelColor(name) {
   const l = String(name).toLowerCase();
   if (l.startsWith(TAG_PREFIX)) return TAG_COLOR;
-  if (l === WAITING_CLEARED_LABEL) return '0e8a16';
+  if (l === WAITING_CLEARED_LABEL) return WAITING_CLEARED_COLOR;
   if (l === WAITING_LABEL || l.startsWith(FOLLOW_UP_PREFIX)) return WAITING_COLOR;
   return 'ededed';
 }

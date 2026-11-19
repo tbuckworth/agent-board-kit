@@ -8,6 +8,7 @@ let package = Package(
         .executableTarget(
             name: "AgentBoard",
             path: "Sources/AgentBoard",
+            resources: [.copy("widgets.js")],          // the Mail tab's widget renderer (MailWidgets.script)
             linkerSettings: [.linkedFramework("Carbon")]
         ),
     ]

@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _kitenv  # noqa: E402,F401  (scratch config with an example owner, before agentboard reads any)
-from agentboard import actions, collect, config, gmailread  # noqa: E402
+from agentboard import actions, chats, collect, config, gmailstate, google, sources  # noqa: E402
 
 
 class Env:
@@ -45,7 +45,8 @@ class IdentityTest(unittest.TestCase):
         self.assertIsNone(config.owner_name(default=None, cfg=empty))
         self.assertIsNone(config.owner_email(empty))
         self.assertEqual(config.owner_addresses(empty), [])
-        self.assertIn("<the owner's address>", actions.orch_header(empty))
+        self.assertIn("This is the owner writing", actions.orch_header(empty))
+        self.assertIn("--to owner ", actions.orch_header(empty))              # the mailroom resolves the alias
 
     def test_owner_email_falls_back_to_the_allowlist(self):
         cfg = {"allowlist": ["Owner@Example.com", "second@example.com"]}
@@ -62,8 +63,10 @@ class IdentityTest(unittest.TestCase):
         with Env(AGENT_BOARD_REPOS="/elsewhere"):
             self.assertEqual(config.repos_root({"repos_root": "/srv/repos"}), Path("/elsewhere"))
         root = Path(os.environ["AGENT_BOARD_TEST_ROOT"])
-        self.assertIn(os.path.realpath(str(root / "code" / "orchestrator")), collect.ORCHESTRATOR_DIRS)
-        self.assertTrue(collect.is_orchestrator("x", "", str(root / "code" / "orchestrator")))
+        orch = collect.orchestrator_dir()
+        self.assertEqual(orch, os.path.realpath(str(root / "code" / "orchestrator")))
+        self.assertTrue(collect.is_orchestrator("x", "", str(root / "code" / "orchestrator"), orch))
+        self.assertEqual(sources.REPOS_ROOT, root / "code")          # the worktree scan's root
 
 
 class MailroomDirTest(unittest.TestCase):
@@ -76,35 +79,89 @@ class MailroomDirTest(unittest.TestCase):
                 self.assertIsNone(config.mailroom_dir())                 # no agentmail package there
                 (Path(d) / "agentmail").mkdir()
                 self.assertEqual(config.mailroom_dir(), Path(d))
-                self.assertEqual(actions.mailroom_root(), d)
+                self.assertEqual(sources.mailroom_root(), d)
 
     def test_no_mailroom_is_a_clear_error(self):
         with Env(AGENT_MAILROOM_DIR="/nonexistent/mailroom"):
             with self.assertRaises(RuntimeError) as e:
-                actions.mailroom("close")
+                sources.mailroom("close")
             self.assertIn("mailroom isn't installed", str(e.exception))
+            self.assertIsNone(sources.optional_mailroom("failover"))
+
+
+class BoardConfig:
+    """The board config file at `path` holding `cfg` for one block (config.BOARD_CONFIG is read at import)."""
+    def __init__(self, path, **cfg):
+        self.path, self.cfg = Path(path), cfg
+
+    def __enter__(self):
+        self.path.write_text(json.dumps(self.cfg))
+        self.real = config.BOARD_CONFIG
+        config.BOARD_CONFIG = self.path
+
+    def __exit__(self, *exc):
+        config.BOARD_CONFIG = self.real
 
 
 class GmailOptionalTest(unittest.TestCase):
     def test_off_by_default_and_on_with_a_credentials_file(self):
         self.assertIsNone(config.board_config()["gmail_credentials"])
-        self.assertIsNone(gmailread.make())                              # default: no read-check
+        self.assertIsNone(google.gmail_login())
+        self.assertIsNone(gmailstate.for_owner(sync=True))               # default: no read-check, no Gmail sync
         with tempfile.TemporaryDirectory() as d:
             creds = Path(d) / "creds.json"
-            cfg = Path(d) / "board.json"
-            cfg.write_text(json.dumps({"gmail_credentials": str(creds)}))
-            with Env(AGENT_BOARD_CONFIG=str(cfg)):
-                real = config.BOARD_CONFIG
-                config.BOARD_CONFIG = cfg
-                try:
-                    self.assertIsNone(gmailread.make())                  # named but missing: still off
-                    creds.write_text("{}")
-                    g = gmailread.make()
-                    self.assertIsNotNone(g)
-                    self.assertEqual((g.sender, g.owners), ("agents@example.com", ["owner@example.com"]))
-                    self.assertIsNone(gmailread.make(owners=[]))         # no owner address to check the login against
-                finally:
-                    config.BOARD_CONFIG = real
+            with BoardConfig(Path(d) / "board.json", gmail_credentials=str(creds)):
+                self.assertIsNone(gmailstate.for_owner(sync=True))       # named but missing: still off
+                creds.write_text("{}")
+                g = gmailstate.for_owner(sync=True)
+                self.assertIsNotNone(g)
+                self.assertEqual((g.sender, g.owners, g.creds_path), ("agents@example.com", ["owner@example.com"], creds))
+                self.assertIsNone(gmailstate.for_owner(sync=True, owners=[]))   # no owner address to check it against
+                self.assertIsNone(gmailstate.for_owner(sync=True, sender=""))   # no agents' account to look for
+            with Env(AGENT_BOARD_GMAIL_CREDS=str(creds)):
+                self.assertEqual(google.gmail_login(), creds)            # the environment names it too
+
+
+class GoogleTokenTest(unittest.TestCase):
+    def test_off_by_default_and_on_with_a_token_file(self):
+        self.assertIsNone(config.board_config()["google_token"])
+        self.assertIsNone(config.google_token())
+        self.assertIsNone(google.docs_login())
+        with tempfile.TemporaryDirectory() as d:
+            token = Path(d) / "token.json"
+            with BoardConfig(Path(d) / "board.json", google_token="%s/token.json" % d):
+                self.assertEqual(config.google_token(), token)
+                self.assertIsNone(google.docs_login())                   # named, but no file there
+                token.write_text("{}")
+                self.assertEqual(google.docs_login(), token)
+            with Env(AGENT_BOARD_GOOGLE_TOKEN=str(token)):
+                self.assertEqual(config.google_token(), token)
+            self.assertEqual(config.google_token({"google_token": "~/t.json"}), Path(os.path.expanduser("~/t.json")))
+
+
+class TasksRepoTest(unittest.TestCase):
+    def test_the_board_config_then_the_to_do_config_then_none(self):
+        self.assertIsNone(config.board_config()["tasks_repo"])
+        with tempfile.TemporaryDirectory() as d:
+            todo = Path(d) / "todo-config.json"
+            self.assertIsNone(config.tasks_repo({}, todo_config=todo))  # neither: the to-do source is off
+            todo.write_text(json.dumps({"repo": " example/tasks "}))
+            self.assertEqual(config.tasks_repo({}, todo_config=todo), "example/tasks")
+            self.assertEqual(config.tasks_repo({"tasks_repo": "example/mine"}, todo_config=todo), "example/mine")
+            todo.write_text("{not json")
+            self.assertIsNone(config.tasks_repo({"tasks_repo": ""}, todo_config=todo))
+
+
+class OwnerTextTest(unittest.TestCase):
+    def test_text_agents_read_names_the_owner_from_the_config(self):
+        self.assertTrue(actions.close_text().startswith("[relayed from Alex via agent-board] close\nAlex asked you"))
+        self.assertIn("use agent-mail send to Alex.)", actions.send_footer())
+        self.assertIn("agent-mail send --to owner --subject", actions.orch_header())     # the alias, no address
+        self.assertEqual(chats.as_owner(), "owner")
+        self.assertIn("(Alex posted this from the agent board as message k3f9.", chats.footer("k3f9"))
+        brief = actions.SPAWN_BRIEF.format(owner=actions.owner(), path="/p", repo="r", branch="b", state="s", text="t")
+        self.assertTrue(brief.startswith("Alex started you from the agent board"))
+        self.assertIn("Instructions from Alex:", brief)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
-"""Cheap, read-only readers for everything the board shows. Nothing here writes to another tool's state.
+"""Cheap readers for everything the board shows, and the helpers every tool shares (running a command, the board's
+own logs and state files, mailing the owner). Nothing here writes to another tool's state.
 
   Claude sessions  ~/.claude/sessions/<pid>.json        live = pid alive, same process start, socket present
   Codex sessions   ~/.codex/state_5.sqlite (threads)     live = its writer lock is actually HELD (/proc/locks);
@@ -6,8 +7,12 @@
   Status log       ~/.local/state/agent-status/events.jsonl, tailed incrementally
   Mailroom store   ~/.local/state/agent-mail/mailroom.sqlite, opened read-only
   Metrics          /proc/meminfo, /proc/stat, statvfs, one long-lived `nvidia-smi -l`
-  Usage            `agent-usage --json` when installed, else its cache file (read-only stand-in)
+  Usage            `agent-usage --json`, or its cache file (read only) when agent-usage is missing or fails
 """
+import contextlib
+import datetime
+import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -15,6 +20,7 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -22,6 +28,8 @@ from pathlib import Path
 from . import config
 
 HOME = Path.home()
+BOARD_STATE = HOME / ".local/state/agent-board"      # the board's own state: sent messages, groups, Time page
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")   # a Claude or Codex id
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 STATUS_LOG = Path(os.environ.get("AGENT_STATUS_DIR", HOME / ".local/state/agent-status")) / "events.jsonl"
@@ -30,6 +38,9 @@ MAIL_DB = MAIL_STATE / "mailroom.sqlite"
 MAIL_CONFIG = config.MAIL_CONFIG
 USAGE_CACHE = MAIL_STATE / "usage-cache.json"
 BIN_DIRS = [HOME / ".local/bin", Path("/usr/local/bin"), Path("/usr/bin")]
+# The PATH of a login shell: a systemd job or a detached worker needs it to find the agents' tools.
+LOGIN_PATH = ":".join([str(HOME / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/snap/bin"])
+BOARD_BIN = Path(__file__).resolve().parent.parent / "bin"     # this checkout's commands
 
 
 def find_bin(name):
@@ -44,16 +55,135 @@ def find_bin(name):
     return None
 
 
+def run(cmd, timeout=60, env=None, input=None, cwd=None):
+    """Run a command, in the folder `cwd` if given, and capture its text output: (exit code, stdout, stderr). Never
+    raises: a command that cannot start gives 127 and the reason, one that runs over `timeout` seconds is stopped
+    and gives 124."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, input=input, cwd=cwd)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out after %gs" % timeout
+    except OSError as e:
+        return 127, "", str(e)
+
+
+def run_merged(cmd, stdin=None, timeout=60):
+    """`run` with stdout and stderr joined and stripped: (exit code, text)."""
+    code, out, err = run(cmd, timeout=timeout, input=stdin)
+    return code, (out + err).strip()
+
+
+class CommandError(Exception):
+    """A command the board runs for the owner (the mailroom's agent-group or agent-mail) is not installed, failed, or
+    printed something that is not JSON; the message says which, for the Mac to show."""
+
+
+def call(name, args, run, stdin=None, parse=True):
+    """The command `name` (find_bin) with `args`, `stdin` on its input: its output parsed as JSON when `parse`, else
+    as stripped text. `run` is `run` or a stand-in for it. Raises CommandError when the command is not installed,
+    exits non-zero (with the end of what it printed) or, when `parse`, prints something that is not JSON."""
+    exe = find_bin(name)
+    if not exe:
+        raise CommandError("%s is not installed" % name)
+    code, out, err = run([exe] + list(args), timeout=60, input=stdin)
+    if code != 0:
+        raise CommandError((err or out).strip()[-500:] or "%s exited %d" % (name, code))
+    if not parse:
+        return out.strip()
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise CommandError("%s printed something that is not JSON: %s" % (name, out.strip()[:200])) from None
+
+
+def agent_send_argv(cli, sid):
+    """The command that types text (given on its stdin) into a live agent. By its full id, but not --exact-id:
+    that refuses when a dead login-move leftover shares the id (agent-send treats them as ambiguous), while plain
+    resolution picks the live one; a UUID cannot match a name. Raises RuntimeError without agent-send."""
+    exe = find_bin("agent-send")
+    if not exe:
+        raise RuntimeError("agent-send is not installed")
+    return [exe, "--raw", "--cli", cli, sid]
+
+
+def detached_argv(unit, command, env, properties):
+    """systemd-run --user for `command` as the transient unit `unit`: it lives in the user manager, not in the SSH
+    session or timer that asked, with the login PATH plus `env` ({name: value}) and the unit `properties`."""
+    return (["systemd-run", "--user", "--collect", "--unit", unit, "--setenv=PATH=%s" % LOGIN_PATH]
+            + ["--setenv=%s=%s" % kv for kv in env.items()] + ["--property=%s" % p for p in properties] + list(command))
+
+
 def ro_sqlite(path):
-    """Read-only connection that never checkpoints or writes; falls back to query_only if ro open fails."""
+    """A read-only connection, with sqlite3.Row rows, to another tool's existing SQLite database. Raises
+    FileNotFoundError when there is no file (nothing is created) and sqlite3.Error when it cannot be read."""
+    if not Path(path).exists():
+        raise FileNotFoundError("no database at %s" % path)
     try:
         con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=2, check_same_thread=False)
         con.execute("select 1 from sqlite_master limit 1")
-    except sqlite3.Error:
+    except sqlite3.OperationalError:
+        # a WAL database that SQLite before 3.22 cannot read on a read-only connection: open it normally and refuse
+        # writes (query_only), though SQLite may then still checkpoint its WAL file
+        if not _is_wal(path):
+            raise
         con = sqlite3.connect(str(path), timeout=2, check_same_thread=False)
         con.execute("pragma query_only=1")
     con.row_factory = sqlite3.Row
     return con
+
+
+def _is_wal(path):
+    """Whether a SQLite file is in WAL mode: its header's write and read versions (bytes 18 and 19) are 2."""
+    with open(path, "rb") as fh:
+        return fh.read(20)[18:20] == b"\x02\x02"
+
+
+def error_text(e):
+    """An exception as one line for a board field or the snapshot's problems: "Type: message", at most 300 long."""
+    return ("%s: %s" % (type(e).__name__, e))[:300]
+
+
+class Periodic:
+    """A value that load() reads, read again when maybe_refresh() finds the last read started over `interval`
+    seconds ago, or is forced. A read runs in a background thread, so a poll never waits for it, or in the caller's
+    thread when `sync` is set (a one-shot snapshot); one runs at a time. Until the first read ends, the value is
+    `initial`. A read that raises leaves the value as it was and puts error_text() in `error`, which the next good
+    read clears; `checked_at` is when the last read ended (None before)."""
+
+    def __init__(self, load, interval, initial, sync):
+        self.load, self.interval, self.sync = load, interval, sync
+        self.value, self.error, self.checked_at = initial, None, None
+        self.at, self.busy = 0, False          # when the last read started; whether one is running
+        self.lock = threading.Lock()
+
+    def refresh(self, *args):
+        """Read now with load(*args), in this thread, unless a read is running already."""
+        with self.lock:
+            if self.busy:
+                return
+            self.busy = True
+        try:
+            self.value, self.error = self.load(*args), None
+        except Exception as e:      # the board stays up on the last value; `error` says why it is not newer
+            self.error = error_text(e)
+        finally:
+            self.checked_at, self.busy = time.time(), False
+
+    def maybe_refresh(self, now=None, force=False, args=()):
+        """The current value, after starting a read with load(*args) when one is due or `force` is set."""
+        now = now or time.time()
+        if force or now - self.at > self.interval:
+            self.at = now
+            if self.sync:
+                self.refresh(*args)
+            else:
+                threading.Thread(target=self.refresh, args=args, daemon=True).start()
+        return self.value
+
+    def invalidate(self):
+        """The next maybe_refresh() reads (a manual refresh)."""
+        self.at = 0
 
 
 # ------------------------------------------------------------------ processes
@@ -65,16 +195,21 @@ def proc_start(pid):
         return None
 
 
+def boot_time():
+    """Epoch seconds when this machine booted (/proc/stat btime), or None where there is no /proc."""
+    try:
+        with open("/proc/stat") as fh:
+            return next(float(line.split()[1]) for line in fh if line.startswith("btime "))
+    except (OSError, ValueError, StopIteration):
+        return None
+
+
 def process_started_at(pid):
     """Epoch seconds when a live process started, or None. A resumed Codex thread keeps its creation time, so
     this is the only way to tell that its process began after something."""
     ticks = proc_start(pid) if pid else None
-    try:
-        with open("/proc/stat") as fh:
-            btime = next(float(line.split()[1]) for line in fh if line.startswith("btime "))
-        return btime + int(ticks) / os.sysconf("SC_CLK_TCK") if ticks else None
-    except (OSError, ValueError, StopIteration):
-        return None
+    btime = boot_time()
+    return btime + int(ticks) / os.sysconf("SC_CLK_TCK") if ticks and btime is not None else None
 
 
 def pid_alive(pid, start=None):
@@ -112,6 +247,43 @@ def tool_command(cmd):
     j = max(rest.rfind("' && pwd -P"), rest.rfind("' < /dev/null && pwd -P"))
     rest = rest[:j] if j >= 0 else (rest[:-1] if rest.endswith("'") else rest)
     return rest.replace("'\"'\"'", "'")
+
+
+# ------------------------------------------------------------------ the SSH connection we serve
+GONE_TIMEOUTS = 8       # consecutive retransmission timeouts: ~50 s of a peer acknowledging nothing
+
+
+def _proc_tcp_addr(ip, port):
+    """How /proc/net/tcp{,6} writes an address: each 32-bit word of the address in host (little-endian) order."""
+    b = ip.packed
+    return "".join("%08X" % int.from_bytes(b[i:i + 4], "little") for i in range(0, len(b), 4)) + ":%04X" % port
+
+
+def ssh_peer_gone(conn=None, tables=("/proc/net/tcp", "/proc/net/tcp6")):
+    """Has the SSH client this process serves (SSH_CONNECTION) stopped acknowledging data? A Mac that sleeps or
+    drops off the network never closes its connection, and with the kernel's 15 retries the stream would keep
+    writing into it for ~16 minutes. Here: the connection still has data in flight and the kernel has already
+    timed out GONE_TIMEOUTS retransmissions in a row (an awake Mac acknowledges within a round trip). False when
+    unsure: not over SSH, or the socket is not in the kernel's tables (e.g. an SSH server that runs in user space)."""
+    parts = (os.environ.get("SSH_CONNECTION", "") if conn is None else conn).split()
+    try:
+        cip, cport, sip, sport = ipaddress.ip_address(parts[0]), int(parts[1]), ipaddress.ip_address(parts[2]), int(parts[3])
+    except (IndexError, ValueError):
+        return False
+    pairs = [(_proc_tcp_addr(sip, sport), _proc_tcp_addr(cip, cport))]
+    if cip.version == 4 and sip.version == 4:     # an IPv4 client on an IPv6 listener: ::ffff:a.b.c.d
+        pairs.append((_proc_tcp_addr(ipaddress.ip_address("::ffff:" + str(sip)), sport),
+                      _proc_tcp_addr(ipaddress.ip_address("::ffff:" + str(cip)), cport)))
+    for table in tables:
+        try:
+            with open(table) as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) > 6 and (f[1], f[2]) in pairs and f[3] == "01":       # 01: established
+                        return int(f[4].split(":")[0], 16) > 0 and int(f[6], 16) >= GONE_TIMEOUTS
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 # ------------------------------------------------------------------ background waits that can never end
@@ -206,6 +378,60 @@ def stuck_waits(pids, procs=None):
     return out
 
 
+MAIL_STUCK_AFTER = 120          # an agent-mail send/reply blocked on its input this long never gets its text
+MAIL_SLOW_AFTER = 900           # ...and one still running this long, whatever it waits on, is not going out
+
+
+def _mail_subject(argv):
+    for i, x in enumerate(argv):
+        if x == "--subject" and i + 1 < len(argv):
+            return argv[i + 1]
+        if x.startswith("--subject="):
+            return x.split("=", 1)[1]
+    return "reply %s" % argv[3] if len(argv) > 3 and argv[2] == "reply" else ""
+
+
+def stuck_mail(pids, procs=None, now=None, proc="/proc", stuck_after=MAIL_STUCK_AFTER):
+    """{agent pid: [{"pid", "age", "subject", "why"}]}: an `agent-mail send|reply` run by an agent (anywhere below
+    its process) that is not going out. why "input": blocked reading a socket on its input for `stuck_after` s.
+    A Claude Code command holding a heredoc gets the Bash tool's socket as its input, which never ends: an
+    agent-mail waiting there for its body never sends, while the tile would show only "background". why "slow":
+    still running after MAIL_SLOW_AFTER s."""
+    procs = proc_table(proc) if procs is None else procs
+    now = now or time.time()
+    want = {int(p) for p in pids if p}
+    out = {}
+    for q, (_, argv) in procs.items():
+        if len(argv) < 3 or os.path.basename(argv[1]) != "agent-mail" or argv[2] not in ("send", "reply"):
+            continue
+        agent, up = None, q
+        for _ in range(12):                      # its agent: the nearest ancestor that is one
+            up = procs.get(up, (None,))[0]
+            if up in want:
+                agent = up
+                break
+            if not up:
+                break
+        if agent is None:
+            continue
+        started = process_started_at(q)
+        age = now - started if started else 0
+        try:
+            with open("%s/%d/wchan" % (proc, q)) as fh:
+                wchan = fh.read().strip()
+            stdin = os.readlink("%s/%d/fd/0" % (proc, q))
+        except OSError:
+            wchan, stdin = "", ""
+        if age >= stuck_after and wchan == "unix_stream_data_wait" and stdin.startswith("socket:"):
+            why = "input"
+        elif age >= MAIL_SLOW_AFTER:
+            why = "slow"
+        else:
+            continue
+        out.setdefault(agent, []).append({"pid": q, "age": round(age), "subject": _mail_subject(argv)[:120], "why": why})
+    return out
+
+
 def held_locks():
     """{"MAJ:MIN:INODE": pid} for every lock the kernel holds (Linux), or None where unknowable."""
     try:
@@ -238,27 +464,34 @@ DEFAULT_CLAUDE_HOME = HOME / ".claude"    # the mailroom's "config_dir: null", w
 ROUTING_MIN_REMAINING = {"session": 10, "weekly": 5}   # the mailroom's usage.min_remaining defaults
 
 
-def claude_routing(path=MAIL_CONFIG):
+def mail_config(path=None):
+    """The mailroom's config object (at `path`, default MAIL_CONFIG, which is config.MAIL_CONFIG); {} when the file
+    does not exist. A file that is not a JSON object raises ValueError: a damaged config must not quietly become the
+    defaults. The owner's name and addresses are read from it through config.py (owner_addresses, owner)."""
+    return load_config({}, path or MAIL_CONFIG)
+
+
+def claude_accounts(path=None):
+    """The mailroom's usage.claude_accounts: {Claude login name: its settings}, in the config's order; {} when the
+    config has none."""
+    return (mail_config(path).get("usage") or {}).get("claude_accounts") or {}
+
+
+def claude_routing(path=None):
     """(Claude login names in the mailroom's usage.order, min_remaining) with the mailroom's defaults: without an
     order, the configured logins in config order (default: the one login named "default")."""
-    try:
-        u = json.loads(Path(path).read_text()).get("usage") or {}
-    except (OSError, ValueError, AttributeError):
-        u = {}
-    accts = list((u.get("claude_accounts") or {"default": None}).keys())
+    u = mail_config(path).get("usage") or {}
+    accts = list(claude_accounts(path) or {"default": None})
     order = [t[7:] for t in (u.get("order") or ["claude:" + n for n in accts]) if isinstance(t, str)
              and t.startswith("claude:") and t[7:] in accts]
     return order, dict(ROUTING_MIN_REMAINING, **(u.get("min_remaining") or {}))
 
 
-def claude_logins(path=MAIL_CONFIG):
+def claude_logins(path=None):
     """[(account name, config dir)] for every Claude login in the mailroom's usage config; the default
     login (config_dir null) is always ~/.claude, even when this process runs under another login's
     CLAUDE_CONFIG_DIR. Without config, just the default."""
-    try:
-        accts = (json.loads(Path(path).read_text()).get("usage") or {}).get("claude_accounts") or {}
-    except (OSError, ValueError, AttributeError):
-        accts = {}
+    accts = claude_accounts(path)
     out, seen = [], set()
     for name, a in accts.items():
         d = Path(os.path.expanduser(a.get("config_dir"))) if isinstance(a, dict) and a.get("config_dir") else DEFAULT_CLAUDE_HOME
@@ -270,11 +503,234 @@ def claude_logins(path=MAIL_CONFIG):
     return out
 
 
-def claude_sessions_all(logins=None):
+def login_labels(path=None):
+    """{Claude login name: its label in the mailroom's usage config, without the part in brackets}, for the logins
+    that have one ("Work seat (~/.claude-work)" gives "Work seat")."""
+    accts = claude_accounts(path)
+    return {name: a["label"].split("(")[0].strip() for name, a in accts.items()
+            if isinstance(a, dict) and isinstance(a.get("label"), str) and a["label"].split("(")[0].strip()}
+
+
+def login_config(home):
+    """The .claude.json of the Claude login whose folder is `home`: the default login's sits beside ~/.claude, in the
+    home folder; another login's is inside its folder."""
+    return HOME / ".claude.json" if Path(home).resolve() == DEFAULT_CLAUDE_HOME.resolve() else Path(home) / ".claude.json"
+
+
+def login_account(home):
+    """(account id, organisation id) the Claude login whose folder is `home` is signed in to, or None when it is
+    signed out. Raises OSError or ValueError when its .claude.json cannot be read."""
+    o = read_json(login_config(home), {}).get("oauthAccount") or {}
+    return (o["accountUuid"], o.get("organizationUuid")) if o.get("accountUuid") else None
+
+
+def mark_shared_logins(accounts, logins=None):
+    """Put "same_account_as" on each Claude account of a usage reading (in place) whose login is signed in to the same
+    account, in the same organisation, as an earlier login: those logins' targets; and "login_dir", its folder, with ~
+    for the home folder. Such logins spend one allowance, which the reading shows as two. The default login comes
+    first, so it is never the one marked (its .claude.json is not in its folder), then the others as the mailroom's
+    usage.claude_accounts lists them (logins: claude_logins', read from the mailroom's config when None). Reads each
+    login's .claude.json (login_account), and raises as that does."""
+    logins = claude_logins() if logins is None else logins
+    seen = {}
+    for name, home in sorted(logins, key=lambda nh: Path(nh[1]).resolve() != DEFAULT_CLAUDE_HOME.resolve()):
+        who = login_account(home)
+        if who is None:
+            continue
+        target = usage_target({"cli": "claude", "account": name})
+        acct = next((a for a in accounts if a.get("target") == target), None)
+        if who in seen and acct is not None:
+            acct["same_account_as"] = list(seen[who])
+            acct["login_dir"] = "~/" + str(Path(home).relative_to(HOME)) if Path(home).is_relative_to(HOME) else str(home)
+        seen.setdefault(who, []).append(target)
+
+
+def append_log(path, msg):
+    """Append one timestamped line to a run log, creating its folder. Returns the line, without its newline."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    with open(path, "a") as fh:
+        fh.write(line + "\n")
+    return line
+
+
+@contextlib.contextmanager
+def file_lock(path):
+    """Hold an exclusive lock on the file at `path` (created, with its folder, if missing) for the with-block, so
+    callers that share the path run it one at a time; a second caller waits for the first."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield                                # closing the file releases the lock
+
+
+def append_jsonl(path, obj, unless=None):
+    """Append `obj` as one JSON line: a single write under an exclusive lock on the file, so concurrent writers
+    never interleave. With `unless`, a check of the lines already there (read_jsonl's list) made under the same
+    lock: when it is true nothing is written. Whether the line was written. A new file is private (0600). Raises
+    OSError when the file cannot be written."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if unless is not None and unless(read_jsonl(path)):
+            return False
+        os.write(fd, (json.dumps(obj, ensure_ascii=False, default=str) + "\n").encode("utf-8"))
+        return True
+    finally:
+        os.close(fd)                         # releases the lock
+
+
+def read_jsonl(path):
+    """The JSON values of a file's lines, oldest first; [] when the file does not exist. A line that is not JSON
+    raises ValueError naming the file and line, except a last line without its newline: a writer may be appending
+    it right now. An unreadable file raises OSError."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    lines = text.split("\n")
     out = []
-    for account, home in (logins or claude_logins()):
+    for i, ln in enumerate(lines):
+        if not ln.strip():
+            continue
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            if i == len(lines) - 1:
+                continue
+            raise ValueError("%s line %d is not JSON" % (path, i + 1)) from None
+    return out
+
+
+def read_json(path, default=None):
+    """A JSON file's content, or `default` when the file does not exist. A damaged file raises: OSError when it cannot
+    be read, ValueError naming it when it is not JSON, so a damaged state file never passes for a missing one. A
+    cache the caller can rebuild is read with read_cache."""
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return default
+    except ValueError as e:         # not JSON, or not even UTF-8 text
+        raise ValueError("%s is not valid JSON: %s" % (path, e)) from None
+
+
+def read_cache(path, default, log):
+    """read_json for a cache the caller can rebuild from its sources: a damaged file is reported with log(message)
+    and gives `default`, as a missing one does, so the caller starts it afresh."""
+    try:
+        return read_json(path, default)
+    except (OSError, ValueError) as e:
+        log("starting a damaged cache afresh: %s" % error_text(e))
+        return default
+
+
+class _Lines:
+    """The complete lines of a binary file from its position on, as bytes (json.loads reads them; a parser looks for
+    what it wants before decoding a line); `offset` is the byte after the last one given. A last line without its
+    newline is still being written, so it ends the lines without being given."""
+
+    def __init__(self, fh, offset):
+        self.fh, self.offset = fh, offset
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raw = self.fh.readline()
+        if not raw.endswith(b"\n"):
+            raise StopIteration
+        self.offset += len(raw)
+        return raw
+
+
+def read_appended(paths, since, cache_path, log):
+    """{path: parse's result} for each (path, parse) in `paths` whose file was modified since `since`, in that order
+    (a file parse has nothing for yet, None, is left out). parse(lines, state, path) reads the lines into `state`, None
+    at the start of a file, and returns it. The files are logs that only grow: one that has grown since the cache's
+    last read is read on from where that read stopped, and one replaced or shrunk (another inode, or smaller) from
+    its start. The cache at `cache_path` is rewritten (private) with what was read this time; a damaged one is
+    reported with log(message), and every file is read again."""
+    cache = read_cache(cache_path, {}, log) or {}
+    out, fresh = {}, {}
+    for p, parse in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if st.st_mtime < since:
+            continue
+        hit = cache.get(p)
+        if not (isinstance(hit, dict) and hit.get("ino") == st.st_ino and 0 <= hit.get("offset", -1) <= st.st_size):
+            hit = {"ino": st.st_ino, "offset": 0, "state": None}
+        if hit["offset"] < st.st_size:
+            with open(p, "rb") as fh:
+                fh.seek(hit["offset"])
+                lines = _Lines(fh, hit["offset"])
+                hit = dict(hit, state=parse(lines, hit["state"], p), offset=lines.offset)
+        fresh[p] = hit
+        if hit["state"] is not None:
+            out[p] = hit["state"]
+    write_json(cache_path, fresh, mode=0o600)
+    return out
+
+
+def iso_ts(s):
+    """Epoch seconds from an ISO 8601 time, including the "Z" that Claude, Codex and Google end theirs with (Python
+    before 3.11 does not read it). Raises ValueError on anything else."""
+    return datetime.datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s).timestamp()
+
+
+def rfc3339(ts):
+    """Epoch seconds as the RFC 3339 time in UTC that Google's APIs take ("2026-11-13T09:30:00Z"), to the second."""
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_config(defaults, path):
+    """`defaults` overridden by the JSON object at `path`. A missing file means no overrides; one that is not a
+    JSON object raises ValueError (read_json's errors otherwise), so a typo in a config never quietly turns into the
+    defaults."""
+    given = read_json(path, {})
+    if not isinstance(given, dict):
+        raise ValueError("%s must hold a JSON object" % path)
+    return dict(defaults, **given)
+
+
+def write_json(path, obj, mode=None):
+    """Write `obj` as JSON with write_text_atomic."""
+    write_text_atomic(path, json.dumps(obj, indent=1, default=str), mode)
+
+
+def write_text_atomic(path, text, mode=None):
+    """Write `text` atomically: a unique temporary file beside `path`, then a rename, so concurrent writers never
+    collide. The file keeps its permissions; a new one is private (0600) unless `mode` says otherwise."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    if mode is None and path.exists():
+        mode = path.stat().st_mode & 0o777
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def live_session_ids():
+    """The ids of every Claude Code and Codex session running now."""
+    return ({s["id"] for s in claude_sessions_all() if s["live"]}
+            | {s["id"] for s in CodexReader().sessions() if s["live"]})
+
+
+def claude_sessions_all():
+    out, labels = [], login_labels()
+    for account, home in claude_logins():
         for s in claude_sessions(home):
             s["account"] = account
+            s["account_label"] = labels.get(account)
             s["account_default"] = Path(home).resolve() == DEFAULT_CLAUDE_HOME.resolve()
             s["config_dir"] = str(home)     # `claude attach` for a --bg session must run under its own login
             out.append(s)
@@ -303,12 +759,15 @@ def claude_sessions(home=CLAUDE_HOME):
 
 
 class CodexReader:
-    """Codex threads with real liveness. Busy = its rollout file was written in the last BUSY_SECONDS."""
+    """Codex threads with real liveness. Busy = its rollout file was written in the last BUSY_SECONDS. A threads
+    table that cannot be read gives no threads for that poll, with the reason in `error`."""
     BUSY_SECONDS = 45
+    RECENT_SECONDS = 86400      # a thread not live and not asked about is listed if updated this recently
 
     def __init__(self, home=CODEX_HOME):
         self.home = Path(home)
         self.con = None
+        self.error = None
 
     def _db(self):
         if self.con is None:
@@ -318,7 +777,7 @@ class CodexReader:
             self.con = ro_sqlite(db)
         return self.con
 
-    def sessions(self, ids_of_interest=(), recent_seconds=86400, now=None):
+    def sessions(self, ids_of_interest=(), now=None):
         now = now or time.time()
         lock_dir = self.home / "thread-writer-locks"
         locks = {}
@@ -336,26 +795,27 @@ class CodexReader:
                 live[tid] = None            # cannot tell: trust the file
             elif lock_key(st) in held:
                 live[tid] = held[lock_key(st)]
-        con = self._db()
         rows = {}
-        if con is not None:
-            want = set(live) | set(ids_of_interest)
-            ph = ",".join("?" * len(want))
-            where = "where archived = 0 and (updated_at >= ? %s)" % ("or id in (%s)" % ph if want else "")
-            base = "id, name, title, cwd, git_branch, rollout_path, updated_at, model, reasoning_effort, created_at"
-            for cols in (base + ", source, thread_source, agent_nickname", base):   # older Codex: no subagent columns
-                try:
-                    for r in con.execute("select %s from threads %s" % (cols, where), [int(now - recent_seconds)] + list(want)):
-                        rows[r["id"]] = dict(r)
-                    break
-                except sqlite3.OperationalError as e:
-                    if "no such column" in str(e) and cols != base:
-                        continue                 # an older Codex: retry without the subagent columns
-                    self.con = None              # locked / I/O / stale handle: reopen next poll
-                    break
-                except sqlite3.Error:
-                    self.con = None
-                    break
+        try:
+            con = self._db()
+            if con is not None:
+                want = set(live) | set(ids_of_interest)
+                ph = ",".join("?" * len(want))
+                where = "where archived = 0 and (updated_at >= ? %s)" % ("or id in (%s)" % ph if want else "")
+                base = "id, name, title, cwd, git_branch, rollout_path, updated_at, model, reasoning_effort, created_at"
+                for cols in (base + ", source, thread_source, agent_nickname", base):
+                    try:
+                        for r in con.execute("select %s from threads %s" % (cols, where),
+                                             [int(now - self.RECENT_SECONDS)] + list(want)):
+                            rows[r["id"]] = dict(r)
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "no such column" not in str(e) or cols == base:
+                            raise
+                        # an older Codex: retry without the subagent columns
+            self.error = None
+        except sqlite3.Error as e:          # locked, I/O, a stale handle: reopened next poll; the board lists it
+            self.con, self.error = None, error_text(e)
         out = []
         for tid, r in rows.items():
             is_live = tid in live
@@ -422,43 +882,46 @@ def _agent_path(source):
         return ""
 
 
-def tmux_sessions():
-    """{session name: set of its panes' current directories}, or {} without tmux."""
+TMUX_NO_SERVER = ("no server running", "error connecting to")      # tmux's words when no server is up
+
+
+def tmux_list_panes():
+    """[(pane pid, session name, pane's current directory)] for every tmux pane, from one `tmux list-panes -a`;
+    [] without tmux or with no tmux server running. Raises RuntimeError when tmux fails otherwise or does not answer
+    in 3 s."""
     tmux = find_bin("tmux")
     if not tmux:
-        return {}
-    try:
-        r = subprocess.run([tmux, "list-panes", "-a", "-F", "#{session_name}\t#{pane_current_path}"],
-                           capture_output=True, text=True, timeout=3)
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
+        return []
+    code, out, err = run([tmux, "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{pane_current_path}"],
+                         timeout=3)
+    if code != 0:
+        if any(w in err for w in TMUX_NO_SERVER):
+            return []
+        raise RuntimeError("tmux list-panes exit %d: %s" % (code, err.strip()[-300:]))
+    rows = []
+    for line in out.splitlines():
+        pid, _, rest = line.partition("\t")
+        name, _, path = rest.partition("\t")
+        if pid.isdigit() and name:
+            rows.append((int(pid), name, path))
+    return rows
+
+
+def tmux_sessions(rows=None):
+    """{session name: set of its panes' current directories}; rows: tmux_list_panes()'s, read now when None."""
     out = {}
-    for line in r.stdout.splitlines():
-        name, _, path = line.partition("\t")
-        if name:
-            out.setdefault(name, set()).add(path)
+    for _, name, path in tmux_list_panes() if rows is None else rows:
+        out.setdefault(name, set()).add(path)
     return out
 
 
-def tmux_panes():
-    """{pane_pid: session_name} for every tmux pane, or {} without tmux."""
-    tmux = find_bin("tmux")
-    if not tmux:
-        return {}
-    try:
-        r = subprocess.run([tmux, "list-panes", "-a", "-F", "#{pane_pid} #{session_name}"],
-                           capture_output=True, text=True, timeout=3)
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    out = {}
-    for line in r.stdout.splitlines():
-        pid, _, name = line.partition(" ")
-        if pid.isdigit():
-            out[int(pid)] = name
-    return out
+def tmux_panes(rows):
+    """{pane pid: session name} for tmux_list_panes()'s rows."""
+    return {pid: name for pid, name, _ in rows}
 
 
-def tmux_session_for(pid, panes, depth=12):
+def tmux_session_for(pid, panes):
+    depth = 12                  # the pane's process is at most this many ancestors up
     while pid and depth:
         if pid in panes:
             return panes[pid]
@@ -469,11 +932,11 @@ def tmux_session_for(pid, panes, depth=12):
 
 # ------------------------------------------------------------------ status log
 class EventLog:
-    """Incremental tail of the agent-status log; keeps the last `keep_seconds` of events in memory."""
+    """Incremental tail of the agent-status log; keeps the last KEEP_SECONDS of events in memory."""
+    KEEP_SECONDS = 48 * 3600
 
-    def __init__(self, path=STATUS_LOG, keep_seconds=48 * 3600):
+    def __init__(self, path=STATUS_LOG):
         self.path = Path(path)
-        self.keep = keep_seconds
         self.events = []
         self.ino = None
         self.pos = 0
@@ -514,7 +977,7 @@ class EventLog:
         elif st.st_size > self.pos:
             new, self.pos = self._read_from(self.path, self.pos)
         self.ino = st.st_ino
-        cutoff = now - self.keep
+        cutoff = now - self.KEEP_SECONDS
         self.events.extend(e for e in new if (e.get("ts") or 0) >= cutoff)
         if self.events and (self.events[0].get("ts") or 0) < cutoff:
             self.events = [e for e in self.events if (e.get("ts") or 0) >= cutoff]
@@ -528,17 +991,46 @@ class EventLog:
 
 
 # ------------------------------------------------------------------ mailroom store
-def owner_addresses(path=MAIL_CONFIG):
+def norm_id(message_id):
+    """A Message-ID as two copies of it compare: without spaces or <>, in lower case."""
+    return (message_id or "").strip().strip("<>").strip().lower()
+
+
+def owner_addresses(path=None):
     """The owner's addresses (mailroom config owner_email, then allowlist), lower case; [] when unconfigured."""
-    return config.owner_addresses(config.mail_config(path))
+    return config.owner_addresses(mail_config(path))
 
 
-def mail_account(path=MAIL_CONFIG):
+def owner(path=None):
+    """The address the board and its tools mail the owner at (config.owner_email: the mailroom config's owner_email,
+    else its first allowlisted sender), in lower case; None when the config names neither."""
+    return (config.owner_email(mail_config(path)) or "").lower() or None
+
+
+def mail_account(path=None):
     """The agents' Gmail address (mailroom config "account"), or ""."""
-    try:
-        return (json.loads(Path(path).read_text()).get("account") or "").lower()
-    except (OSError, ValueError, AttributeError):
-        return ""
+    return (mail_config(path).get("account") or "").lower()
+
+
+def mail_host(path=None):
+    """This machine's name in the mailroom (config "host_id")."""
+    return mail_config(path).get("host_id") or "desktop"
+
+
+def mail_owner(subject, body):
+    """Email the owner from the agents' account, unrouted (a detached job has no session for the reply to reach).
+    (sent?, what went wrong)."""
+    exe = find_bin("agent-mail")
+    if not exe:
+        return False, "agent-mail is not installed"
+    to = owner()
+    if not to:
+        return False, "no owner address in the mailroom config (owner_email)"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SSH_")}
+    env["PATH"] = LOGIN_PATH
+    code, out, err = run([exe, "send", "--unrouted", "--to", to, "--subject", subject], timeout=120, env=env,
+                         input=body if body.endswith("\n") else body + "\n")
+    return code == 0, "" if code == 0 else "agent-mail exit %d: %s" % (code, (err or out).strip()[-300:])
 
 
 class MailStore:
@@ -548,7 +1040,7 @@ class MailStore:
         self.path = Path(path)
         self.owners = owners
         # this machine's identity in mail routing (mailroom config host_id); sessions hosted elsewhere are skipped
-        self.host_id = host_id or config.mail_config().get("host_id") or "desktop"
+        self.host_id = host_id or mail_host()
         self.con = None
 
     def _db(self):
@@ -557,7 +1049,8 @@ class MailStore:
         return self.con
 
     def read(self, now=None, window=7 * 86400):
-        """{"by_session": {(cli, sid): {"sent": [...], "inbound": [...], "reviews": [...]?}}, "held": [...]}"""
+        """{"by_session": {(cli, sid): {"sent": [...], "inbound": [...], "reviews": [...]?}}, "held": [...], "ok"};
+        "ok" is False without a store, and also when it could not be read, with the sqlite error in "error"."""
         now = now or time.time()
         owners = self.owners if self.owners is not None else owner_addresses()
         con = self._db()
@@ -566,12 +1059,11 @@ class MailStore:
             return out
         since = int(now - window)
         try:
-            tags = {}
+            tags, names = {}, {}
             for r in con.execute("select tag, cli, session_id, session_name, origin_host from sessions"):
-                if (r["origin_host"] or self.host_id) == self.host_id:     # no origin: an older, local row
-                    tags[r["tag"]] = (r["cli"], r["session_id"])
-            names = {}
-            for r in con.execute("select session_id, session_name from sessions where origin_host = ?", (self.host_id,)):
+                if (r["origin_host"] or self.host_id) != self.host_id:     # no origin: an older, local row
+                    continue
+                tags[r["tag"]] = (r["cli"], r["session_id"])
                 if r["session_name"]:
                     names[r["session_name"]] = r["session_id"]
             for r in con.execute("select tag, thread_id, to_addr, subject, sent_at, message_id from sent where sent_at >= ?", (since,)):
@@ -610,8 +1102,9 @@ class MailStore:
                     if key:
                         out["by_session"].setdefault(key, {"sent": [], "inbound": []}).setdefault(
                             "reviews", []).append(dict(r))
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                if "no such table" not in str(e):
+                    raise
         except sqlite3.Error as e:
             self.con = None
             out["ok"] = False
@@ -627,11 +1120,57 @@ def _addressed_to(to_addr, owners):
 
 # ------------------------------------------------------------------ git
 def _git(cwd, *args):
+    # --no-optional-locks: `git status` must not refresh the agents' own index, or their commits can hit index.lock
     try:
-        r = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["git", "--no-optional-locks", "-C", cwd] + list(args), capture_output=True, text=True,
+                           timeout=5)
         return r.stdout.strip() if r.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
         return None
+
+
+def repo_of_common(common, toplevel=""):
+    """A repo's name from its git common dir: the main checkout's folder, so a linked worktree such as
+    admin-todo-12 is named admin."""
+    return os.path.basename(os.path.dirname(os.path.abspath(common))) or os.path.basename(toplevel)
+
+
+_names_beside = {}         # folder -> the names in it, read once per process
+
+
+def repo_name(cwd):
+    """The repo a folder belongs to, or "" when it belongs to none. A folder that exists asks git. One that no
+    longer does (a removed worktree) is matched by agent-spawn's naming, <repo>-<branch>: the longest git repo
+    beside it, at the nearest level where one matches, so .../admin-todo-12 is admin and
+    .../recipe-site-worktrees/7-x/site is recipe-site."""
+    if not cwd:
+        return ""
+    if os.path.isdir(cwd):
+        common = _git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if common:
+            return repo_of_common(common)
+    p = Path(cwd)
+    for comp in [p] + list(p.parents)[:-1]:
+        parent = comp.parent
+        if parent not in _names_beside:
+            try:
+                _names_beside[parent] = os.listdir(parent)
+            except OSError:
+                _names_beside[parent] = []
+        # only the names it could be named after are looked at, so a folder of many entries costs one listing
+        hits = [r for r in _names_beside[parent] if (comp.name == r or comp.name.startswith(r + "-"))
+                and _has_git(parent / r)]
+        if hits:
+            return max(hits, key=len)
+    return ""
+
+
+def _has_git(folder):
+    """Whether `folder` holds a .git; False when that cannot be looked for (no permission to enter it)."""
+    try:
+        return (folder / ".git").exists()
+    except OSError:
+        return False
 
 
 def parse_status_v2(text):
@@ -688,7 +1227,7 @@ def git_facts(cwd, now=None):
         return {}
     toplevel, common = top.splitlines()[:2]
     common = common if os.path.isabs(common) else os.path.join(cwd, common)
-    repo = os.path.basename(os.path.dirname(os.path.abspath(common))) or os.path.basename(toplevel)
+    repo = repo_of_common(common, toplevel)
     raw_status = _git(cwd, "status", "--porcelain=v2", "--branch", "--untracked-files=normal")
     st = parse_status_v2(raw_status)
     # branch: status knows it even on an unborn branch; if status timed out, ask rev-parse (fast)
@@ -716,34 +1255,46 @@ def git_facts(cwd, now=None):
 
 
 class PullRequests:
-    """Every PR per GitHub repo, from one `gh pr list` per repo every `ttl` seconds, in the background.
-    A failed or missing gh just means no PR column; it never blocks a poll."""
+    """Every PR per GitHub repo, from one `gh pr list` per repo every `ttl` seconds, in the background (in the
+    caller's thread when `sync` is set: a one-shot snapshot). Without gh there is no PR column. A failed gh keeps
+    the repo's last table and is tried again a minute later; until it succeeds, `error` says why."""
 
     RETRY = 60
 
     def __init__(self, ttl=300, runner=None, sync=False):
         self.ttl = ttl
         self.runner = runner or self._gh
-        self.sync = sync          # one-shot snapshots wait for the answer; the stream never does
+        self.sync = sync
         self.by_slug = {}      # slug -> (ts, {branch: pr})
+        self.errors = {}       # slug -> why its last gh call failed
         self.pending = set()
         self.lock = threading.Lock()
 
     @staticmethod
     def _gh(slug):
+        """The repo's PRs as `gh pr list --json` lists them; None when gh is not installed. Raises RuntimeError when
+        gh fails (logged out, rate limited, no answer in 30 s) and ValueError when its output is not JSON."""
         gh = find_bin("gh")
         if not gh:
             return None
-        r = subprocess.run([gh, "pr", "list", "--repo", slug, "--state", "all", "--limit", "100", "--json",
-                            "number,state,headRefName,headRefOid,baseRefName,url,isDraft,mergedAt,title"],
-                           capture_output=True, text=True, timeout=30)
-        return json.loads(r.stdout) if r.returncode == 0 else None
+        code, out, err = run([gh, "pr", "list", "--repo", slug, "--state", "all", "--limit", "100", "--json",
+                              "number,state,headRefName,headRefOid,baseRefName,url,isDraft,mergedAt,title"], timeout=30)
+        if code != 0:
+            raise RuntimeError("gh pr list exit %d: %s" % (code, (err or out).strip()[-300:]))
+        return json.loads(out)
+
+    @property
+    def error(self):
+        """Each repo's gh failure as "slug: error", joined by "; ", or None."""
+        with self.lock:
+            return "; ".join("%s: %s" % kv for kv in sorted(self.errors.items())) or None
 
     def _fetch(self, slug, now=None):
+        err = None
         try:
             rows = self.runner(slug)
-        except Exception:
-            rows = None
+        except Exception as e:      # the repo keeps its last table; `error` shows why it is not newer
+            rows, err = None, error_text(e)
         table = {}
         for pr in rows or []:
             b = pr.get("headRefName")
@@ -756,6 +1307,10 @@ class PullRequests:
             else:   # keep what we had; retry in a minute, not on every poll
                 old = self.by_slug.get(slug, (0, {}))[1]
                 self.by_slug[slug] = (when - self.ttl + self.RETRY, old)
+            if err:
+                self.errors[slug] = err
+            else:
+                self.errors.pop(slug, None)
             self.pending.discard(slug)
 
     def invalidate(self):
@@ -780,12 +1335,15 @@ class PullRequests:
         return (hit[1] if hit else {}).get(branch)
 
 
+REPOS_ROOT = config.repos_root()        # where repos and worktrees live (AGENT_BOARD_REPOS, else the mailroom config)
+
+
 def list_worktrees(roots=None):
     """Every linked worktree of every main repo directly under the roots (default: the configured repos_root),
     wherever the worktree itself lives: [{path, repo, main, branch, detached, locked}]. Missing (prunable) ones
     are skipped."""
     out = []
-    for root in roots or [config.repos_root()]:
+    for root in roots or [REPOS_ROOT]:
         try:
             entries = sorted(os.listdir(root))
         except OSError:
@@ -814,13 +1372,12 @@ class GitCache:
     def __init__(self, ttl=60, budget=4, fetch=git_facts):
         self.ttl, self.budget, self.fetch = ttl, budget, fetch
         self.cache = {}
+        self.burst = False         # the next poll fetches every stale cwd, not just `budget` of them
 
     def invalidate(self):
         """Next poll refetches every cwd (a manual refresh)."""
         self.cache = {c: (0, f) for c, (_, f) in self.cache.items()}
         self.burst = True
-
-    burst = False
 
     def get_many(self, cwds, now=None):
         now = now or time.time()
@@ -850,7 +1407,7 @@ class Metrics:
             return
         try:
             self.gpu_proc = subprocess.Popen(
-                [smi, "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw",
+                [smi, "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu",
                  "--format=csv,noheader,nounits", "-l", "5"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         except OSError:
@@ -865,7 +1422,7 @@ class Metrics:
             if len(f) < 5:
                 continue
             g = {"name": f[0], "mem_used": _num(f[1]) * 2**20, "mem_total": _num(f[2]) * 2**20,
-                 "util": _num(f[3]), "temp": _num(f[4]), "power": _num(f[5]) if len(f) > 5 else None}
+                 "util": _num(f[3]), "temp": _num(f[4])}
             batch.append(g)
             # nvidia-smi prints one line per GPU per tick; a repeated name starts a new tick
             if len(batch) > 1 and batch[-1]["name"] == batch[0]["name"]:
@@ -972,36 +1529,24 @@ def _disk_kind(dev):
 
 # ------------------------------------------------------------------ plan usage
 class Usage:
-    """Plan usage behind one interface: `agent-usage --json` when installed; until then its cache file.
+    """Plan usage: `agent-usage --json`, or its cache file when agent-usage is missing or fails (the failure in
+    the reading's "error"). Nothing here writes the cache or runs a probe. A reading is taken every `interval`
+    seconds, as a Periodic (in the background unless `sync`). `annotate`, when given, is called with each reading's
+    accounts and adds to them in place (the board passes bin/agent-board's annotate_usage, which says what it adds);
+    what it raises goes in the reading's "error"."""
 
-    The stand-in never writes the cache and never runs the probes itself, so swapping to agent-usage
-    later needs no change here beyond it appearing on PATH."""
-
-    def __init__(self, cache_path=USAGE_CACHE, interval=300, runner=None):
+    def __init__(self, cache_path=USAGE_CACHE, interval=300, runner=None, annotate=None, sync=False):
         self.cache_path = Path(cache_path)
-        self.interval = interval
-        self.runner = runner or self._run_agent_usage
+        self.runner = runner or agent_usage
+        self.annotate = annotate
         # show the last cached reading at once; the first real read happens in the background.
         # The cache is another tool's file: nothing in it may stop the collector from starting.
         try:
             cached = self.from_cache()
         except Exception:
             cached = None
-        self.data = cached or {"source": "none", "accounts": [], "observed_at": None, "error": None}
-        self.at = 0
-        self.lock = threading.Lock()
-        self.busy = False
-
-    @staticmethod
-    def _run_agent_usage(refresh):
-        exe = find_bin("agent-usage")
-        if not exe:
-            return None
-        cmd = [exe, "--json"] + (["--refresh"] if refresh else [])
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        if r.returncode != 0:
-            raise RuntimeError((r.stderr or r.stdout).strip()[-300:] or "agent-usage exit %d" % r.returncode)
-        return json.loads(r.stdout)
+        first = self._annotated(cached or {"source": "none", "accounts": [], "observed_at": None, "error": None})
+        self.timer = Periodic(self._read, interval, first, sync)
 
     def from_cache(self):
         try:
@@ -1022,41 +1567,255 @@ class Usage:
         seen = [a["observed_at"] for a in accounts if isinstance(a.get("observed_at"), (int, float))]
         return {"source": "cache", "accounts": accounts, "observed_at": max(seen) if seen else None, "error": None}
 
-    def refresh(self, force=False):
-        with self.lock:
-            if self.busy:
-                return
-            self.busy = True
+    def _read(self, force):
+        """One reading: agent-usage's (re-probed with `force`), else the cache's with agent-usage's failure in
+        "error"; then annotated."""
+        data, err = None, None
         try:
-            data, err = None, None
-            try:
-                raw = self.runner(force)
-                if raw is not None:
-                    data = {"source": "agent-usage", "accounts": raw.get("accounts") or [],
-                            "observed_at": raw.get("generated_at"), "recommendation": raw.get("recommendation"),
-                            "error": None}
-            except Exception as e:   # a broken probe must never take the board down
-                err = str(e)[:300]
-            if data is None:
-                try:
-                    data = self.from_cache()
-                except Exception:
-                    data = None
-                data = data or {"source": "none", "accounts": [], "observed_at": None, "error": None}
-                if err:
-                    data["error"] = err
-            self.data, self.at = data, time.time()
-        finally:
-            self.busy = False
+            raw = self.runner(force)
+            if raw is not None:
+                data = {"source": "agent-usage", "accounts": raw.get("accounts") or [],
+                        "observed_at": raw.get("generated_at"), "recommendation": raw.get("recommendation"),
+                        "error": None}
+        except Exception as e:   # a broken probe must never take the board down
+            err = error_text(e)
+        if data is None:
+            data = self.from_cache() or {"source": "none", "accounts": [], "observed_at": None, "error": None}
+            if err:
+                data["error"] = err
+        return self._annotated(data)
 
-    def kick(self):
-        """Re-read now, through agent-usage's own cache (a manual board refresh; no new probes)."""
-        self.at = time.time()
-        threading.Thread(target=self.refresh, args=(False,), daemon=True).start()
+    def _annotated(self, data):
+        if self.annotate is not None:
+            try:
+                self.annotate(data.get("accounts") or [])
+            except Exception as e:      # costs only what annotate adds; the reading's "error" says why
+                data["error"] = "; ".join(x for x in (data.get("error"), error_text(e)) if x)
+        return data
+
+    @property
+    def data(self):
+        """The current reading: {"source", "accounts", "observed_at", "error", ...}."""
+        return self.timer.value
+
+    @property
+    def error(self):
+        """Why the current reading is not a fresh, complete one, or None."""
+        return self.timer.error or self.data.get("error")
 
     def maybe_refresh(self, now=None, force=False):
-        now = now or time.time()
-        if force or now - self.at > self.interval:
-            self.at = now
-            threading.Thread(target=self.refresh, args=(force,), daemon=True).start()
-        return self.data
+        """The current reading, after starting a new one when `interval` has passed or `force` is set (`force` also
+        makes agent-usage probe again)."""
+        return self.timer.maybe_refresh(now, force, args=(force,))
+
+    def invalidate(self):
+        """The next maybe_refresh() takes a reading, through agent-usage's own cache (no new probes)."""
+        self.timer.invalidate()
+
+
+def claude_home_of(sid):
+    """(account, config dir) of the login holding the NEWEST copy of this session's transcript, or (None, None).
+    After a login move both logins have a copy and the old one stops at the move, so first-found is wrong."""
+    best = None
+    for account, home in claude_logins():
+        for path in Path(home).glob("projects/*/%s.jsonl" % sid):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if best is None or mtime > best[0]:
+                best = (mtime, account, Path(home))
+    return (best[1], best[2]) if best else (None, None)
+
+
+def transcript_tail(path, nbytes):
+    """The lines of a transcript's last `nbytes` bytes (the first may be cut). Raises OSError when unreadable."""
+    with open(path, "rb") as fh:
+        fh.seek(max(0, os.path.getsize(path) - nbytes))
+        return fh.read().decode("utf-8", "replace").splitlines()
+
+
+def last_claude_model(home, sid):
+    """The model of the session's last assistant turn, from its transcript tail."""
+    for path in Path(home).glob("projects/*/%s.jsonl" % sid):
+        try:
+            lines = transcript_tail(path, 2_000_000)
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"model"' in line and '"assistant"' in line:
+                try:
+                    m = (json.loads(line).get("message") or {}).get("model")
+                except ValueError:
+                    continue
+                if m and not m.startswith("<"):
+                    return m
+    return None
+
+
+def last_turn_failed(sid):
+    """Whether the session's conversation ends on Claude Code's own record of a failed request (an assistant entry
+    with isApiErrorMessage), from its newest transcript's tail; None when that can't be read. A StopFailure hook
+    also fires when a side request fails after a turn finished normally (such as a 429 "Usage credits are required
+    for long context requests" a second after an agent's final answer), and that leaves no such record."""
+    _, home = claude_home_of(sid)
+    paths = sorted(Path(home).glob("projects/*/%s.jsonl" % sid), key=lambda p: p.stat().st_mtime) if home else []
+    if not paths:
+        return None
+    try:
+        lines = transcript_tail(paths[-1], 2_000_000)
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("type") in ("assistant", "user") and not d.get("isMeta"):
+            return d["type"] == "assistant" and bool(d.get("isApiErrorMessage"))
+    return None
+
+
+def codex_settings(tid):
+    con = CodexReader()._db()
+    if con is None:
+        return None, None
+    r = con.execute("select model, reasoning_effort from threads where id = ?", (tid,)).fetchone()
+    return (r["model"], r["reasoning_effort"]) if r else (None, None)
+
+
+def is_live(agent):
+    if agent["cli"] == "claude":
+        return any(s["id"] == agent["id"] and s["live"] for s in claude_sessions_all())
+    return any(s["id"] == agent["id"] and s["live"] for s in CodexReader().sessions(ids_of_interest=[agent["id"]]))
+
+
+def cmdline(pid, proc="/proc"):
+    try:
+        with open("%s/%d/cmdline" % (proc, int(pid)), "rb") as fh:
+            return [a.decode("utf-8", "replace") for a in fh.read().split(b"\x00") if a]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def model_effort(agent):
+    """(model, effort) as the agent runs now: its process arguments first, else its transcript / thread."""
+    argv = cmdline(agent.get("pid")) if agent.get("pid") else []
+    model = effort = None
+    for i, a in enumerate(argv):
+        if a in ("--model", "-m") and i + 1 < len(argv):
+            model = argv[i + 1]
+        elif a == "--effort" and i + 1 < len(argv):
+            effort = argv[i + 1]
+        elif a.startswith("model_reasoning_effort="):
+            effort = a.split("=", 1)[1].strip("'\"")
+    if agent["cli"] == "codex" and not (model and effort):
+        m, e = codex_settings(agent["id"])
+        model, effort = model or m, effort or e
+    if agent["cli"] == "claude" and not model:
+        _, home = claude_home_of(agent["id"])
+        model = last_claude_model(home, agent["id"]) if home else None
+    return model, effort
+
+
+def agent_usage(refresh, run=run):
+    """`agent-usage --json` (with --refresh: re-probe now; else it answers from its 2-minute cache and never spends
+    quota), parsed; None when agent-usage is not installed. Raises RuntimeError when it fails."""
+    b = find_bin("agent-usage")
+    if not b:
+        return None
+    code, out, err = run([b, "--json"] + (["--refresh"] if refresh else []), timeout=90)
+    if code != 0:
+        raise RuntimeError((err or out).strip()[-300:] or "agent-usage exit %d" % code)
+    return json.loads(out)
+
+
+def read_usage(run=run):
+    """The accounts agent-usage reports; RuntimeError when it is not installed or fails."""
+    got = agent_usage(False, run)
+    if got is None:
+        raise RuntimeError("agent-usage is not installed")
+    return got.get("accounts") or []
+
+
+SAME_RESET = 3600      # one window's resets_at moves by a second between readings; a new window's by hours or days
+
+
+def same_reset(a, b):
+    """Whether two usage readings' reset times (resets_at, or None) name the same window."""
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(float(a) - float(b)) <= SAME_RESET
+
+
+def model_window(model):
+    """The windows() key of a model's own weekly allowance: "model:<name>", in lower case. mark_window_keys sends
+    these keys to the Mac with each reading."""
+    return "model:%s" % (model or "").lower()
+
+
+def windows(acct):
+    """{"session"|"weekly"|model_window(name): window} for one account."""
+    out = {}
+    for w in acct.get("windows") or []:
+        k = model_window(w.get("model")) if w.get("kind") == "model_weekly" else w.get("kind")
+        if k:
+            out[k] = w
+    return out
+
+
+def mark_window_keys(accounts):
+    """Put "key", its windows() key, on each window of a usage reading's accounts (in place): the name the Mac
+    asks the usage_split action for (agentboard/allowance.py)."""
+    for a in accounts:
+        for key, w in windows(a).items():
+            w["key"] = key
+
+
+def left_pct(w):
+    """Percent left in a usage window: its remaining_pct, else 100 minus used_pct (none given: all of it)."""
+    if w.get("remaining_pct") is not None:
+        return float(w["remaining_pct"])
+    return 100.0 - float(w.get("used_pct") or 0)
+
+
+def usage_target(agent):
+    """The usage account an agent spends: "codex", or "claude:<login>" (no login named: the mailroom's default login,
+    "default")."""
+    if agent.get("cli") == "codex":
+        return "codex"
+    return "claude:%s" % (agent.get("account") or "default")
+
+
+def mailroom_root():
+    """The mailroom checkout whose agentmail package and bin/ the board borrows (config.mailroom_dir: the kit's
+    sibling mailroom/, or AGENT_MAILROOM_DIR), as a string; None when there is none with an agentmail package. The
+    kit's commands on PATH are wrappers, so the checkout is not found through them."""
+    d = config.mailroom_dir()
+    return str(d) if d else None
+
+
+def mailroom(module):
+    """A module of the mailroom package (read-only use, as agent-close's own functions are used). Raises
+    RuntimeError when the mailroom isn't installed, and whatever importing the module raises."""
+    import importlib
+    import sys
+    root = mailroom_root()
+    if not root:
+        raise RuntimeError("the mailroom isn't installed (no agentmail/ in the kit's mailroom/ or AGENT_MAILROOM_DIR)")
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return importlib.import_module("agentmail." + module)
+
+
+def optional_mailroom(module):
+    """mailroom(module), or None when the mailroom isn't installed (mailroom_root) or is older than that module. A
+    module that is there but fails to import raises."""
+    if mailroom_root() is None:
+        return None
+    try:
+        return mailroom(module)
+    except ModuleNotFoundError as e:
+        if e.name != "agentmail." + module:
+            raise
+        return None

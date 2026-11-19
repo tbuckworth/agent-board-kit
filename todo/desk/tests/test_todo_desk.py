@@ -1,6 +1,8 @@
+import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -8,6 +10,7 @@ import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import issue_body as ib  # noqa: E402
 import todo_desk as td  # noqa: E402
 
 # Never the real ~/.config: every Desk here gets CFG, and the config tests point the loader at temp dirs
@@ -74,7 +77,7 @@ BODY = "Notes here\n\n## Checklist\n- [ ] one\n- [ ] two\n\n## Claude Resolution
 
 class BodyMerge(unittest.TestCase):
     def test_sections_round_trip(self):
-        self.assertEqual(td.join_sections(td.split_sections(BODY)), BODY)
+        self.assertEqual(ib.join_sections(ib.split_sections(BODY)), BODY)
 
     def test_mac_checklist_and_github_notes_merge(self):
         mine = BODY.replace("- [ ] one", "- [x] one")
@@ -155,6 +158,25 @@ class Update(unittest.TestCase):
         self.assertIn("priority:high", out["labels"])
         self.assertIn("source:app", out["labels"])
 
+    def test_archive_closes_as_not_planned(self):
+        desk, gh = make_desk(self.issue())
+        out = desk.update(7, {"state": "CLOSED", "stateReason": "NOT_PLANNED"})
+        self.assertEqual(out["state"], "CLOSED")
+        patch = [b for m, _, b in gh.calls if m == "PATCH"][-1]
+        self.assertEqual(patch["state_reason"], "not_planned")
+        self.assertIn("list:tasks", out["labels"])           # archived tasks stay in their list
+
+    def test_close_reason_only_with_a_close(self):
+        desk, gh = make_desk(self.issue())
+        desk.update(7, {"state": "CLOSED"})
+        self.assertNotIn("state_reason", [b for m, _, b in gh.calls if m == "PATCH"][-1])
+        gh.issue["state"] = "closed"
+        desk.update(7, {"state": "OPEN", "stateReason": "NOT_PLANNED"})    # an undone archive: just reopened
+        self.assertEqual([b for m, _, b in gh.calls if m == "PATCH"][-1], {"state": "open"})
+        gh.issue["state"] = "open"
+        desk.update(7, {"state": "CLOSED", "stateReason": "DROP TABLE"})
+        self.assertNotIn("state_reason", [b for m, _, b in gh.calls if m == "PATCH"][-1])
+
     def test_new_label_created(self):
         desk, gh = make_desk(self.issue())
         desk.update(7, add=["list:brand-new"], remove=["list:tasks"])
@@ -196,34 +218,47 @@ class Assign(unittest.TestCase):
             procs.append((argv, FakeProc()))
             return procs[-1][1]
         desk, gh = make_desk(self.issue(), popen=popen)
-        issue, url, log = desk.assign(9, "under £2k please")
+        issue, url, log = desk.assign(9, "under $2k please", "mac")
         self.assertIn(td.ASSIGNED_LABEL, issue["labels"])
         self.assertEqual(issue["agent"]["status"], "assigned")
-        self.assertIn("> under £2k please", gh.comments[0]["body"])
+        self.assertIn("> under $2k please", gh.comments[0]["body"])
         argv, proc = procs[0]
         self.assertEqual(argv[1:], ["--source", "todo"])
         sent = proc.stdin.getvalue().decode()
         self.assertIn("Task #9: Look into e-bikes", sent)
         self.assertIn("https://github.com/example-user/tasks/issues/9", sent)
-        self.assertIn("under £2k please", sent)
-        self.assertIn("todo-9-look-into-e-bikes", sent)
+        self.assertIn("under $2k please", sent)
+        # the orchestrator names the agent for what the task is, as it names its own
+        self.assertIn("2 to 4 lowercase words joined by hyphens", sent)
+        self.assertNotIn("todo-9-", sent)
+        self.assertIn("Agent started: NAME (REPO@BRANCH, ACCOUNT)", sent)
         self.assertIn("the Mac app, over SSH", sent)
         # a second press is refused
         with self.assertRaises(ValueError):
-            desk.assign(9, "")
+            desk.assign(9, "", "mac")
         self.assertEqual(len(procs), 1)
-        desk.assign(9, "", again=True)
+        desk.assign(9, "", "mac", again=True)
         self.assertEqual(len(procs), 2)
+
+    def test_from_the_desktop_says_so(self):
+        procs = []
+        desk, gh = make_desk(self.issue(), popen=lambda argv, **kw: procs.append(FakeProc()) or procs[-1])
+        desk.assign(9, "", "desktop")
+        self.assertIn("from the todo-desk command on the desktop", gh.comments[0]["body"])
+        sent = procs[0].stdin.getvalue().decode()
+        self.assertTrue(sent.startswith("[message from Alex via the to-do app (the todo-desk command on the desktop), "
+                                        "not by email."))
+        self.assertNotIn("Mac", sent.split("\n", 1)[0])
 
     def test_closed_refused(self):
         desk, gh = make_desk(self.issue(state="closed"), popen=lambda *a, **k: self.fail("launched"))
         with self.assertRaises(ValueError):
-            desk.assign(9, "")
+            desk.assign(9, "", "mac")
 
     def test_failed_launch_rolls_back(self):
         desk, gh = make_desk(self.issue(), popen=lambda argv, **kw: FakeProc(code=2))
         with self.assertRaises(ValueError):
-            desk.assign(9, "")
+            desk.assign(9, "", "mac")
         self.assertNotIn(td.ASSIGNED_LABEL, gh.issue["labels"])
         self.assertIn("todo-agent:failed", gh.comments[-1]["body"])
 
@@ -265,6 +300,64 @@ class Serve(unittest.TestCase):
         self.assertTrue(lines[2]["ok"])
 
 
+class MacGone(unittest.TestCase):
+    """A Mac that sleeps never closes its connection: serve leaves once the kernel shows it acknowledging nothing."""
+    CONN = "198.51.100.20 59853 192.0.2.10 22"
+    LOCAL, REMOTE = "0A0200C0:0016", "146433C6:E9CD"         # as /proc/net/tcp writes the two ends above
+
+    def gone(self, rows, conn=CONN, name="tcp"):
+        with tempfile.TemporaryDirectory() as d:
+            head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            (Path(d) / name).write_text(head + "".join(
+                "%4d: %s %s %s %08X:00000000 01:00000020 %08X     0        0 1 1 0 20 4 30 10 -1\n" % ((i,) + r)
+                for i, r in enumerate(rows)))
+            return td.ssh_peer_gone(conn, tables=(str(Path(d) / "tcp"), str(Path(d) / "tcp6")))
+
+    def test_only_with_data_in_flight_and_many_timeouts(self):
+        mine = lambda st="01", tx=0x2A0, rt=8: (self.LOCAL, self.REMOTE, st, tx, rt)
+        self.assertTrue(self.gone([mine()]))
+        self.assertFalse(self.gone([mine(rt=7)]))
+        self.assertFalse(self.gone([mine(tx=0, rt=9)]))
+        self.assertFalse(self.gone([mine(st="08")]))
+        self.assertFalse(self.gone([mine()], conn=""))
+        mapped = lambda w: "0000000000000000FFFF0000" + w
+        self.assertTrue(self.gone([(mapped("0A0200C0") + ":0016", mapped("146433C6") + ":E9CD", "01", 5, 9)], name="tcp6"))
+
+    def test_ticker_leaves_only_when_idle(self):
+        desk, gh = make_desk({"number": 1, "title": "t", "body": "", "state": "open", "labels": []})
+        s = td.Server(desk, out=io.StringIO())
+
+        class Left(Exception):
+            pass
+
+        class Clock:                                   # each tick is 6 s; the busy run ends after 30
+            def __init__(self):
+                self.t = real_time.time()
+                self.end = self.t + 30
+
+            def time(self):
+                return self.t
+
+            def sleep(self, n):
+                self.t += 6
+                if self.t > self.end:
+                    s.stop.set()
+
+        def exit_(code):
+            raise Left(code)
+        real_time, real_exit = td.time, td.os._exit
+        td.time, td.os._exit = Clock(), exit_
+        try:
+            s.busy = True
+            s.ticker(gone=lambda: True)                # mid-request: stays until the request is done
+            s.stop.clear()
+            s.busy = False
+            with self.assertRaises(Left):
+                s.ticker(gone=lambda: True)
+        finally:
+            td.time, td.os._exit = real_time, real_exit
+
+
 class Idempotent(unittest.TestCase):
     def test_same_op_twice_is_done_once(self):
         desk, gh = make_desk({"number": 3, "title": "t", "body": "", "state": "open", "labels": ["list:tasks"]})
@@ -287,7 +380,7 @@ class ReviewFixes(unittest.TestCase):
     def test_whitespace_only_merge_does_not_patch(self):
         body = "Notes\n\n\n\n## Checklist\n- [ ] x"
         desk, gh = make_desk({"number": 4, "title": "t", "body": body, "state": "open", "labels": []})
-        mine = td.join_sections(td.split_sections(body))        # what the Mac sends: normalised, same content
+        mine = ib.join_sections(ib.split_sections(body))        # what the Mac sends: normalised, same content
         desk.update(4, {"body": mine}, {"body": body.replace("Notes", "Old notes")})
         self.assertFalse(any(m == "PATCH" for m, _, _ in gh.calls))
 
@@ -333,7 +426,7 @@ class ReviewFixes(unittest.TestCase):
                 return orig(method, path, body, headers)
             gh.rest = rest
             with self.assertRaises(td.GitHubError):
-                desk.assign(9, "")
+                desk.assign(9, "", "mac")
             self.assertNotIn(td.ASSIGNED_LABEL, gh.issue["labels"])
         finally:
             td.time.sleep, td.find_orchestrate = sleep, find
@@ -408,7 +501,7 @@ class Dispatch(unittest.TestCase):
     def test_request_becomes_an_assign(self):
         desk, gh, procs = self.make(comments=[
             ("example-user", "<!-- todo-agent-request -->\n\nold ask"),
-            ("example-user", "<!-- todo-agent-request -->\n\nunder £2k please")])
+            ("example-user", "<!-- todo-agent-request -->\n\nunder $2k please")])
         self.assertEqual(desk.dispatch(), [(9, "assigned")])
         self.assertNotIn(td.REQUESTED_LABEL, gh.issue["labels"])
         self.assertIn(td.ASSIGNED_LABEL, gh.issue["labels"])
@@ -416,10 +509,10 @@ class Dispatch(unittest.TestCase):
         self.assertTrue(assigned.startswith("<!-- todo-agent:assigned -->"))
         self.assertIn("from the to-do web app", assigned)
         self.assertIn("Alex's instructions:", assigned)
-        self.assertIn("> under £2k please", assigned)
+        self.assertIn("> under $2k please", assigned)
         sent = procs[0].stdin.getvalue().decode()
         self.assertIn("the web app, on a phone or a browser", sent)
-        self.assertIn("under £2k please", sent)
+        self.assertIn("under $2k please", sent)
         self.assertNotIn("old ask", sent)
         # the label is gone, so a second run starts nothing
         self.assertEqual(desk.dispatch(), [])
@@ -453,6 +546,25 @@ class Dispatch(unittest.TestCase):
         self.assertTrue(out[0][1].startswith("failed: agent-orchestrate exited"))
         self.assertEqual(sum("todo-agent:failed" in c["body"] for c in gh.comments), 1)
         self.assertNotIn(td.ASSIGNED_LABEL, gh.issue["labels"])
+
+    def test_skips_are_reported(self):
+        desk, gh, procs = self.make(comments=[("example-user", "<!-- todo-agent-request -->\n\ngo")])
+        td.STATE_DIR.mkdir(parents=True)
+        lock = open(td.STATE_DIR / "dispatch.lock", "w")         # another run, holding the lock
+        td.fcntl.flock(lock, td.fcntl.LOCK_EX)
+        self.assertEqual(desk.dispatch(), [(None, "skipped: another dispatch run holds the lock")])
+        lock.close()
+        real = gh.rest
+
+        def taken(method, path, body=None, headers=None):
+            if method == "DELETE":
+                err = td.GitHubError("404")
+                err.status = 404
+                raise err
+            return real(method, path, body, headers)
+        gh.rest = taken
+        self.assertEqual(desk.dispatch(), [(9, "skipped: another run took the request")])
+        self.assertEqual(procs, [])
 
     def test_request_marker_is_not_an_agent_status(self):
         self.assertIsNone(td.agent_info([{"body": "<!-- todo-agent-request -->\n\ngo"}]))
@@ -544,6 +656,35 @@ class PruneDeleted(unittest.TestCase):
         self.assertEqual(desk.pruned_since(None), [])
 
 
+class QuietSync(unittest.TestCase):
+    """A sync that changed nothing does not rewrite the 1.3 MB cache file (it did every minute: ~1.9 GB a day)."""
+
+    def test_saves_only_on_change_or_after_a_while(self):
+        tmp = tempfile.mkdtemp()
+        repo = PruneDeleted.Repo([1, 2])
+        desk = td.Desk(gh=repo, cache_path=Path(tmp) / "cache.json", config=CFG)
+        desk.sync()
+        ino = lambda: (Path(tmp) / "cache.json").stat().st_ino        # each save replaces the file
+        first = ino()
+        desk.sync()
+        self.assertEqual(ino(), first)                                # nothing changed: not written
+        self.assertIsNotNone(repo.sinces[-1])
+        repo.numbers = [1, 2, 3]
+        changed, _, _ = desk.sync()
+        self.assertEqual([i["number"] for i in changed], [3])
+        self.assertNotEqual(ino(), first)                             # a new issue: written
+        self.assertIn("3", json.loads((Path(tmp) / "cache.json").read_text())["issues"])
+        second = ino()
+        desk.sync()
+        self.assertEqual(ino(), second)
+        desk.data["synced_at"] = td.iso_minus(td.now_iso(), td.QUIET_SAVE_SECONDS + 60)
+        desk.save()                                                   # the file last written over half an hour ago
+        third = ino()
+        desk.sync()
+        self.assertNotEqual(ino(), third)                             # so this quiet sync refreshes its synced_at
+        self.assertEqual(json.loads((Path(tmp) / "cache.json").read_text())["synced_at"], desk.data["synced_at"])
+
+
 class Groups(unittest.TestCase):
     """Groups are GitHub sub-issues plus the subtask label."""
 
@@ -575,6 +716,17 @@ class Groups(unittest.TestCase):
         self.assertEqual([m[0] for m in self.mutations], ["add"])
         self.desk.set_parent(7, 4)                            # another group: replaces the parent
         self.assertEqual(self.parents, {7: 4})
+        self.assertIn(td.SUBTASK_LABEL, self.gh.issue["labels"])
+
+    def test_regroup_marks_the_task_updated(self):
+        self.desk.set_parent(7, 3)
+        self.gh.calls.clear()
+        self.desk.set_parent(7, 4)                            # label already on: off and on again, so updatedAt moves
+        patches = [c[2]["labels"] for c in self.gh.calls if c[0] == "PATCH"]
+        self.assertEqual([td.SUBTASK_LABEL in l for l in patches], [False, True])
+        self.gh.calls.clear()
+        self.desk.set_parent(7, 4)                            # same group again: nothing to do
+        self.assertEqual([c for c in self.gh.calls if c[0] == "PATCH"], [])
 
     def test_unlink_removes_label_and_is_idempotent(self):
         self.desk.set_parent(7, 3)
@@ -669,7 +821,7 @@ class Identity(unittest.TestCase):
                "repos_root": "~/code/", "general_repo": None}
         msg = td.orchestrator_message(issue, "", cfg)
         self.assertTrue(msg.startswith("[message from Alex via the to-do app (the Mac app, over SSH)"))
-        self.assertIn("agent-mail send --to owner@example.com", msg)
+        self.assertIn("agent-mail send --to owner --subject", msg)      # the mailroom's alias: no address typed
         self.assertIn("existing repo under ~/code, start", msg)
         self.assertIn("start it in\n  ~/code/general on a new branch", msg)
         self.assertIn("gh issue comment 5 --repo example-user/tasks --body \"<!-- todo-agent:started -->", msg)
@@ -677,7 +829,7 @@ class Identity(unittest.TestCase):
         self.assertIn("Alex added no further instructions.", msg)
         bare = td.orchestrator_message(issue, "x", {"repo": "example-user/tasks"})
         self.assertIn("the owner adds:", bare)
-        self.assertIn("--to <owner address>", bare)
+        self.assertIn("agent-mail send --to owner --subject", bare)
 
     def test_config_command_needs_no_github(self):
         out, err = io.StringIO(), io.StringIO()
@@ -782,7 +934,7 @@ class RunningAgents(unittest.TestCase):
     def test_assign_to_a_running_agent(self):
         sent = []
         desk, gh = self.make(sent)
-        issue, url, log = desk.assign(9, "after your current step", to=A2)
+        issue, url, log = desk.assign(9, "after your current step", "mac", to=A2)
         self.assertIn(td.ASSIGNED_LABEL, issue["labels"])
         body = gh.comments[0]["body"]
         self.assertTrue(body.startswith("<!-- todo-agent:started -->\nAssigned to the running agent docs-cleanup (docs)"))
@@ -795,26 +947,26 @@ class RunningAgents(unittest.TestCase):
         self.assertTrue(text.startswith("[relayed from Alex via the to-do app (the Mac app, over SSH)]"))
         self.assertIn("Task #9: Look into e-bikes", text)
         self.assertIn("gh issue view 9 --repo example-user/tasks --comments", text)
-        self.assertIn("Answer Alex with agent-mail send --to owner@example.com", text)
+        self.assertIn("Answer Alex with agent-mail send --to owner", text)
         self.assertIn("after your current step", text)
         self.assertIn("finish or checkpoint your current", text)
         self.assertIn("<!-- todo-agent:done -->", text)
         self.assertNotIn("agent-spawn", text)
         self.assertEqual(log, "")
         with self.assertRaises(ValueError):                     # already assigned
-            desk.assign(9, "", to=A2)
+            desk.assign(9, "", "mac", to=A2)
 
     def test_gone_agent_refused_and_failed_send_rolls_back(self):
         sent = []
         desk, gh = self.make(sent)
         with self.assertRaisesRegex(ValueError, "gone is no longer running"):
-            desk.assign(9, "", to=GONE)
+            desk.assign(9, "", "mac", to=GONE)
         with self.assertRaisesRegex(ValueError, "no longer running"):
-            desk.assign(9, "", to="11111111-2222-3333-4444-555555555555")
+            desk.assign(9, "", "mac", to="11111111-2222-3333-4444-555555555555")
         self.assertEqual(gh.comments, [])
         desk, gh = self.make(sent, code=1)
         with self.assertRaisesRegex(ValueError, "agent-send failed"):
-            desk.assign(9, "", to=A1)
+            desk.assign(9, "", "mac", to=A1)
         self.assertNotIn(td.ASSIGNED_LABEL, gh.issue["labels"])
         self.assertTrue(gh.comments[-1]["body"].startswith("<!-- todo-agent:failed -->\nThe task was not sent to"))
 
@@ -877,7 +1029,8 @@ class RunningAgents(unittest.TestCase):
         self.assertTrue(msg["message"].startswith("[relayed from Alex via the to-do app"))
         self.assertNotIn("agent-spawn", msg["message"])
         msg = td.Server(desk, out=io.StringIO()).dispatch({"cmd": "assign_preview", "number": 9, "text": "x"})
-        self.assertIn("agent-spawn --name todo-9-look-into-e-bikes", msg["message"])
+        self.assertIn("Pass it to\n  agent-spawn --name", msg["message"])
+        self.assertNotIn("todo-9-", msg["message"])
 
     def test_board_root_is_the_kits_board_or_the_commands_checkout(self):
         self.assertTrue((td.KIT_BOARD / "agentboard" / "__init__.py").exists())   # the kit layout: board/ beside todo/
@@ -897,6 +1050,222 @@ class RunningAgents(unittest.TestCase):
             self.assertIsNone(td.board_root())
         finally:
             td.KIT_BOARD = saved
+
+
+class AgentMail(unittest.TestCase):
+    """Double-click the agent on a task to open its latest mail, as on the agent board."""
+
+    def mailroom(self, sessions, sent):
+        db = Path(tempfile.mkdtemp()) / "mailroom.sqlite"
+        con = td.sqlite3.connect(str(db))
+        con.execute("create table sessions(tag text primary key, cli text, session_id text, session_name text, "
+                    "cwd text, created_at integer, origin_host text)")
+        con.execute("create table sent(id integer primary key, tag text, gmail_id text, thread_id text, "
+                    "message_id text, to_addr text, subject text, sent_at integer)")
+        con.executemany("insert into sessions values (?, 'claude', ?, ?, ?, 0, 'desktop')", sessions)
+        con.executemany("insert into sent (tag, message_id, to_addr, subject, sent_at) values (?, ?, ?, ?, ?)", sent)
+        con.commit()
+        con.close()
+        return db
+
+    def test_newest_mail_to_the_owner_by_name_or_folder(self):
+        db = self.mailroom(
+            [("t1", "s1", "todo-5-fix", "/home/alex/code/general-todo-5-fix"),
+             ("t2", "s2", "todo-5-fix", "/home/alex/code/general-todo-5-fix"),          # the same agent, restarted
+             ("t3", "s3", "renamed later", "/home/alex/code/to-do-todo-6-thing"),
+             ("t4", "s4", "someone else", "/home/alex/code/other")],
+            [("t1", "<a@x>", "owner@example.com", "First", 100),
+             ("t2", "<b@x>", "Alex <owner@example.com>", "Second", 200),
+             ("t2", "<c@x>", "someone@example.org", "Not to the owner", 300),
+             ("t3", "<d@x>", "owner@example.com", "Renamed agent's", 150),
+             ("t4", "<e@x>", "owner@example.com", "Other", 400)])
+        owners = ["owner@example.com"]
+        m = td.latest_mail("todo-5-fix", db=db, owners=owners)
+        self.assertEqual((m["message_id"], m["subject"]), ("<b@x>", "Second"))
+        self.assertEqual(m["sent_at"], "1970-01-01T00:03:20Z")
+        self.assertEqual(td.latest_mail("todo-6-thing", "to-do-todo-6-thing", db=db, owners=owners)["subject"],
+                         "Renamed agent's")
+        self.assertIsNone(td.latest_mail("todo-7-none", "to-do-todo-7", db=db, owners=owners))
+        self.assertIsNone(td.latest_mail("todo-5-fix", db=Path(tempfile.mkdtemp()) / "missing.sqlite", owners=owners))
+
+    def test_folder_from_the_started_comment(self):
+        info = {"events": [
+            {"kind": "assigned", "text": "Assigned"},
+            {"kind": "started", "text": "Agent started: todo-6-thing (to-do@todo-6-thing, claude:personal)"}]}
+        self.assertEqual(td.agent_folder(info), "to-do-todo-6-thing")
+        self.assertEqual(td.agent_folder({"events": [{"kind": "started", "text":
+                         "Assigned to the running agent x (to-do-y) from the Mac to-do app at now."}]}), None)
+        self.assertIsNone(td.agent_folder(None))
+
+    def test_command(self):
+        db = self.mailroom([("t3", "s3", "renamed later", "/home/alex/code/to-do-todo-6-thing")],
+                           [("t3", "<d@x>", "owner@example.com", "S", 1793181600)])
+        desk, _ = make_desk({"number": 6, "title": "T", "body": "", "state": "OPEN", "labels": []})
+        desk.find_mail = lambda name, folder: td.latest_mail(name, folder, db=db, owners=["owner@example.com"])
+        # Only the Gmail lookup is replaced: it asks Gmail over the network through the agent board's login
+        desk.find_thread = lambda mid: "1a2b" if mid == "<d@x>" else None
+        desk.data["agents"]["6"] = {"status": "started", "name": "todo-6-thing", "events": [
+            {"kind": "started", "text": "Agent started: todo-6-thing (to-do@todo-6-thing, claude:personal)"}]}
+        res = td.Server(desk, out=io.StringIO()).dispatch({"cmd": "agent_mail", "number": 6})
+        self.assertEqual(res["mail"], {"message_id": "<d@x>", "subject": "S", "sent_at": "2026-10-28T10:00:00Z",
+                                       "thread": "1a2b"})
+        self.assertEqual(res["name"], "todo-6-thing")
+        self.assertTrue(res["owner"])
+        none = td.Server(desk, out=io.StringIO()).dispatch({"cmd": "agent_mail", "number": 7})
+        self.assertEqual((none["name"], none["mail"]), (None, None))
+
+    def test_failed_thread_lookup_still_opens_by_search(self):
+        db = self.mailroom([("t3", "s3", "x", "/home/alex/code/to-do-todo-6-thing")],
+                           [("t3", "<d@x>", "owner@example.com", "S", 1793181600)])
+        desk, _ = make_desk({"number": 6, "title": "T", "body": "", "state": "OPEN", "labels": []})
+        desk.find_mail = lambda name, folder: td.latest_mail(name, folder, db=db, owners=["owner@example.com"])
+
+        def broken(mid):
+            raise ValueError("could not look up the Gmail thread: boom")
+        desk.find_thread = broken
+        desk.data["agents"]["6"] = {"status": "started", "name": "todo-6-thing", "events": [
+            {"kind": "started", "text": "Agent started: todo-6-thing (to-do@todo-6-thing, claude:personal)"}]}
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            res = td.Server(desk, out=io.StringIO()).dispatch({"cmd": "agent_mail", "number": 6})
+        self.assertIsNone(res["mail"]["thread"])
+        self.assertIn("boom", res["mail"]["thread_error"])
+        self.assertIn("opening by search", err.getvalue())
+
+
+def fake_agent_board(rows_ok, snapshot_ok=True, thread="null"):
+    """A stand-in agent-board install (another repository, run as a child process): bin/agent-board and the
+    agentboard package that BOARD_ROWS and BOARD_THREAD import."""
+    root = Path(tempfile.mkdtemp())
+    (root / "bin").mkdir()
+    exe = root / "bin" / "agent-board"
+    exe.write_text("#!%s\nimport sys\nprint('{\"agents\": []}' if %r else 'boom', file=sys.stdout if %r else sys.stderr)"
+                   "\nsys.exit(0 if %r else 1)\n" % (sys.executable, snapshot_ok, snapshot_ok, snapshot_ok))
+    exe.chmod(0o755)
+    pkg = root / "agentboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("" if rows_ok else "raise ImportError('rows broke')\n")
+    (pkg / "gmailstate.py").write_text(
+        "import sys\nclass GmailState:\n    def is_read(self, m): pass\n"
+        "    def maybe_refresh(self, now=None, force=False): pass\n"
+        "    def thread_of(self, m):\n        sys.stdout.write(%r)\n        sys.exit(0 if %r != 'exit' else 3)\n"
+        "def for_owner(sync, sender=None, owners=None):\n    return GmailState()\n" % (thread, thread))
+    (pkg / "mailbox.py").write_text("REFRESH = 30\ndef summary():\n    return None\n")
+    (pkg / "sources.py").write_text("class Periodic:\n    def __init__(self, load, interval, initial, sync):\n"
+                                    "        self.value = initial\n"
+                                    "    def maybe_refresh(self, now=None, force=False, args=()):\n"
+                                    "        return self.value\n")
+    (pkg / "collect.py").write_text("class Collector:\n    def __init__(self, gmail=None, mailbox=None): pass\n"
+                                    "    def agents(self, with_git=False):\n        return [[{'id': 'rows'}]]\n")
+    return str(exe)
+
+
+class KitBoardAPI(unittest.TestCase):
+    """BOARD_ROWS and BOARD_THREAD run against the kit's own board/ (beside todo/), so a rename there fails here,
+    not silently on the desktop. With no Gmail login configured the read-check is off: rows come back, no thread."""
+
+    def run_snippet(self, code, *args):
+        home = Path(tempfile.mkdtemp())
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_BOARD_")}
+        env.update(HOME=str(home), AGENT_BOARD_CONFIG=str(home / "no-board-config.json"), PATH="/usr/bin:/bin",
+                   AGENT_MAIL_CONFIG_DIR=str(home / "cfg"), AGENT_MAIL_STATE_DIR=str(home / "state"),
+                   AGENT_STATUS_DIR=str(home / "status"))
+        return subprocess.run([sys.executable, "-c", code, str(td.KIT_BOARD)] + list(args), env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    def test_thread_lookup_runs_on_the_kits_board(self):
+        # BOARD_THREAD treats a missing gmailstate as "no read-check": check the kit's board still has what it calls
+        out = self.run_snippet("import sys; sys.path.insert(0, sys.argv[1]); from agentboard import gmailstate; "
+                               "g = gmailstate.GmailState; gmailstate.for_owner; g.is_read; g.maybe_refresh; g.thread_of")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        out = self.run_snippet(td.BOARD_THREAD, "<m@example.com>")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIsNone(json.loads(out.stdout))
+
+    def test_rows_run_on_the_kits_board(self):
+        out = self.run_snippet(td.BOARD_ROWS)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"agents": []})
+
+
+class Failures(unittest.TestCase):
+    """What should have worked and didn't is an error (or, for the board's fallback, a warning), never silence."""
+
+    def board(self, *a, **kw):
+        exe = fake_agent_board(*a, **kw)
+        orig, td.find_agent_board = td.find_agent_board, lambda: exe
+        self.addCleanup(setattr, td, "find_agent_board", orig)
+        kit, td.KIT_BOARD = td.KIT_BOARD, Path(tempfile.mkdtemp()) / "no-board"     # not the kit's own board/
+        self.addCleanup(setattr, td, "KIT_BOARD", kit)
+
+    def stderr(self, fn, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = fn(*args)
+        return out, err.getvalue()
+
+    def test_board_rows(self):
+        self.board(rows_ok=True)
+        self.assertEqual(self.stderr(td.board_snapshot), ({"agents": [{"id": "rows"}]}, ""))
+
+    def test_board_fallback_warns_with_the_first_error(self):
+        self.board(rows_ok=False)
+        snap, err = self.stderr(td.board_snapshot)
+        self.assertEqual(snap, {"agents": []})
+        self.assertIn("rows broke", err)
+        self.assertIn("agent-board snapshot", err)
+
+    def test_board_both_fail_names_both(self):
+        self.board(rows_ok=False, snapshot_ok=False)
+        with self.assertRaises(ValueError) as e:
+            td.board_snapshot()
+        self.assertIn("rows broke", str(e.exception))
+        self.assertIn("boom", str(e.exception))
+
+    def test_gmail_thread(self):
+        self.board(rows_ok=True, thread='"t1"')
+        self.assertEqual(td.gmail_thread("<m@x>"), "t1")
+        self.board(rows_ok=True, thread="null")
+        self.assertIsNone(td.gmail_thread("<m@x>"))
+        self.board(rows_ok=True, thread="not json")
+        with self.assertRaises(ValueError):
+            td.gmail_thread("<m@x>")
+        self.board(rows_ok=True, thread="exit")
+        with self.assertRaises(ValueError):
+            td.gmail_thread("<m@x>")
+
+    def test_mail_owners(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.assertEqual(td.mail_owners(CFG, tmp / "missing.json"), ["owner@example.com"])
+        self.assertEqual(td.mail_owners({}, tmp / "missing.json"), [])
+        (tmp / "c.json").write_text('{"allowlist": ["A@x", "Owner@example.com"]}')
+        self.assertEqual(td.mail_owners(CFG, tmp / "c.json"), ["owner@example.com", "a@x"])
+        self.assertEqual(td.mail_owners({}, tmp / "c.json"), ["a@x", "owner@example.com"])
+        (tmp / "bad.json").write_text("{nope")
+        with self.assertRaises(ValueError):
+            td.mail_owners(CFG, tmp / "bad.json")
+        for shape in ('["a@x"]', '{"allowlist": "a@x"}', '{"allowlist": [1]}'):
+            (tmp / "shape.json").write_text(shape)
+            with self.assertRaisesRegex(ValueError, "allowlist is a list"):
+                td.mail_owners(CFG, tmp / "shape.json")
+
+    def test_done_ops(self):
+        desk, _ = make_desk({"number": 3, "title": "t", "body": "", "state": "open", "labels": []})
+        self.assertIsNone(desk.done_op("a"))
+        desk.record_op("a", {"ok": 1})
+        self.assertEqual(desk.done_op("a"), {"ok": 1})
+        desk._ops_path().write_text("{half a fi")
+        with self.assertRaises(ValueError):
+            desk.done_op("a")
+        with self.assertRaises(ValueError):
+            desk.record_op("b", {})
+
+    def test_audit_failure_is_reported(self):
+        blocker = Path(tempfile.mkdtemp()) / "a-file"
+        blocker.write_text("")
+        orig, td.STATE_DIR = td.STATE_DIR, blocker / "state"          # can't be made: its parent is a file
+        self.addCleanup(setattr, td, "STATE_DIR", orig)
+        _, err = self.stderr(td.audit, {"action": "assign"})
+        self.assertIn("audit", err)
 
 
 if __name__ == "__main__":

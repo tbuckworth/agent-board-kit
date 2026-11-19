@@ -9,10 +9,10 @@ import os
 import re
 from pathlib import Path
 
-from . import config, util
+from . import config, investigator, messages, util
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-MARKER = "[cloud-watchdog"
+MARKER = messages.PREFIX   # in the watchdog's own messages, which name resources but never launch them
 
 
 def _files_since(roots, since, exclude):
@@ -35,22 +35,43 @@ def _files_since(roots, since, exclude):
     return out
 
 
+def _grep_failed(code, err):
+    """None for grep's exit status 0 (a match) or 1 (no match); for any other (2 an error, and util.run's 124 timeout
+    or 127 not found) a description of the failed search."""
+    return "grep exited %s: %s" % (code, err.strip()[-200:]) if code not in (0, 1) else None
+
+
 def _grep_files(files, terms):
-    hits = []
+    """(files that contain any of the terms, failed searches). A failed batch keeps whatever matches it printed."""
+    hits, failures = [], []
     args = []
     for t in terms:
         args += ["-e", t]
     for i in range(0, len(files), 200):
-        code, out, _ = util.run(["grep", "-lF"] + args + files[i:i + 200], timeout=120)
+        code, out, err = util.run(["grep", "-lF"] + args + files[i:i + 200], timeout=120)
+        failed = _grep_failed(code, err)
+        if failed:
+            failures.append(failed)
         hits += [l for l in out.splitlines() if l]
-    return hits
+    return hits, failures
 
 
-def _session_of(path):
+def _first_record(path):
+    """The transcript's first line as JSON, or {} when it is not JSON (an empty or half-written file)."""
+    with open(path) as f:
+        line = f.readline()
+    try:
+        return json.loads(line)
+    except ValueError:
+        return {}
+
+
+def _session_of(path, first):
+    """(session id, cli) of a transcript, given its first record: a Codex rollout begins with a session_meta record."""
     p = Path(path)
     if p.parent.name == "subagents":
         return p.parent.parent.name, "claude"
-    if "/.codex/" in path:
+    if first.get("type") == "session_meta":
         m = UUID_RE.findall(p.name)
         return (m[-1] if m else p.stem), "codex"
     return p.stem, "claude"
@@ -69,29 +90,34 @@ def _is_tool_line(obj):
                                    "custom_tool_call_output", "local_shell_call", "exec_command_end")
 
 
-def search(terms, since, cfg, launched_at=None):
+def search(terms, since, cfg):
+    """(candidate sessions, failed searches): the sessions whose transcripts under transcripts.roots, modified since
+    `since`, mention any of the terms, leaving out the dirs transcripts.exclude names and the investigator's (its
+    transcripts mention every resource it is asked about). Runs grep; a search that failed is described in the
+    second list."""
     tcfg = cfg["transcripts"]
     terms = [t for t in terms if t and len(str(t)) >= 6]
     if not terms:
-        return []
-    files = _files_since(tcfg["roots"], since, tcfg["exclude"])
-    matched = _grep_files(files, terms)
+        return [], []
+    files = _files_since(tcfg["roots"], since, tcfg["exclude"] + [investigator.WORKDIR_NAME])
+    matched, failures = _grep_files(files, terms)
     verbs = [v.lower() for v in tcfg["launch_verbs"]]
     by_session = {}
     for path in matched:
-        sid, cli = _session_of(path)
-        code, out, _ = util.run(["grep", "-nF"] + sum([["-e", t] for t in terms], []) + [path], timeout=60)
+        code, out, err = util.run(["grep", "-nF"] + sum([["-e", t] for t in terms], []) + [path], timeout=60)
+        failed = _grep_failed(code, err)
+        try:
+            first = _first_record(path)
+        except OSError as e:
+            failed = failed or "cannot read %s: %s" % (path, e)
+        if failed:
+            failures.append(failed)
+            continue
+        sid, cli = _session_of(path, first)
         cand = by_session.get(sid) or {"session_id": sid, "cli": cli, "cwd": None, "first_ts": None,
-                                       "launch_ts": None, "launch_hit": False, "hits": 0, "snippet": "",
-                                       "files": set()}
-        cand["files"].add(path)
+                                       "launch_ts": None, "launch_hit": False, "hits": 0, "snippet": ""}
         if cli == "codex" and cand["cwd"] is None:
-            try:
-                with open(path) as f:
-                    first = json.loads(f.readline())
-                cand["cwd"] = (first.get("payload") or {}).get("cwd")
-            except (OSError, ValueError):
-                pass
+            cand["cwd"] = (first.get("payload") or {}).get("cwd")
         for line in out.splitlines()[:400]:
             _, _, raw = line.partition(":")
             try:
@@ -100,7 +126,10 @@ def search(terms, since, cfg, launched_at=None):
                 continue
             if MARKER in raw:
                 continue
-            ts = util.parse_time(obj.get("timestamp"))
+            try:
+                ts = util.parse_time(obj.get("timestamp"))
+            except ValueError:   # transcripts are written by many tools; a line's time is a hint, not a requirement
+                ts = None
             cand["cwd"] = cand["cwd"] or obj.get("cwd")
             cand["hits"] += 1
             if ts and (cand["first_ts"] is None or ts < cand["first_ts"]):
@@ -112,11 +141,7 @@ def search(terms, since, cfg, launched_at=None):
                     cand["snippet"] = _snippet(raw, terms, verbs)
         if cand["hits"]:  # files that only mention it in our own pings do not make a candidate
             by_session[sid] = cand
-    out = []
-    for c in by_session.values():
-        c["files"] = sorted(c["files"])
-        out.append(c)
-    return out
+    return list(by_session.values()), failures
 
 
 def _snippet(raw, terms, verbs):
