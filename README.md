@@ -4,19 +4,31 @@ Run a fleet of Claude Code and Codex agents on an always-on Linux machine and ma
 your inbox, a Mac menu-bar board and a GitHub-Issues to-do list.
 
 - **Email your agents.** Every agent mails you from one shared Gmail account. Your reply lands back
-  in the exact session that wrote to you, even hours later. Mail that no agent owns goes to an
-  **orchestrator** (one fresh `claude -p` run per email), which starts, relays to, and closes
-  agents for you.
+  in the exact session that wrote to you, even hours later. Mail that no agent owns, or that answers
+  an agent that has closed, goes to an **orchestrator** (one fresh `claude -p` run per email), which
+  starts, relays to, and closes agents for you.
 - **Mail you can act on.** Before an agent's mail leaves, a cheap model with no context reads it as
   you will. If it would leave you asking "what does this mean?" or "where's the plot?", it goes back to
-  the agent once, with concrete fixes. Plots go inline, and a mail containing an API key or token is
-  never sent. Mail to collaborators and other people is checked for clarity too.
+  the agent once, with concrete fixes. Replies answer your questions first, commands to run come in
+  their own copyable blocks, plots go inline, and agents can offer clickable options and interactive
+  plots. A mail containing an API key or token is never sent.
+- **Group chats.** Put several agents (and yourself) in one thread where every post reaches every
+  member: ask the orchestrator by email, or start one from the board. Each agent chooses which posts
+  wake it; your reply to the group's mail is your post.
 - **One worktree per agent.** `agent-spawn` makes a branch off `origin/main`, a git worktree, a
   tmux session and a memory-capped systemd scope, and launches Claude Code or Codex in it with a
   brief. `agent-close` removes it, but only when its work is landed.
 - **See everything at a glance.** The **agent board** (a Mac menu-bar app) shows every session as
   a tile coloured by state (busy, waiting on you, blocked, idle, offline), with git progress
-  toward main, plan usage, and right-click actions (message, close, resume, switch model/login).
+  toward main, plan usage, and right-click actions (message, close, resume, switch model/login). A
+  tile turning red posts a notification. It also has a **Mail tab** (your mail with the agents:
+  threads, snooze, replies with files, the options and plots agents send, optional sync with your
+  Gmail), **Chats**, **Sent** (what you asked for and what is done), **where your plan usage went**
+  by group and agent, a **Time** page (where your time went, per day and group) and optional
+  **meeting alerts** from your Google Calendar.
+- **Several logins, one order.** With more than one Claude login, new agents go where there is
+  headroom (each login, then Codex), `agent-failover` moves an agent that hits a limit mid-task, and
+  you are mailed while any agent bills extra usage.
 - **A to-do list agents can work on.** Your tasks are issues in a private GitHub repo. A web app
   and a Mac app edit them. **Assign to agent** starts an agent on a task, or hands it to one that is
   already running; it reports back on the issue and by email.
@@ -48,11 +60,11 @@ Everything personal (names, addresses, GitHub names, paths, hosts) lives in one 
 
 | Directory | What | Status |
 |---|---|---|
-| [`mailroom/`](mailroom/README.md) | `agent-mail`, `agent-mailroom` (daemon), `agent-send`, `agent-status`, `agent-spawn`, `agent-close`, `agent-orchestrate`; optional `agent-usage`, `agent-failover`, `agent-switch` (several Claude logins), `agent-memwatch` + memory caps | core |
+| [`mailroom/`](mailroom/README.md) | `agent-mail` (with the Mail tab's mailbox and an optional hourly backup), `agent-mailroom` (daemon), `agent-send`, `agent-group` (group chats), `agent-status`, `agent-spawn`, `agent-close`, `agent-orchestrate`; optional `agent-usage`, `agent-failover`, `agent-switch` (several Claude logins), `agent-memwatch` + memory caps | core |
 | [`orchestrator/`](orchestrator/AGENTS.md) | The orchestrator's brief, memory file and status-report skill (rendered into `ORCHESTRATOR_DIR`) | core |
 | [`templates/`](templates/) | Global agent instructions, Claude Code and Codex hook settings | core |
-| [`board/`](board/README.md) | The agent board: Linux collector + macOS menu-bar app; `agent-restart` (reboot and resume every agent) | core (the app needs a Mac) |
-| [`todo/`](todo/README.md) | To-do on GitHub Issues: label setup, `todo-desk` helper, web app, Mac app, Assign to agent | core |
+| [`board/`](board/README.md) | The agent board: Linux collector + macOS menu-bar app with the Mail tab, Chats, Sent, plan usage, the Time page and optional meeting alerts; `agent-restart` (reboot and resume every agent), `agent-cli-update` | core (the app needs a Mac) |
+| [`todo/`](todo/README.md) | To-do on GitHub Issues: label setup, `todo-desk` helper, web app, Mac app (both with Triage), Assign to agent | core |
 | [`cloud-watchdog/`](cloud-watchdog/README.md) | Watches paid cloud resources agents launch (Modal, Lambda, Slurm, HF...) and chases the owner | optional |
 | [`bin/kit`](bin/kit), [`install.sh`](install.sh) | Installer (`kit install`), health check (`kit doctor`), `kit uninstall` | |
 | [`docs/`](docs/) | Step-by-step setup, daily use, security, troubleshooting | |
@@ -112,7 +124,7 @@ mailroom on macOS itself is untested; [docs/07-mac.md](docs/07-mac.md) says what
 ## Updating
 
 `git pull && ./install.sh` (add `--start` to also enable anything new; running services are not restarted).
-What changed in each update: [CHANGELOG.md](CHANGELOG.md). Your
+What changed in each update, and what to do for it: [CHANGELOG.md](CHANGELOG.md). Your
 `kit.env`, configs, Gmail token, orchestrator memory and state survive updates. After a change to
 the mailroom code, restart the daemon: `systemctl --user restart agent-mailroom` (check that no
 orchestrator run is in flight: `agent-orchestrate --runs`).

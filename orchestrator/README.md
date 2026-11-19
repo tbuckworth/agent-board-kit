@@ -2,8 +2,9 @@
 
 The brief and memory for {{OWNER_NAME}}'s agent orchestrator. It is **not a running session**: the
 mailroom starts one fresh `claude -p --model sonnet --effort high` run in this directory per event
-(an email no agent session claimed, a reply in a thread the orchestrator wrote, a message from the
-agent board or the to-do app), and `agent-send orchestrator "..."` does the same for a peer message.
+(an email no agent session claimed, {{OWNER_NAME}}'s mail to an agent that has closed or exited, a
+reply in a thread the orchestrator wrote, a message from the agent board or the to-do app), and
+`agent-send orchestrator "..."` does the same for a peer message.
 `AGENTS.md` is the job description, `STATE.md` the memory, and `.claude/skills/agent-report` the
 status-report procedure.
 

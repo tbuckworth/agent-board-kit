@@ -10,10 +10,24 @@ Account settings:
 import fnmatch
 import re
 
-from .. import util
-from . import clean
+from . import clean, ssh
 
 DEFAULT_COST_RE = r"\$\s*([\d,]+(?:\.\d+)?)"
+SQUEUE_FAILED = 97   # the remote command's exit status when squeue failed (the month-cost command's own otherwise)
+BILLING_STATES = ("RUNNING", "CONFIGURING", "COMPLETING")
+HAS_RESOURCES = True
+COUNTS_FROM_LAUNCH = True
+ID_TERM = "Submitted batch job %s"   # what sbatch prints; a bare job number would match unrelated numbers
+STOP_EFFECT = "`scancel`; the job's output files are kept"
+STOP_KEEPS_DATA = True
+
+
+def billing_now(r):
+    return r.get("state") in BILLING_STATES
+
+
+def ownership(r, identity):
+    return "ours"   # `squeue --me`: only your own jobs
 
 
 def _elapsed(text):
@@ -60,7 +74,7 @@ def parse(acct, jobs_txt, now):
         if len(f) < 5 or not _paid(acct, f[1]):
             continue
         jid, part, name, state, el = f[:5]
-        if state not in ("RUNNING", "CONFIGURING", "COMPLETING"):
+        if state not in BILLING_STATES:
             continue
         secs = _elapsed(el) if re.match(r"[\d:-]+$", el) else 0
         rate = rate_for(acct, part)
@@ -75,10 +89,12 @@ def collect(acct, opts):
     now = opts["now"]
     host = _host(acct)
     _paid(acct, "")  # fail early and clearly when no paid partitions are configured
-    remote = 'squeue --me -h -o "%i|%P|%j|%T|%M"'
+    remote = 'squeue --me -h -o "%%i|%%P|%%j|%%T|%%M" || exit %d' % SQUEUE_FAILED
     if acct.get("month_cost_command"):
         remote += "; echo ===; " + acct["month_cost_command"]
-    code, out, err = util.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host, remote], timeout=60)
+    code, out, err = ssh(host, remote, 60)
+    if code == SQUEUE_FAILED:
+        raise RuntimeError("squeue failed on %s: %s" % (host, err.strip()[-200:]))
     if code != 0:
         raise RuntimeError("ssh %s failed (%s): %s" % (host, code, err.strip()[-200:]))
     jobs_txt, _, cost_txt = out.partition("===")
@@ -91,6 +107,5 @@ def collect(acct, opts):
 
 
 def stop(acct, job_id):
-    host = _host(acct)
-    code, out, err = util.run(["ssh", "-o", "BatchMode=yes", host, "scancel %s" % int(job_id)], timeout=60)
+    code, out, err = ssh(_host(acct), "scancel %s" % int(job_id), 60)
     return code == 0, (out + err).strip()[-200:] or "scancel sent"

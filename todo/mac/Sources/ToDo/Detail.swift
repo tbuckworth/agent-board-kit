@@ -118,7 +118,7 @@ struct TaskDetail: View {
     var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 10) {
-                Button { store.toggleComplete(task.number) } label: { CheckCircle(done: !task.isOpen, priority: task.priority, size: 20) }
+                Button { store.toggleComplete(task.number) } label: { CheckCircle(done: !task.isOpen, importance: task.importance, size: 20) }
                     .buttonStyle(.plain).padding(.top, 2 * z)
                 Text(task.title).font(.system(size: 17 * z, weight: .semibold))
                     .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
@@ -135,10 +135,11 @@ struct TaskDetail: View {
     }
 
     var crumb: String {
-        var parts = ["\(task.priority) priority"]
+        let marks = Rating.marks(task, now: store.now)
+        var parts = [task.importance.map { "\($0) importance" }, marks.urgent ? "urgent" : nil, marks.due].compactMap { $0 }
         if let sec = task.section { parts.append(sec) }
         if !task.isLocal { parts.append("#\(task.number)") }
-        return "· " + parts.joined(separator: " · ")
+        return parts.isEmpty ? "" : "· " + parts.joined(separator: " · ")
     }
 
     @ViewBuilder var banners: some View {
@@ -450,7 +451,15 @@ struct AgentSection: View {
             HStack(alignment: .top, spacing: 8) {
                 Circle().fill(color).frame(width: 8 * z, height: 8 * z).padding(.top, 5 * z)
                 Text(line).font(.system(size: 13 * z)).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                if task.agent?.name != nil {
+                    Button { store.openAgentMail(task) } label: { Image(systemName: "envelope") }
+                        .buttonStyle(.borderless)
+                        .help("Open the agent's latest email (or double-click this line)")
+                }
             }
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { store.openAgentMail(task) }
             ForEach(0..<events.count, id: \.self) { i in AgentEventRow(event: events[i]) }
         }
     }
@@ -488,7 +497,9 @@ struct EditForm: View {
     @State private var notes: String
     @State private var list: String
     @State private var section: String
-    @State private var priority: String
+    @State private var importance: String?
+    @State private var urgent: Bool
+    @State private var due: String?
     @State private var tags: [String]
     @State private var waiting: Bool
     @State private var who: String
@@ -503,7 +514,9 @@ struct EditForm: View {
         _notes = State(initialValue: task.notes)
         _list = State(initialValue: task.list)
         _section = State(initialValue: task.section ?? "")
-        _priority = State(initialValue: task.priority)
+        _importance = State(initialValue: task.importance)
+        _urgent = State(initialValue: Rating.urgent(task))
+        _due = State(initialValue: Rating.due(task))
         _tags = State(initialValue: task.tags)
         _waiting = State(initialValue: task.waiting || store.focusRequest == .waiting)
         _who = State(initialValue: task.waitingOn ?? "")
@@ -532,9 +545,18 @@ struct EditForm: View {
                 if let live = store.items[task.number] {
                     ChecklistSection(task: live, store: store)          // saved as you go, like the task panel
                 }
-                field("Priority") {
-                    Picker("", selection: $priority) { ForEach(priorities, id: \.self) { Text($0).tag($0) } }
-                        .pickerStyle(.segmented).labelsHidden()
+                if rated {
+                    field("Importance") {
+                        HStack(spacing: 14) {
+                            Picker("", selection: $importance) {
+                                ForEach(Rating.importances, id: \.self) { Text($0.capitalized).tag(Optional($0)) }
+                                Text("None").tag(String?.none)
+                            }
+                            .pickerStyle(.segmented).labelsHidden()
+                            Toggle("Urgent", isOn: $urgent).toggleStyle(.checkbox).fixedSize()
+                        }
+                    }
+                    field("Due") { DayChooser(day: $due, presets: Rating.duePresets, now: store.now) }
                 }
                 field("Tags") { TagEditor(task: task, store: store, draft: $tags) }
                 field("Waiting") { waitingFields }
@@ -579,33 +601,16 @@ struct EditForm: View {
                 .toggleStyle(.checkbox)
             if waiting {
                 TextField("Who? e.g. Sam, the landlord", text: $who).textFieldStyle(.roundedBorder).focused($whoFocused)
-                HStack(spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text("Follow up").foregroundStyle(.secondary)
-                    ForEach([(3, "3 days"), (7, "1 week"), (14, "2 weeks")], id: \.0) { days, label in
-                        let day = Waiting.day(in: days, from: store.now)
-                        Button(label) { followUp = day }
-                            .buttonStyle(.bordered).controlSize(.small)
-                            .tint(followUp == day ? Palette.attention : nil)
-                    }
-                    Button("None") { followUp = nil }.buttonStyle(.bordered).controlSize(.small)
-                        .tint(followUp == nil ? Palette.attention : nil)
-                }
-                HStack(spacing: 6) {
-                    if followUp != nil {
-                        DatePicker("", selection: Binding(
-                            get: { followUp.flatMap(Waiting.date) ?? store.now },
-                            set: { followUp = Waiting.day($0) }), displayedComponents: .date)
-                            .datePickerStyle(.field).labelsHidden().fixedSize()
-                        Text(followUp.map { "on " + Waiting.short($0, now: store.now) } ?? "")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Button("Pick a day…") { followUp = Waiting.day(in: 7, from: store.now) }
-                            .buttonStyle(.borderless)
-                    }
+                    DayChooser(day: $followUp, presets: [("3 days", 3), ("1 week", 7), ("2 weeks", 14)], now: store.now)
                 }
             }
         }
     }
+
+    /// The rating fields show for a task in a rated list, as the edited list field names it.
+    var rated: Bool { Rating.rates(task, inList: list, config: store.config) }
 
     func field<C: View>(_ label: String, @ViewBuilder _ content: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -621,8 +626,50 @@ struct EditForm: View {
         let waitChanged = w.on != task.waiting || (w.on && (w.who.trimmingCharacters(in: .whitespaces) != (task.waitingOn ?? "")
                                                              || w.followUp != task.followUp))
         store.saveEdit(task.number, title: title, notes: notes, list: list, section: section.isEmpty ? nil : section,
-                       priority: priority, tags: tagsChanged ? tags : nil, waiting: waitChanged ? w : nil)
+                       tags: tagsChanged ? tags : nil, waiting: waitChanged ? w : nil, rating: editedRating())
         store.editing = nil
+    }
+
+    /// The task's rating now, with the fields changed in the pane: a rating changed meanwhile elsewhere (Triage,
+    /// another device) keeps what this pane left alone. Nil when the list isn't rated or the pane changed no rating field.
+    func editedRating() -> Rating.Value? {
+        guard rated, let live = store.items[task.number] else { return nil }
+        return Rating.edited(live: Rating.Value(live), original: task, importance: importance, urgent: urgent, due: due)
+    }
+}
+
+/// A day, or none: a few days from now, any day on a calendar, or None. The waiting follow-up and the due date.
+struct DayChooser: View {
+    @Binding var day: String?
+    let presets: [(String, Int)]                    // (button, days from now)
+    let now: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            FlowLayout(spacing: 6) {
+                ForEach(presets, id: \.1) { label, days in
+                    let d = Waiting.day(in: days, from: now)
+                    Button(label) { day = d }
+                        .buttonStyle(.bordered).controlSize(.small)
+                        .tint(day == d ? Palette.attention : nil)
+                }
+                Button("None") { day = nil }.buttonStyle(.bordered).controlSize(.small)
+                    .tint(day == nil ? Palette.attention : nil)
+            }
+            HStack(spacing: 6) {
+                if day != nil {
+                    DatePicker("", selection: Binding(
+                        get: { day.flatMap(Waiting.date) ?? now },
+                        set: { day = Waiting.day($0) }), displayedComponents: .date)
+                        .datePickerStyle(.field).labelsHidden().fixedSize()
+                    Text(day.map { "on " + Waiting.short($0, now: now) } ?? "")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button("Pick a day…") { day = Waiting.day(in: 7, from: now) }
+                        .buttonStyle(.borderless)
+                }
+            }
+        }
     }
 }
 
@@ -735,7 +782,7 @@ struct AssignSheet: View {
 
     func loadAgents() {
         agentsError = nil
-        guard store.link.isLive || store.agentsStub != nil else { agentsError = "The desktop isn't connected."; return }
+        guard store.link.isLive else { agentsError = "The desktop isn't connected."; return }
         store.runningAgents { list, err in
             if let list = list {
                 agents = list
@@ -761,7 +808,7 @@ struct AssignSheet: View {
     }
 
     func loadPreview() {
-        guard store.link.isLive || store.previewStub != nil else { previewError = "The desktop isn't connected."; return }
+        guard store.link.isLive else { previewError = "The desktop isn't connected."; return }
         if running && chosen == nil { preview = nil; previewError = "Pick an agent to see what it is sent."; return }
         store.assignPreview(task.number, text: store.assignText(lead: task.number, others: others, text: text),
                             to: running ? chosen?.id : nil) { msg, err in

@@ -7,6 +7,7 @@ APP=build/AgentBoard.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$(swift build -c release --show-bin-path)/AgentBoard" "$APP/Contents/MacOS/AgentBoard"
+cp -R "$(swift build -c release --show-bin-path)/AgentBoard_AgentBoard.bundle" "$APP/Contents/Resources/"   # widgets.js
 cp Info.plist "$APP/Contents/Info.plist"
 if [ ! -f build/AppIcon.icns ]; then
   "$APP/Contents/MacOS/AgentBoard" --icon build/AppIcon.iconset && iconutil -c icns build/AppIcon.iconset -o build/AppIcon.icns

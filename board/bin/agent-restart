@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 """agent-restart: restart, or update and restart, the desktop without losing the agents.
 
+Run `run` only after the owner says yes.
     agent-restart plan [--json]                       what would happen: updates, every agent, what it's waiting on
     agent-restart run [--update] [--wait-minutes 15] [--choice NAME=nudge|quiet|skip ...] [--dry-run] --yes
     agent-restart status | cancel
     agent-restart restore                             (the boot-time unit agent-restart-restore.service)
     agent-restart test-cycle --only NAME[,NAME] [--choice NAME=..]  kill those agents' tmux and restore them: the path, no reboot
 
-run writes a manifest and starts a detached worker:
-  1. heads-up to agents mid-turn, then wait up to --wait-minutes for them to stop;
-  2. with --update: apt-get update, full-upgrade (stops before rebooting if apt fails), snap refresh;
-  3. email the owner (mailroom config owner_email), then reboot.
-At boot, restore brings every agent back in its tmux session, with the same conversation, login, model and effort.
-Quiet ones just come back. Nudged ones (default: those that were busy or on a background wait) get one note saying
-what they were doing and waiting on. It ends by emailing the owner a summary.
-Defaults: busy and background agents are nudged, the rest come back quietly. An agent runs it only after the owner
-says yes.
+What a restart does, and the nudge, quiet and skip choices: the README's Restart the desktop section. Its mails go
+to the owner (mailroom config owner_email).
 """
-import argparse
 import json
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentboard import restart  # noqa: E402
+from agentboard import cli, restart  # noqa: E402
 
 
 def show_plan(p):
@@ -32,7 +25,8 @@ def show_plan(p):
     print("Updates: %s pending (%s security); reboot %s%s; kernel %s -> %s; GPU %s" % (
         u.get("total"), u.get("security"), "needed" if u.get("reboot_required") else "not needed",
         (" since " + time.strftime("%d %b", time.localtime(u["reboot_since"]))) if u.get("reboot_since") else "",
-        u.get("kernel"), u.get("newest_kernel"), "ok" if u.get("gpu_ok") else "NOT ok: " + u.get("gpu_message", "")))
+        u.get("kernel"), u.get("newest_kernel"),
+        "none" if u.get("gpu_ok") is None else "ok" if u.get("gpu_ok") else "NOT ok: " + u.get("gpu_message", "")))
     if u.get("highlights"):
         print("  including: " + ", ".join(u["highlights"]))
     if u.get("snaps"):
@@ -52,8 +46,7 @@ def show_plan(p):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="agent-restart", description=__doc__.split("\n\n")[0],
-                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap = cli.parser(__doc__, "agent-restart")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("plan")
     p.add_argument("--json", action="store_true")
@@ -73,8 +66,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     if a.cmd == "plan":
-        pl = restart.plan()
-        print(json.dumps(pl, indent=1, default=str)) if a.json else show_plan(pl)
+        cli.out(restart.plan(), a.json, show_plan)
         return 0
     choices = {}
     for c in getattr(a, "choice", []):

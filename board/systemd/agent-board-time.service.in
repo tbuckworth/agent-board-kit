@@ -1,0 +1,9 @@
+[Unit]
+Description=agent-board: recompute the Time page (active time per day, by board group)
+
+[Service]
+Type=oneshot
+# PATH as a login shell has it: claude (the group guesses) and gh (the to-do source) are usually in ~/.local/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
+ExecStart={{PYTHON}} {{KIT_DIR}}/board/bin/agent-board time
+TimeoutStartSec=900

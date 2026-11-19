@@ -6,19 +6,24 @@ enum Route: Hashable {
     case list(String)
     case agents
     case search
+    case triage
 }
 
 struct Filters: Equatable {
     var section: String?
-    var priority: String?
+    /// One of `Rating.importances`, or `Rating.unrated` for the tasks with no importance.
+    var importance: String?
+    /// Only the effectively urgent tasks (`Rating.effectivelyUrgent`).
+    var urgent = false
     /// Tags: every "only" tag must be on a task, and no "hide" tag may be. Kept across launches.
     var tags: [String: TagMode] = [:]
 
-    var active: Bool { section != nil || priority != nil || !tags.isEmpty }
+    var active: Bool { section != nil || importance != nil || urgent || !tags.isEmpty }
 
-    func accepts(_ t: TaskItem) -> Bool {
+    func accepts(_ t: TaskItem, now: Date) -> Bool {
         if let s = section, t.section?.lowercased() != s { return false }
-        if let p = priority, t.priority != p { return false }
+        if let i = importance, (t.importance ?? Rating.unrated) != i { return false }
+        if urgent, !Rating.effectivelyUrgent(t, now: now) { return false }
         return acceptsTags(t)
     }
 
@@ -111,7 +116,7 @@ final class Store: ObservableObject {
     @Published var syncedAt: String?          // the desktop's sync time of the newest data this Mac has
     @Published var deskSyncedAt: String?      // when the desktop last checked GitHub (from its pings)
     @Published var link: LinkState = .down("not connected yet")
-    @Published var lastContact: Date?
+    var lastContact: Date?      // not published: no view shows it, and every 20 s ping set it (a full redraw)
     @Published var syncError: String?
     @Published var toast: Toast?
     @Published private(set) var undoStack: [UndoEntry] = []
@@ -145,11 +150,10 @@ final class Store: ObservableObject {
     @Published var updateAvailable = false
     @Published var now = Date()
     @Published var hasLoaded = false
-    var previewStub: String?          // the offscreen renderer's stand-in for the orchestrator message
-    var agentsStub: [BoardAgent]?     // ...and for the board's running agents
+    var openURL: (URL, String?) -> Void = { Browser.open($0, signedInAs: $1) }   // (link, Google account)
 
     static let defaults = UserDefaults.standard
-    let channel = DeskLink()
+    let channel: DeskChannel
     let persist: Bool
     private var inFlight: UUID?
     private var retryAt: [UUID: Date] = [:]
@@ -157,7 +161,9 @@ final class Store: ObservableObject {
     private var saveWork: DispatchWorkItem?
     private var timers: [Timer] = []
 
-    init(persist: Bool = true) {
+    /// `channel`: the link to todo-desk (a DeskLink in the app, made in AppDelegate).
+    init(channel: DeskChannel, persist: Bool) {
+        self.channel = channel
         self.persist = persist
         let z = Store.defaults.double(forKey: "zoom")
         zoom = z > 0 ? CGFloat(z) : 1
@@ -167,7 +173,7 @@ final class Store: ObservableObject {
         if persist {
             let saved = (Store.defaults.dictionary(forKey: "tagFilter") as? [String: String]) ?? [:]
             filters.tags = saved.compactMapValues { TagMode(rawValue: $0) }
-            load()
+            load(from: Store.cacheURL)
         }
     }
 
@@ -186,8 +192,14 @@ final class Store: ObservableObject {
         var labels: [String]?
     }
 
-    func load(from url: URL = Store.cacheURL) {
-        guard let data = try? Data(contentsOf: url), let c = try? JSONDecoder().decode(CacheFile.self, from: data) else { return }
+    /// The cache, with any edits not yet on GitHub. One that can't be read is kept aside and the error shown.
+    func load(from url: URL) {
+        let c: CacheFile
+        switch CacheIO.load(url, { try JSONDecoder().decode(CacheFile.self, from: $0) }) {
+        case .success(let file?): c = file
+        case .success(nil): return
+        case .failure(let e): show(e.message, error: true); return
+        }
         server = Dictionary(c.issues.map { ($0.number, $0) }, uniquingKeysWith: { a, _ in a })
         serverConfig = c.config
         syncedAt = c.syncedAt
@@ -203,10 +215,13 @@ final class Store: ObservableObject {
         saveWork?.cancel()
         let c = CacheFile(issues: Array(server.values), config: serverConfig, syncedAt: syncedAt, pending: pending, labels: labelNames)
         let url = Store.cacheURL
-        let w = DispatchWorkItem {
-            guard let data = try? JSONEncoder().encode(c) else { return }
-            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: url, options: .atomic)
+        let w = DispatchWorkItem { [weak self] in
+            do {
+                try CacheIO.save(url) { try JSONEncoder().encode(c) }
+            } catch {
+                let message = (error as? CacheError)?.message ?? error.localizedDescription
+                Task { @MainActor in self?.show(message, error: true) }
+            }
         }
         saveWork = w
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.8, execute: w)
@@ -248,7 +263,7 @@ final class Store: ObservableObject {
     var live: [TaskItem] { items.values.filter { !isDeleted($0) } }
 
     func open(in list: String) -> [TaskItem] {
-        Store.waitingLast(live.filter { $0.isOpen && $0.list == list && filters.accepts($0) }, today: today)
+        Store.waitingLast(live.filter { $0.isOpen && $0.list == list && filters.accepts($0, now: now) }, today: today)
     }
 
     /// Today as `YYYY-MM-DD`, for follow-up days.
@@ -306,6 +321,7 @@ final class Store: ObservableObject {
         case .list(let l): return groupedRows(open(in: l)).map { $0.task.number } + (showCompleted ? completed(in: l).map { $0.number } : [])
         case .agents: return agentTasks.map { $0.number }
         case .search: return searchResults().map { $0.number }
+        case .triage: return []
         }
     }
 
@@ -324,7 +340,7 @@ final class Store: ObservableObject {
 
     func openCounts() -> [String: Int] {
         var c: [String: Int] = [:]
-        for t in live where t.isOpen && filters.accepts(t) { c[t.list, default: 0] += 1 }
+        for t in live where t.isOpen && filters.accepts(t, now: now) { c[t.list, default: 0] += 1 }
         return c
     }
 
@@ -390,7 +406,7 @@ final class Store: ObservableObject {
     }
 
     private func absorb(_ obj: [String: Any], full: Bool) {
-        let issues = decodeIssues(obj["issues"])
+        let issues = readIssues(obj["issues"])
         if full { server = [:] }
         for i in issues { server[i.number] = i }
         for n in (obj["removed"] as? [Int]) ?? [] { server.removeValue(forKey: n) }
@@ -399,7 +415,7 @@ final class Store: ObservableObject {
             let keep = Set(known)
             server = server.filter { keep.contains($0.key) }
         }
-        if let c = decodeConfig(obj["config"]) { serverConfig = c } else if obj["config"] is NSNull { serverConfig = nil }
+        takeConfig(obj["config"])
         if let l = obj["labels"] as? [String] { labelNames = l }
         if let s = obj["synced_at"] as? String { syncedAt = s; deskSyncedAt = s }
         rebuildAll()
@@ -410,24 +426,46 @@ final class Store: ObservableObject {
         lastContact = Date()
         switch e["type"] as? String {
         case "issues":
-            let issues = decodeIssues(e["issues"])
+            let issues = readIssues(e["issues"])
             for i in issues { server[i.number] = i }
             let removed = (e["removed"] as? [Int]) ?? []
             for n in removed { server.removeValue(forKey: n) }
             if let s = e["synced_at"] as? String { syncedAt = s; deskSyncedAt = s }
-            syncError = nil
+            if syncError != nil { syncError = nil }
             rebuild(issues.map { $0.number } + removed)
             scheduleSave()
         case "config":
-            if let c = decodeConfig(e["config"]) { serverConfig = c } else if e["config"] is NSNull { serverConfig = nil } else { break }
-            rebuildAll()                                    // null: the config file was deleted on GitHub
+            guard takeConfig(e["config"]) else { break }    // null: the config file was deleted on GitHub
+            rebuildAll()
             scheduleSave()
         case "ping", "ready":
-            if let s = e["synced_at"] as? String { deskSyncedAt = s }   // display only: never the cursor for "since"
+            if let s = e["synced_at"] as? String, s != deskSyncedAt { deskSyncedAt = s }   // display only: never the cursor for "since"
         case "error":
             syncError = e["error"] as? String
         default:
             break
+        }
+    }
+
+    /// The issues in a reply or event. Any that can't be read are left out and the window says how many.
+    private func readIssues(_ any: Any?) -> [Issue] {
+        let d = decodeIssues(any)
+        if d.unreadable > 0 { show("\(d.unreadable) task\(d.unreadable == 1 ? "" : "s") couldn't be read", error: true) }
+        return d.issues
+    }
+
+    /// Take the config from a reply or event: null means the file was deleted on GitHub, no key means no change.
+    /// A malformed one is reported and the current one kept. Returns whether the config changed.
+    @discardableResult
+    private func takeConfig(_ any: Any?) -> Bool {
+        if any is NSNull { serverConfig = nil; return true }
+        do {
+            guard let c = try decodeConfig(any) else { return false }
+            serverConfig = c
+            return true
+        } catch {
+            show("The lists' settings (.todo/config.json) couldn't be read: \(error.localizedDescription)", error: true)
+            return false
         }
     }
 
@@ -503,8 +541,8 @@ final class Store: ObservableObject {
                 server[issue.number] = issue
                 if op.kind == .create { remap(op.number, to: issue.number) }
             }
-            for issue in decodeIssues(obj["issues"]) { server[issue.number] = issue }
-            if let c = decodeConfig(obj["config"]) { serverConfig = c }
+            for issue in readIssues(obj["issues"]) { server[issue.number] = issue }
+            takeConfig(obj["config"])
             rebuildAll()
         case .failure(let e):
             if e.offline {
@@ -578,14 +616,24 @@ final class Store: ObservableObject {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return nil }
         let l = listSlug(list).isEmpty ? "tasks" : listSlug(list)
-        var labels = ["list:" + l, "source:app"]
-        if let g = config?.group(of: l) { labels.append("group:" + g) }
+        let labels = newIssueLabels(list: l)
         let n = nextLocal
         nextLocal -= 1
         enqueue(PendingOp(kind: .create, number: n, title: t, body: IssueBody.build(notes: notes, checklist: checklist),
                           labels: labels, what: "Add “\(t)”"))
         if let after = items[n]?.issue { pushUndo(UndoEntry(what: "adding “\(t)”", number: n, before: nil, after: after)) }
         return n
+    }
+
+    /// A new issue's labels: its list, made here, and the list's group.
+    private func newIssueLabels(list: String) -> [String] {
+        ["list:" + list, "source:app"] + (config?.group(of: list).map { ["group:" + $0] } ?? [])
+    }
+
+    /// Delete the apps' way: closed, with no list (so it is hidden everywhere, and not counted as completed).
+    private func closeAndUnlist(_ t: TaskItem, what: String) {
+        let lists = t.issue.labels.filter { $0.lowercased().hasPrefix("list:") }
+        update(t.number, set: ["state": "CLOSED"], remove: lists, what: what)
     }
 
     func update(_ number: Int, set: [String: String] = [:], add: [String] = [], remove: [String] = [], what: String,
@@ -614,18 +662,15 @@ final class Store: ObservableObject {
 
     func deleteTask(_ number: Int, recordUndo: Bool = true) {
         guard let t = items[number] else { return }
+        if number < 0 { discardPending(number); return }
         if !recordUndo {
-            let lists = t.issue.labels.filter { $0.lowercased().hasPrefix("list:") }
-            if number < 0 { discardPending(number); return }
-            update(number, set: ["state": "CLOSED"], remove: lists, what: "Delete “\(t.title)”")
+            closeAndUnlist(t, what: "Delete “\(t.title)”")
             return
         }
-        let lists = t.issue.labels.filter { $0.lowercased().hasPrefix("list:") }
-        if number < 0 { discardPending(number); return }
         if selection == number { selectNeighbour(of: number) }
         if !Grouping.openDescendants(number, all: live).isEmpty { deleteMany([number]); return }   // with its tasks
         undoable(number, "deleting “\(t.title)”") {
-            update(number, set: ["state": "CLOSED"], remove: lists, what: "Delete “\(t.title)”")
+            closeAndUnlist(t, what: "Delete “\(t.title)”")
         }
         show("Deleted “\(t.title)”", undo: { [weak self] in self?.undo() })
     }
@@ -659,9 +704,10 @@ final class Store: ObservableObject {
         }
     }
 
-    /// Save the edit pane. `tags` and `waiting` are left as they are when nil.
-    func saveEdit(_ number: Int, title: String, notes: String, list: String, section: String?, priority: String,
-                  tags: [String]? = nil, waiting: WaitingEdit? = nil) {
+    /// Save the edit pane. `tags`, `waiting` and `rating` are left as they are when nil (a nil rating adds no
+    /// `urgency:low`). Every save takes off the retired `priority:` label.
+    func saveEdit(_ number: Int, title: String, notes: String, list: String, section: String?,
+                  tags: [String]? = nil, waiting: WaitingEdit? = nil, rating: Rating.Value? = nil) {
         guard let t = items[number] else { return }
         var set: [String: String] = [:]
         let newTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -671,14 +717,11 @@ final class Store: ObservableObject {
         let whoChanged = (who ?? "").trimmingCharacters(in: .whitespaces) != (t.waitingOn ?? "")
         let body = Waiting.withWho(IssueBody.withNotes(t.issue.body, notes), who)
         if body != t.issue.body, notes.trimmingCharacters(in: .whitespacesAndNewlines) != t.notes || whoChanged { set["body"] = body }
-        var diff = labelDiff(from: t, list: list, section: section, priority: priority, config: config)
-        if let tags = tags {
-            let d = tagDiff(from: t, to: tags)
-            diff.add += d.add
-            diff.remove += d.remove
-        }
-        if let w = waiting {
-            let d = waitingDiff(from: t, waiting: w.on, followUp: w.followUp)
+        var diff = labelDiff(from: t, list: list, section: section, config: config)
+        var parts = [rating.map { ratingDiff(from: t, to: $0) } ?? (add: [], remove: retiredPriority(t))]
+        if let tags = tags { parts.append(tagDiff(from: t, to: tags)) }
+        if let w = waiting { parts.append(waitingDiff(from: t, waiting: w.on, followUp: w.followUp)) }
+        for d in parts {
             diff.add += d.add
             diff.remove += d.remove
         }
@@ -782,7 +825,7 @@ final class Store: ObservableObject {
             moveMany(marked.contains(number) ? chosen : [number], toList: list)   // the selection, or a group with its tasks
             return
         }
-        let diff = labelDiff(from: t, list: list, section: t.section, priority: t.priority, config: config)
+        let diff = labelDiff(from: t, list: list, section: t.section, config: config)
         undoable(number, "moving “\(t.title)” to \(titleCase(list))") {
             update(number, add: diff.add, remove: diff.remove, what: "Move “\(t.title)” to \(titleCase(list))")
         }
@@ -851,8 +894,7 @@ final class Store: ObservableObject {
         undoableMany(real, "deleting \(label(numbers))") {
             for n in real {
                 guard let t = items[n] else { continue }
-                let lists = t.issue.labels.filter { $0.lowercased().hasPrefix("list:") }
-                update(n, set: ["state": "CLOSED"], remove: lists, what: "Delete “\(t.title)”")
+                closeAndUnlist(t, what: "Delete “\(t.title)”")
             }
             return []
         }
@@ -869,7 +911,7 @@ final class Store: ObservableObject {
         undoableMany(targets, "moving \(label(numbers)) to \(titleCase(l))") {
             for n in targets {
                 guard let t = items[n] else { continue }
-                let diff = labelDiff(from: t, list: l, section: t.section, priority: t.priority, config: config)
+                let diff = labelDiff(from: t, list: l, section: t.section, config: config)
                 update(n, add: diff.add, remove: diff.remove, what: "Move “\(t.title)” to \(titleCase(l))")
             }
             return []
@@ -883,12 +925,12 @@ final class Store: ObservableObject {
         undoableMany(numbers, "rating \(label(numbers))") {
             for n in numbers {
                 guard let t = items[n] else { continue }
-                var add: [String] = []
-                if let i = importance { add.append("importance:" + i) }
-                if let u = urgency { add.append("urgency:" + u) }
-                else if importance != nil, Labels.value(t.issue.labels, "urgency:") == nil { add.append("urgency:low") }
-                let remove = t.issue.labels.filter { $0.lowercased().hasPrefix("priority:") }   // retired
-                update(n, add: add, remove: remove, what: "Rate “\(t.title)”")
+                var r = Rating.Value(t)
+                if let i = importance { r.importance = i }
+                if let u = urgency { r.urgency = u }
+                let d = ratingDiff(from: t, to: r)
+                if d.add.isEmpty && d.remove.isEmpty { continue }
+                update(n, add: d.add, remove: d.remove, what: "Rate “\(t.title)”")
             }
             return []
         }
@@ -916,8 +958,7 @@ final class Store: ObservableObject {
         guard !title.isEmpty, let first = tasks.first else { return nil }
         var g: Int?
         undoableMany(numbers, "grouping \(label(numbers))") {
-            var labels = ["list:" + first.list, "source:app"] + Grouping.ratingLabels(tasks)
-            if let grp = config?.group(of: first.list) { labels.append("group:" + grp) }
+            let labels = newIssueLabels(list: first.list) + Grouping.ratingLabels(tasks)
             let n = nextLocal
             nextLocal -= 1
             enqueue(PendingOp(kind: .create, number: n, title: title, body: "", labels: labels, what: "Group “\(title)”"))
@@ -940,8 +981,7 @@ final class Store: ObservableObject {
             for n in members { setParent(n, nil, what: "Ungroup “\(items[n]?.title ?? "")”") }
             for g in groups {
                 guard let t = items[g] else { continue }
-                let lists = t.issue.labels.filter { $0.lowercased().hasPrefix("list:") }
-                update(g, set: ["state": "CLOSED"], remove: lists, what: "Delete group “\(t.title)”")
+                closeAndUnlist(t, what: "Delete group “\(t.title)”")
             }
             return []
         }
@@ -1002,7 +1042,7 @@ final class Store: ObservableObject {
         if undoStack.count > 60 { undoStack.removeFirst(undoStack.count - 60) }
     }
 
-    private func undoable(_ number: Int, _ what: String, _ action: () -> Void) {
+    func undoable(_ number: Int, _ what: String, _ action: () -> Void) {
         let before = items[number]?.issue
         action()
         guard let b = before, let after = items[number]?.issue, after != b else { return }
@@ -1011,7 +1051,7 @@ final class Store: ObservableObject {
 
     /// Several tasks changed by one action, undone together. `action` returns any tasks it created (a new group),
     /// which undo deletes. Tasks it left unchanged aren't recorded.
-    private func undoableMany(_ numbers: [Int], _ what: String, _ action: () -> [Int]) {
+    func undoableMany(_ numbers: [Int], _ what: String, _ action: () -> [Int]) {
         var before: [Int: Issue] = [:]
         for n in numbers { if let i = items[n]?.issue { before[n] = i } }
         let created = action()
@@ -1122,7 +1162,6 @@ final class Store: ObservableObject {
 
     /// `to`: a running agent's session id; the preview is then the message that agent is sent.
     func assignPreview(_ number: Int, text: String, to: String? = nil, done: @escaping (String?, String?) -> Void) {
-        if let stub = previewStub { done(stub, nil); return }
         var req: [String: Any] = ["cmd": "assign_preview", "number": number, "text": text]
         if let to = to { req["to"] = to }
         channel.request(req, timeout: 60) { r in
@@ -1136,7 +1175,6 @@ final class Store: ObservableObject {
     /// The agent board's running agents, from the desktop. A helper too old to know `agents` answers with an error,
     /// so the sheet can't pick one, and never sends a `to` that helper would ignore by starting a new agent.
     func runningAgents(done: @escaping ([BoardAgent]?, String?) -> Void) {
-        if let stub = agentsStub { done(stub, nil); return }
         channel.request(["cmd": "agents"], timeout: 60) { r in
             switch r {
             case .success(let o): done(BoardAgent.decode(o["agents"]), nil)
@@ -1159,6 +1197,30 @@ final class Store: ObservableObject {
                 done(nil)
             case .failure(let e):
                 done(e.message)
+            }
+        }
+    }
+
+    /// Double-click the agent on a task: its latest mail to the owner, in their Gmail, as on the agent board.
+    func openAgentMail(_ task: TaskItem) {
+        let who = task.agent?.name
+        let handle: ([String: Any]) -> Void = { [weak self] o in
+            guard let self = self else { return }
+            let mail = o["mail"] as? [String: Any]
+            let owner = o["owner"] as? String
+            guard let m = mail, let url = AgentMail.url(thread: m["thread"] as? String,
+                                                       messageID: m["message_id"] as? String, owner: owner) else {
+                self.show(who.map { "\($0) hasn't emailed you yet." } ?? "No agent has started on this task yet.")
+                return
+            }
+            self.openURL(url, owner)
+            let subject = (m["subject"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            self.show("Opening \(who ?? "the agent")'s latest email" + (subject.map { ": \($0)" } ?? "."))
+        }
+        channel.request(["cmd": "agent_mail", "number": task.number], timeout: 45) { [weak self] r in
+            switch r {
+            case .success(let o): handle(o)
+            case .failure(let e): self?.show("Couldn't find the agent's email: \(e.message)", error: true)
             }
         }
     }
@@ -1245,11 +1307,21 @@ func decodeIssue(_ any: Any?) -> Issue? {
     return try? JSONDecoder().decode(Issue.self, from: data)
 }
 
-func decodeIssues(_ any: Any?) -> [Issue] {
-    ((any as? [Any]) ?? []).compactMap { decodeIssue($0) }
+/// A list of issues from todo-desk: the ones that decode, and how many didn't (they are left out, and counted so
+/// the window can say so).
+struct DecodedIssues {
+    var issues: [Issue]
+    var unreadable: Int
 }
 
-func decodeConfig(_ any: Any?) -> TodoConfig? {
-    guard let d = any as? [String: Any], let data = try? JSONSerialization.data(withJSONObject: d) else { return nil }
-    return try? JSONDecoder().decode(TodoConfig.self, from: data)
+func decodeIssues(_ any: Any?) -> DecodedIssues {
+    let all = (any as? [Any]) ?? []
+    let issues = all.compactMap { decodeIssue($0) }
+    return DecodedIssues(issues: issues, unreadable: all.count - issues.count)
+}
+
+/// The config in a reply: nil when there is none. One that is there but malformed throws.
+func decodeConfig(_ any: Any?) throws -> TodoConfig? {
+    guard let d = any as? [String: Any] else { return nil }
+    return try JSONDecoder().decode(TodoConfig.self, from: try JSONSerialization.data(withJSONObject: d))
 }

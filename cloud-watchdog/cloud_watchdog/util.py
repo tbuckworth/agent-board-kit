@@ -28,29 +28,30 @@ def parse_duration(text):
 
 
 def parse_time(value):
-    """ISO-8601 string (with or without zone; naive = UTC) or epoch -> epoch seconds, or None."""
+    """ISO-8601 string (with or without zone; naive = UTC) or epoch -> epoch seconds. None for no time (None, "" or
+    the modal CLI's "Pending"); raises ValueError for anything else it cannot read."""
     if value in (None, "", "Pending"):
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    s = str(value).strip().replace("Z", "+00:00")
-    try:
-        t = dt.datetime.fromisoformat(s)
-    except ValueError:
-        return None
+    t = dt.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
     if t.tzinfo is None:
         t = t.replace(tzinfo=UTC)
     return t.timestamp()
 
 
+def local_time(epoch):
+    """The time in the system's time zone, the one every local time the watchdog shows or keeps (the digest hour) is
+    in."""
+    return dt.datetime.fromtimestamp(epoch, UTC).astimezone()
+
+
 def iso(epoch, local=False):
     if epoch is None:
         return "-"
-    t = dt.datetime.fromtimestamp(epoch, UTC)
     if local:
-        t = t.astimezone()
-        return t.strftime("%Y-%m-%d %H:%M %Z")
-    return t.strftime("%Y-%m-%d %H:%M UTC")
+        return local_time(epoch).strftime("%Y-%m-%d %H:%M %Z")
+    return dt.datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def age(seconds):
@@ -95,7 +96,8 @@ def json_tail(text, opener="["):
     return json.loads(text[i:])
 
 
-def modal_user(res):
-    """Who is behind a Modal app: its latest deployer, else (a `modal run` app) its creator."""
+def launched_by(res):
+    """Who is behind a resource: its latest deployer, else its creator (a `modal run` app has no deployer);
+    None if the provider records neither."""
     keys = res.keys()   # a collector dict or a sqlite Row
     return (res["deployed_by"] if "deployed_by" in keys else None) or (res["created_by"] if "created_by" in keys else None)

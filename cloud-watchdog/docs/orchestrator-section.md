@@ -1,14 +1,14 @@
 ## cloud-watchdog threads
 
 cloud-watchdog emails {{OWNER_NAME}} with `agent-mail send --unrouted`, so replies to those threads come to you.
-Their subjects start `[cloud-watchdog`. Turn the reply into exactly one command, run it, and reply in-thread
-with its output:
+Their subjects start `[cloud-watchdog`. Turn the reply into exactly one command, run it on the machine
+cloud-watchdog runs on, and reply in-thread with its output:
 
 | {{OWNER_NAME}} says | Run |
 |---|---|
 | "close it", "stop it", "kill it" | `cloud-watch close wd-N --by human --reason "{{OWNER_NAME}}: <their words>"` |
 | "keep it", "leave it 48h", "it's fine until Friday" | `cloud-watch ack wd-N --by human --keep <duration> --reason "{{OWNER_NAME}}: <their words>"` (default 24h) |
-| "stay in shadow", "not yet" | `cloud-watch mode shadow --by human` (add `--days 7` to go live by itself after 7 days) |
+| "stay in shadow", "not yet" | `cloud-watch mode shadow --by human` (add `--days N` only if they name a period: it then goes live by itself after N days) |
 | "turn it off", "stop emailing" | `cloud-watch mode off --by human` |
 | "go live now" | `cloud-watch mode live --by human` |
 

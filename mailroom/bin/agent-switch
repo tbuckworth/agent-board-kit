@@ -2,20 +2,13 @@
 """agent-switch: move a live agent to another CLI, Claude login, model or effort (the agent board's right-click).
 
     agent-switch NAME --options [--json]          # what it runs now, whether it is busy, and every choice
-    agent-switch NAME --to claude:personal|claude:work|codex [--model M] [--effort E] [--force] [--dry-run] [--json]
-    agent-switch NAME --model M [--effort E] [--force] [--json]       # same CLI and login, new model or effort
+    agent-switch NAME --to claude:LOGIN|codex [--model M] [--effort E] [--force] [--dry-run] [--json]
+    agent-switch NAME [--model M] [--effort E] [--force] [--dry-run] [--json]   # same CLI and login; one or both
 
-Claude Code to Claude Code (another login, model or effort) and Codex to Codex (model or effort) continue the same
-conversation in the same tmux pane. Claude Code <-> Codex is a handoff: the new CLI starts in the same pane and
-folder, reads a handoff record (original brief + condensed conversation), and the agent's mail routing moves to the
-new session. An idle agent switches at once; a busy one needs --force, which cuts its turn off and tells it so.
-Exit codes: 0 switched (or nothing to do), 3 busy and --force not given, 2 refused (unknown agent, target or model,
-or not agent-spawn's tmux layout), 1 the switch was attempted and failed. Desktop only.
-Mechanics and limits: agentmail/switch.py.
+Desktop only. Details: README.md, section "Switching an agent (CLI, login, model, effort)"; mechanics:
+agentmail/switch.py.
 """
 import argparse
-import importlib.machinery
-import importlib.util
 import json
 import signal
 import sys
@@ -23,49 +16,29 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import config, statuslog, switch  # noqa: E402
-
-BIN = Path(__file__).resolve().parent
-FAILOVER_STATE = config.STATE_DIR / "failover.json"
+from agentmail import config, failover, launch, statuslog, switch  # noqa: E402
+from agentmail.trust import claude_json_for, ensure_trust  # noqa: E402
 
 
-def spawn_module():
-    loader = importlib.machinery.SourceFileLoader("agent_spawn", str(BIN / "agent-spawn"))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    sp = importlib.util.module_from_spec(spec)
-    loader.exec_module(sp)
-    return sp
-
-
-def helpers():
-    sp = spawn_module()
-
+def helpers(cfg):
     def trust(cwd, config_dir):
-        return sp.ensure_trust(cwd, sp.claude_json_for(config_dir))
+        return ensure_trust(cwd, claude_json_for(config_dir))
 
     def preamble(st, cli):
-        return sp.preamble(st["name"] or st["id"][:8], st["cwd"], statuslog.git_facts(st["cwd"])["branch"], cli)
+        return launch.preamble(cfg, st["name"] or st["id"][:8], st["cwd"], statuslog.git_facts(st["cwd"])["branch"],
+                               cli, "")
 
     def rehome(old_cli, old_sid, new_cli, new_sid, name, cwd):
         from agentmail.store import Store
-        return Store().rehome(old_cli, old_sid, new_cli, new_sid, name, cwd, config.load().get("host_id") or "desktop")
+        return Store().rehome(old_cli, old_sid, new_cli, new_sid, name, cwd, origin_host=cfg["host_id"])
     return trust, preamble, rehome
-
-
-def forget_failover(session_id):
-    """A switch by hand is the owner's choice: agent-failover must not move the agent back to an earlier login."""
-    try:
-        st = json.loads(FAILOVER_STATE.read_text())
-    except (OSError, ValueError):
-        return
-    if st.get("sessions", {}).pop(session_id, None) is not None:
-        FAILOVER_STATE.write_text(json.dumps(st, indent=1))
 
 
 def show_options(opts):
     a = opts["agent"]
     print("%s: %s%s, model %s, effort %s, %s%s" % (
-        a["name"], a["cli"], (" (%s login)" % a["account"]) if a["cli"] == "claude" else "", a["model"], a["effort"],
+        a["name"], a["cli"], (" (%s login)" % a["account"]) if a["cli"] == "claude" else "", a["model"] or "unknown",
+        a["effort"] or "unknown",
         "BUSY (switching will interrupt it)" if a["busy"] else "idle",
         "" if a["movable"] else "; cannot switch: " + a["why_not"]))
     for t in opts["targets"]:
@@ -95,7 +68,7 @@ def main(argv=None):
             return 0
         if not (a.to or a.model or a.effort):
             ap.error("give --to, --model or --effort (or --options)")
-        trust, preamble, rehome = helpers()
+        trust, preamble, rehome = helpers(cfg)
         res = switch.switch(a.name, cfg, to=a.to, model=a.model, effort=a.effort, force=a.force, dry_run=a.dry_run,
                             trust=trust, preamble=preamble, rehome=rehome)
     except switch.SwitchError as e:
@@ -104,12 +77,15 @@ def main(argv=None):
         else:
             print("agent-switch: %s" % e, file=sys.stderr)
         return 2
-    if res["ok"] and not a.dry_run and not res["detail"].startswith("already"):
-        sess = switch.find(a.name, cfg) if not res.get("new_id") else None
-        sid = res.get("new_id") or (sess or {}).get("id", "")
-        forget_failover(sid)
-        statuslog.append({"cli": "codex" if "Codex" in res["to"] else "claude", "session_id": sid, "name": a.name,
-                          "event": "switch", "text": "%s -> %s: %s" % (res["from"], res["to"], res["detail"][:200])})
+    if not (a.dry_run or res["needs_force"] or res["detail"].startswith("already")):   # an attempt was made
+        sid = res.get("new_id") or res["id"]
+        cli = "codex" if "Codex" in res["to"] else "claude"
+        if res["ok"] and cli == "claude":   # the owner's choice, which agent-failover leaves alone
+            failover.STATE.write(failover.switched_by_hand(failover.STATE.read(), sid, time.time()))
+        statuslog.append({"cli": cli, "session_id": sid, "name": a.name,
+                          "event": "switch", "text": "%s -> %s: %s%s" % (res["from"], res["to"],
+                                                                        "" if res["ok"] else "FAILED ",
+                                                                        res["detail"][:200])})
     if a.json:
         print(json.dumps(res, indent=1))
     else:

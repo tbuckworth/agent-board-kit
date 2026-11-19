@@ -39,9 +39,22 @@ private let sshPath = "/usr/bin/ssh"
 private let sshOptions = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
                           "-o", "ServerAliveCountMax=2", "-o", "ControlMaster=no", "-T"]
 
+/// The link to todo-desk as the Store uses it: JSON requests answered on the main queue, events and state
+/// changes through the callbacks. DeskLink is the real one; the self-tests and the offscreen renderer use a
+/// FakeDesk (FakeDesk.swift), since the real one needs ssh to the desktop.
+protocol DeskChannel: AnyObject {
+    var onEvent: (([String: Any]) -> Void)? { get set }
+    var onState: ((LinkState) -> Void)? { get set }
+    var onConnect: (() -> Void)? { get set }
+    var state: LinkState { get }
+    func start()
+    func stop()
+    func request(_ obj: [String: Any], timeout: TimeInterval, completion: @escaping (Result<[String: Any], LinkError>) -> Void)
+}
+
 /// The one long-lived `ssh HOST todo-desk serve`. JSON lines both ways: requests carry an id the reply repeats;
 /// everything else is an event. Reconnects with backoff, and restarts if the helper goes quiet (it pings every 20 s).
-final class DeskLink {
+final class DeskLink: DeskChannel {
     var onEvent: (([String: Any]) -> Void)?
     var onState: ((LinkState) -> Void)?
     var onConnect: (() -> Void)?
@@ -125,7 +138,7 @@ final class DeskLink {
     }
 
     /// Send one request; the completion runs on the main queue with the helper's reply (ok true) or an error.
-    func request(_ obj: [String: Any], timeout: TimeInterval = 90,
+    func request(_ obj: [String: Any], timeout: TimeInterval,
                  completion: @escaping (Result<[String: Any], LinkError>) -> Void) {
         guard state.isLive, let h = stdin else {
             DispatchQueue.main.async { completion(.failure(LinkError(message: "the desktop is not connected", offline: true))) }
@@ -173,7 +186,11 @@ final class DeskLink {
         while let nl = buffer.firstIndex(of: 0x0A) {
             let line = buffer.subdata(in: buffer.startIndex..<nl)
             buffer.removeSubrange(buffer.startIndex...nl)
-            guard !line.isEmpty, let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            guard !line.isEmpty else { continue }
+            guard let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+                unreadable(line, gen: gen)
+                continue
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, self.generation == gen else { return }
                 self.lastData = Date()
@@ -196,6 +213,33 @@ final class DeskLink {
                 }
             }
         }
+    }
+
+    /// A line from the helper that isn't a JSON object. A reply's id is found the way todo-desk writes it
+    /// (`"id": N, "ok": ...`), and that request fails at once rather than waiting out its timeout; a line
+    /// with no id is reported as an error event.
+    private func unreadable(_ line: Data, gen: Int) {
+        let text = String(decoding: line, as: UTF8.self)
+        let id = DeskLink.replyID(text)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.generation == gen else { return }
+            self.lastData = Date()
+            let why = "the desktop sent a line that couldn't be read: " + String(text.prefix(160))
+            if let id = id, self.waiting[id] != nil {
+                self.finish(id, .failure(LinkError(message: why, offline: false)))
+            } else {
+                self.onEvent?(["type": "error", "error": why])
+            }
+        }
+    }
+
+    private static let replyIDPattern = try! NSRegularExpression(pattern: #""id":\s*(\d+),\s*"ok":"#)
+
+    /// The request id in a reply line that didn't parse (the last match: replies put it after the result).
+    static func replyID(_ text: String) -> Int? {
+        let ns = text as NSString
+        guard let m = replyIDPattern.matches(in: text, range: NSRange(location: 0, length: ns.length)).last else { return nil }
+        return Int(ns.substring(with: m.range(at: 1)))
     }
 
     private func ended(gen: Int, status: Int32) {

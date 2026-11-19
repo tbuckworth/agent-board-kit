@@ -5,7 +5,7 @@ the credentialed child. Read-only: TokenInfoGet and AppGetLifecycle only. Standa
 interpreter has `modal` but not this package.
 
     <modal python> -I modal_api.py  < {"app_ids": ["ap-...", ...]}
-    -> {"token_user": "alex-1234", "workspace": "my-workspace", "apps": {"ap-...": {...}}, "errors": {...}}
+    -> {"token_user": "alex-1234", "apps": {"ap-...": {...}}, "errors": {...}}
 """
 import asyncio
 import json
@@ -24,7 +24,6 @@ async def main(req):
     out = {"apps": {}, "errors": {}}
     try:
         ti = await client.stub.TokenInfoGet(api_pb2.TokenInfoGetRequest())
-        out["workspace"] = ti.workspace_name
         out["token_user"] = ti.user_identity.username or ti.service_user_identity.service_user_name or None
     except Exception as e:  # noqa: BLE001 - the lookups below are what matters
         out["errors"]["token"] = type(e).__name__
@@ -41,8 +40,7 @@ async def main(req):
                     out["errors"][app_id] = type(e).__name__
                 return
             out["apps"][app_id] = {"created_by": lc.created_by or None, "deployed_by": lc.deployed_by or None,
-                                   "state": STATES.get(lc.app_state, str(lc.app_state)),
-                                   "created_at": lc.created_at or None}
+                                   "state": STATES.get(lc.app_state, str(lc.app_state))}
 
     await asyncio.gather(*(one(a) for a in req.get("app_ids") or []))
     print(json.dumps(out))

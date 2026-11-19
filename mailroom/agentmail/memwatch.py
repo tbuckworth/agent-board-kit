@@ -1,17 +1,14 @@
 """Memory watch: warn the agents holding the most memory before the machine runs out.
 
-One agent's batch of parallel workers can fill RAM and swap; the kernel then kills small services one by one
-(the mailroom among them) and finally the user systemd manager, which ends every agent. A plain message to the
-agent that started the batch is usually enough for it to cut its workers. This sends that message automatically:
-
-- warn (default 80% of RAM in use): message the agents that hold most of it;
-- urgent (90% of RAM, or 80% with swap half full): message them again, urgently, and email the owner the table;
-- cap: an agent whose own scope (agent-NAME.scope, see memcap) is at 90% of its MemoryMax is told before
-  the cap kills its batch.
+An agent told that its batch is filling the machine can cut its workers before the kernel starts killing services.
+Three levels, with thresholds in DEFAULTS: warn messages the agents that hold most of the RAM in use; urgent
+messages them again and emails the owner the table; cap tells an agent whose own scope (agent-NAME.scope, see
+memcap) nears its MemoryMax, before the cap kills its batch.
 
 "In use" is RAM the kernel cannot reclaim (MemTotal - MemAvailable). Each process's anonymous memory plus swap is
-charged to the nearest ancestor that is a Claude or Codex session; the rest is listed by its cgroup unit.
-Pure functions here, so the decisions are testable; bin/agent-memwatch does the reading, sending and looping.
+charged to a Claude or Codex session, or else to its cgroup unit (owners).
+The readers here read /proc and /sys (meminfo, processes, cgroup_limits, env_session_id); the decisions are pure
+functions, so they are testable; bin/agent-memwatch samples, sends and loops.
 """
 import os
 from pathlib import Path
@@ -21,21 +18,20 @@ DEFAULTS = {
     "urgent_pct": 90,           # RAM in use, %: message again, urgently, and email the owner
     "swap_urgent_pct": 50,      # swap in use, %: with RAM at warn_pct or more, counts as urgent (see level)
     "rearm_pct": 75,            # below this the agent messages re-arm
-    "interval_seconds": 15,
+    "interval_seconds": 15,     # between samples
     "repeat_minutes": 30,       # per agent and level
-    "email_repeat_minutes": 60,
+    "email_repeat_minutes": 60,  # between emails
     "cap_warn_pct": 90,         # of an agent scope's own MemoryMax
     "min_agent_gb": 2,          # agents holding less are never messaged
-    "max_agents": 3,
-    "email": True,
+    "max_agents": 3,            # messaged at most, biggest first
+    "email": True,              # whether urgent emails the owner
 }
 GB = 1 << 30
 
 
 def settings(cfg):
-    s = dict(DEFAULTS, **(cfg.get("memwatch") or {}))
-    s.setdefault("owner_name", (cfg.get("owner_name") or "").strip() or "the owner")
-    return s
+    """DEFAULTS with config memwatch over them, and owner_name: config's, for the texts agents are sent."""
+    return dict(DEFAULTS, owner_name=cfg["owner_name"], **(cfg.get("memwatch") or {}))
 
 
 # ------------------------------------------------------------------ reading
@@ -59,10 +55,10 @@ def usage(mi):
             "swap_pct": 100.0 * swap_used / swap_total if swap_total else 0.0}
 
 
-def processes(proc="/proc"):
+def processes():
     """[{pid, ppid, comm, mem (anon + swap bytes), cgroup}] for every process we can read."""
     out = []
-    for d in Path(proc).iterdir():
+    for d in Path("/proc").iterdir():
         if not d.name.isdigit():
             continue
         try:
@@ -79,10 +75,10 @@ def processes(proc="/proc"):
     return out
 
 
-def cgroup_limits(path, root="/sys/fs/cgroup"):
+def cgroup_limits(path):
     """(anonymous memory + swap, memory.max or None) of one cgroup. Not memory.current: page cache counts there,
     and the kernel reclaims it before the cap bites, so an agent reading big files would look full."""
-    base = Path(root + path)
+    base = Path("/sys/fs/cgroup" + path)
     try:
         stat = dict(line.split() for line in (base / "memory.stat").read_text().splitlines())
         swap = (base / "memory.swap.current").read_text().strip() if (base / "memory.swap.current").exists() else "0"
@@ -167,9 +163,9 @@ def owners(procs, sessions_by_pid, sessions=(), env_of=env_session_id, env_min=1
 
 # ------------------------------------------------------------------ decisions
 def level(u, s):
-    """0 quiet, 1 warn, 2 urgent. Swap filling while RAM is full is what made 2026-10-05 fatal, but swap alone
-    means nothing: pages swapped out under past pressure stay there until touched. On 2026-10-25 swap sat at 60%
-    with RAM at 14% and no memory pressure, and counting it alone emailed the owner every hour all night."""
+    """0 quiet, 1 warn, 2 urgent. Swap counts only with RAM at warn_pct or more: swap filling while RAM is full is
+    what runs the machine out, but pages swapped out under past pressure stay there until touched, so swap alone
+    can sit high for hours with no memory pressure."""
     if u["ram_pct"] >= s["urgent_pct"]:
         return 2
     if u["ram_pct"] < s["warn_pct"]:
@@ -190,32 +186,35 @@ def targets(u, own, s):
 
 
 def decide(state, u, own, caps, s, now):
-    """-> (actions, new state). actions: ("ping", owner, level, text) | ("email", subject, body).
-    `caps`: [(owner, current, max)] for agent scopes near their own MemoryMax."""
-    state = {"sent": dict(state.get("sent", {}))}
-    sent = state["sent"]
+    """-> (actions, new state). actions: ("ping", owner, level, text, key) | ("email", subject, body, key); key is
+    what record() keeps once the action is sent. The new state has re-armed what the level allows, and records no
+    action: the caller records those it sent. `caps`: [(owner, current, max)] for agent scopes near their own
+    MemoryMax."""
+    sent = dict(state.get("sent", {}))
     lvl = level(u, s)
     actions = []
     if lvl == 0 and u["ram_pct"] < s["rearm_pct"]:
         # agent messages re-arm; the email keeps its hourly limit, so a level bouncing around 80% mails the owner once
-        sent = state["sent"] = {k: v for k, v in sent.items() if k.startswith("cap:") or k == "email"}
+        sent = {k: v for k, v in sent.items() if k.startswith("cap:") or k == "email"}
     due = lambda key, minutes: key not in sent or now - sent[key] >= minutes * 60  # noqa: E731
     if lvl:
         warned = targets(u, own, s)
         for g in warned:
             key = "%s:%d" % (g["key"], lvl)
             if due(key, s["repeat_minutes"]):
-                actions.append(("ping", g, lvl, ping_text(u, g, lvl, s)))
-                sent[key] = now
+                actions.append(("ping", g, lvl, ping_text(u, g, lvl, s), key))
         if lvl == 2 and s["email"] and due("email", s["email_repeat_minutes"]):
-            actions.append(("email",) + email_text(u, own, warned, s))
-            sent["email"] = now
+            actions.append(("email",) + email_text(u, own, warned, s) + ("email",))
     for g, cur, mx in caps:
         key = "cap:" + g["key"]
         if g["session"] and cur >= mx * s["cap_warn_pct"] / 100 and due(key, s["repeat_minutes"]):
-            actions.append(("ping", g, "cap", cap_text(g, cur, mx)))
-            sent[key] = now
-    return actions, state
+            actions.append(("ping", g, "cap", cap_text(g, cur, mx), key))
+    return actions, {"sent": sent}
+
+
+def record(state, keys, now):
+    """The state with these actions' keys (decide) recorded as sent at `now`: their repeat limits start."""
+    return {"sent": dict(state.get("sent", {}), **{k: now for k in keys})}
 
 
 # ------------------------------------------------------------------ text
@@ -233,11 +232,10 @@ def what(g):
 
 
 def ping_text(u, g, lvl, s):
-    owner = s.get("owner_name") or "the owner"
     tail = ("At %d%% %s is emailed; when memory runs out the kernel starts killing other agents and services."
-            % (s["urgent_pct"], owner)) if lvl == 1 else (
-            "URGENT: %s has been emailed. If memory runs out the kernel kills other agents and services, and it can "
-            "kill the user manager, ending every session." % owner)
+            % (s["urgent_pct"], s["owner_name"])) if lvl == 1 else (
+            "URGENT: %s has been emailed. If memory runs out the kernel kills other agents and services, and it "
+            "can kill the user manager, which ends every session." % s["owner_name"])
     return ("[agent-memwatch] %s Your session's processes hold %s (%s). If that is a batch you started, cut its "
             "workers or pause it now, and say so in your next note. %s" % (headline(u), gb(g["mem"]), what(g), tail))
 

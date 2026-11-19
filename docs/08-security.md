@@ -15,6 +15,14 @@ without permission prompts on your machine. That is the point, and it is also th
   collaborator's mail is the main risk here; leave the list empty unless you need it.
 - **Everyone else**: held, never delivered, never shown to a model. You can read held mail with
   `agent-mail show N`.
+- **The board** (over its ssh connection, as you): your messages, your **Mail tab** replies and your
+  group-chat posts. A Mail-tab reply gets no DKIM check, since it comes through no mail server: it is
+  trusted because it arrives over your own ssh login. `agent-mail mailbox mark|sync|answer` and
+  `agent-group --as owner` refuse to run inside an agent session (they check the session variables),
+  but any process of your user that clears them can claim to be you: the same limit as `agent-send`.
+- **Other agents, in group chats**: an agent's post reaches the other members marked as an agent's post,
+  information and never an instruction, and a peer relaying "the owner said yes" is not your yes.
+  Agents' posts never become mail to you.
 - **Local processes** can message any session with `agent-send`. Anything running as your user can
   already do what an agent can, so this adds no new trust boundary.
 
@@ -48,6 +56,10 @@ command your user can. Mitigations, in order of value:
 | `~/.config/agent-mail/credentials.json` | your OAuth client id/secret | mode 600; identifies your private app |
 | `~/.config/agent-mail/token.json` | the agents' Gmail refresh token (`gmail.modify`) | mode 600, dir 700; revoke at myaccount.google.com/permissions |
 | `~/.config/agent-kit/kit.env` | names and addresses only | no secrets |
+| board `gmail_credentials` (optional) | a refresh token for **your own** Gmail: `gmail.readonly` for the read-check, `gmail.modify` for the Mail tab's Sync with Gmail, which changes only the Inbox and Unread labels of the agents' mail | mode 600; checked to belong to your address before use; off unless you name it |
+| board `google_token` (optional) | a refresh token for your Google account, read-only: `calendar.readonly` (Time page, meeting alerts) and `drive.metadata.readonly` (the Time page's documents) | mode 600; off unless you name it |
+
+`kit doctor` checks that each of these files is private.
 
 When a Claude login is out, the orchestrator moves on to the next login in `usage.order`, then Codex.
 On Codex it runs with `--ignore-user-config`, so no MCP server from your Codex config (a Gmail one,
@@ -60,6 +72,16 @@ written to disk or logged). That step is off by default.
 - The status log holds events and your agents' one-line notes, never message content.
 - The mailroom stores routing data (message ids, thread ids, session ids, subjects) in
   `~/.local/state/agent-mail/mailroom.sqlite` and keeps inbound mail bodies so `agent-mail show`
-  works. Treat that directory as private.
+  works. It also keeps **every mail an agent sends**, exactly as sent, in
+  `~/.local/state/agent-mail/messages/` (mode 600, never deleted; the board's Mail tab reads it), and
+  the files of your Mail-tab replies under `~/.local/state/agent-mail/files/`. With `MAIL_BACKUP_DIRS`
+  set, the store and the database are copied to those directories every hour: keep them on a disk only
+  you can read. Treat all of it as private.
+- The board's Mail tab shows mail as sanitised HTML in a locked-down web view: no JavaScript from the
+  mail, no loads, no cookies, and links open outside. Options and plots are drawn by the app's own code
+  from the agent's data. Files you copy from the Mac go to `~/.local/state/agent-board/mail-files/`.
+- The board's Time page sends the titles of tiles, documents and mail (never their text) to
+  `claude -p` (no tools) to guess groups for what you have not grouped; `"guess_model": null` in
+  `~/.config/agent-board/time.json` stops it.
 - The board's optional "has my mail been read" check reads only message metadata from your own
   Gmail, with your own OAuth token, and only if you configure it.

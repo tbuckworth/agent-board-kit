@@ -1,39 +1,29 @@
-"""One timer tick: collect -> ingest -> rules/ladder -> digest -> heartbeat."""
+"""One timer tick: collect -> ingest -> blind alerts and digest lines -> quiet owner search -> ladder -> digest."""
 import concurrent.futures as cf
 import fcntl
+import hashlib
 import json
 import shutil
 import tempfile
 
-from . import config, digest, gather, ladder, messages, modes, notify, observe, owner, rules, spend, state, util
+from . import (config, digest, gather, investigator, ladder, messages, modes, notify, observe, owner, providers, rules,
+               spend, state, util)
+
+QUIET_OWNER_MAX_AGE_S = 6 * 3600   # quiet attribution searches again for an owner it could not find after this long
+LAST_OK = "last_ok_at"   # meta key: when the last check finished (`cloud-watch status` and the heartbeat read it)
 
 
-def collect_opts(db, cfg, account, now, slow):
-    opts = {"now": now, "slow": slow, "crash_window_min": cfg["rules"]["crash_loop"]["window_min"],
-            "our_ssh_keys": cfg["identity"].get("owner_lambda_ssh_keys") or [], "idle_pattern": cfg["rules"]["idle_gpu"]["work_pattern"],
-            "idle_gpu_max": cfg["rules"]["idle_gpu"]["gpu_util_max_pct"]}
-    if cfg["accounts"][account]["provider"] == "modal":
-        rows = db.q("select r.native_id, r.crash_streak, r.health, r.deployed_by, r.git_commit, r.extra, "
-                    "(select count(*) from incidents i where i.key=r.key and i.closed_at is null) open_inc "
-                    "from resources r where r.account=? and r.gone_at is null", account)
-        opts["watch"] = [r["native_id"] for r in rows if r["crash_streak"] or r["health"] == "crash_loop" or r["open_inc"]]
-        opts["known_history"] = {r["native_id"]: {"deployed_by": r["deployed_by"], "git_commit": r["git_commit"],
-                                                  "deployed_at": json.loads(r["extra"] or "{}").get("deployed_at")}
-                                 for r in rows if r["deployed_by"]}
-        creators = {r["app_id"]: r["created_by"] for r in db.q(
-            "select app_id, created_by from modal_app_owner where account=? and created_by is not null", account)}
-        creators.update({r["native_id"]: r["created_by"] for r in db.q(
-            "select native_id, created_by from resources where account=? and created_by is not null", account)})
-        opts["known_creator_of"] = creators
-        if cfg.get("modal_python"):
-            opts["modal_python"] = cfg["modal_python"]
-        if slow:
-            opts["known_creators"] = spend.known_ids(db, account, now)
+def collect_opts(db, cfg, account, now, slow, inventory_only):
+    """The options of one account's collect: `now`, `slow`, `inventory_only` (list the resources, without health
+    probes or lookups), and what the provider's collect_options adds."""
+    opts = {"now": now, "slow": slow, "inventory_only": inventory_only}
+    mod = providers.get(cfg["accounts"][account]["provider"])
+    if hasattr(mod, "collect_options"):
+        opts.update(mod.collect_options(db, cfg, account, now, slow))
     return opts
 
 
-def run(cfg=None, dry_run=False, force_slow=False, only=None, quiet=False, now=None):
-    cfg = cfg or config.load()
+def run(cfg, dry_run=False, force_slow=False, only=None):
     config.STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock = open(config.LOCK_PATH, "a+")
     try:
@@ -52,7 +42,7 @@ def run(cfg=None, dry_run=False, force_slow=False, only=None, quiet=False, now=N
             if config.DB_PATH.exists():
                 state.DB().c.execute("vacuum into ?", (db_path,))
         try:
-            return _run(state.DB(db_path), cfg, dry_run, force_slow, only, now or util.now())
+            return _run(state.DB(db_path), cfg, dry_run, force_slow, only, util.now())
         finally:
             if tmp:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -61,22 +51,32 @@ def run(cfg=None, dry_run=False, force_slow=False, only=None, quiet=False, now=N
         lock.close()
 
 
+def record_config(db, cfg, now):
+    """Log the merged config as a `config` action when it differs from the one the last check logged."""
+    config_hash = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
+    if db.meta("config_hash") != config_hash:
+        db.log("config", cfg, shadow=False, now=now)
+        db.set_meta("config_hash", config_hash)
+
+
 def _run(db, cfg, dry_run, force_slow, only, now):
+    if not dry_run:
+        record_config(db, cfg, now)
     mode, switched = modes.effective(db, now)
     summary = {"mode": mode, "dry_run": dry_run, "accounts": {}, "switched_live": switched}
     if mode == "off" and not dry_run:
-        db.set_meta("last_ok_at", now)
+        db.set_meta(LAST_OK, now)
         return summary
     live = mode == "live" and not dry_run
-    notifier = notify.Notifier(db, cfg, shadow=not live, now=now)
+    notifier = notify.Notifier(db, cfg, shadow=not live, now=now, run=util.run, op=gather.op)
     if switched and not dry_run:
         users = cfg["identity"].get("owner_modal_users") or []
-        stops = (" and stops crash-looping Modal apps deployed by %s (on accounts with auto_stop = true)"
-                 % "/".join(users)) if users else "; it never stops anything itself (identity.owner_modal_users is empty)"
-        notifier.send("[cloud-watchdog] Now live",
+        stops = (" and stops crash-looping Modal apps that %s deployed (or, for `modal run` apps, created), on "
+                 "accounts with auto_stop = true" % "/".join(users)) if users else \
+            "; it never stops anything itself (identity.owner_modal_users is empty)"
+        notifier.send(messages.subject("Now live"),
                       "The shadow period is over: from now on the watchdog messages the agents that own resources, "
-                      "emails you%s. Reply \"back to shadow\" or \"off\" to change that." % stops
-                      + messages.footer(None, cfg=cfg))
+                      "emails you%s. Reply \"stay in shadow\" or \"turn it off\" to change that." % stops)
 
     # 1. collect, in parallel, one credentialed child per account
     jobs = {}
@@ -84,11 +84,12 @@ def _run(db, cfg, dry_run, force_slow, only, now):
         for account, acct in cfg["accounts"].items():
             if only and account not in only:
                 continue
-            h = db.one("select * from collector_health where account=?", account)
+            h = db.collector_health(account)
             slow = force_slow or not h or not h["last_slow_at"] or now - h["last_slow_at"] >= cfg["slow_interval_min"] * 60
             if acct.get("slow_only") and not slow:
                 continue
-            jobs[pool.submit(gather.op, account, acct, "collect", collect_opts(db, cfg, account, now, slow))] = (account, slow)
+            opts = collect_opts(db, cfg, account, now, slow, inventory_only=False)
+            jobs[pool.submit(gather.op, acct, "collect", opts)] = (account, slow)
         results = [(jobs[f], f.result()) for f in cf.as_completed(jobs)]
 
     # 2. ingest
@@ -96,67 +97,79 @@ def _run(db, cfg, dry_run, force_slow, only, now):
         summary["accounts"][account] = ingest_account(db, cfg, account, slow, ok, res, now)
 
     # 3. blind collectors
-    for h in db.q("select * from collector_health where consecutive_failures>=? and alerted=0",
-                  cfg["rules"]["blind"]["consecutive_failures"]):
-        subject, md = messages.blind(h["account"], h, now, cfg=cfg)
-        if live:
-            notifier.email(subject, md, key=h["account"])
-        else:
-            db.add_digest("blind", h["account"], "%s: check failing (%s)" % (h["account"], (h["last_error"] or "")[:120]), now)
-        db.x("update collector_health set alerted=1 where account=?", h["account"])
+    alert_blind(db, cfg, notifier, live, now)
 
-    # 4. account-level digest lines
+    # 4. account-level digest lines: daily ones on every check; weekly ones only in the check that sends the Monday
+    #    digest, so each goes out with that digest and no copy waits for the next Monday.
+    weekly = digest.due(db, cfg, now) and util.local_time(now).weekday() == 0
     for account in cfg["accounts"]:
-        for f in rules.account_findings(db, cfg, account, now):
+        for f in rules.metric_findings(db, cfg, account, weekly):
             db.add_digest(f["kind"], f["key"], f["text"], now)
-        if cfg["accounts"][account]["provider"] == "modal" and digest.digest_weekday(cfg, now) == 0:
-            for f in rules.storage_findings(db, cfg, account, now):
-                db.add_digest(f["kind"], f["key"], f["text"], now)
 
     # 5. quiet attribution of anything of ours that is billing, so `cloud-watch list` shows owners
-    book = None
-    pending = db.q("select * from resources where gone_at is null and billing_now=1 and ownership!='foreign' "
-                   "and owner_session is null and (owner_checked_at is null or owner_checked_at<?) limit 5",
-                   now - 6 * 3600)
-    for res in pending:
-        book = book if book is not None else owner.sessions()
-        upd = owner.resolve(db, cfg, res, now, book=book)
-        upd.pop("_candidates", None)
-        if upd:
-            db.update_resource(res["key"], **upd)
+    pending = [r for r in db.ours_billing() if not r["owner_session"]
+               and (r["owner_checked_at"] is None or r["owner_checked_at"] < now - QUIET_OWNER_MAX_AGE_S)][:5]
+    if pending:
+        try:
+            book = owner.sessions()
+        except owner.AddressBookError as e:
+            db.log("error", "quiet attribution skipped: %s" % e, ok=False, shadow=False, now=now)
+        else:
+            for res in pending:
+                owner.refresh(db, cfg, res, now, book, QUIET_OWNER_MAX_AGE_S, owner.resolve)
 
     # 6. the ladder
-    ladder.Ladder(db, cfg, now, notifier, live=live).process()
+    ladder.Ladder(db, cfg, now, notifier, live=live, sessions=owner.sessions, resolve_owner=owner.resolve,
+                  run_investigator=investigator.run, op=gather.op).process()
 
     # 7. digest
     if dry_run:
         if digest.due(db, cfg, now):
             summary["digest"] = "due (not sent: dry run)"
     else:
-        summary["digest_sent"] = digest.send_if_due(db, cfg, now, notifier)
+        summary["digest"] = digest.send_if_due(db, cfg, now, notifier)
 
-    if int(now) % 86400 < 700:
-        observe.prune(db, now)
-    db.set_meta("last_ok_at", now)
+    if now - db.meta("pruned_at", 0) >= 86400:   # once a day, whatever the timer's interval
+        db.prune(now)
+        db.set_meta("pruned_at", now)
+    db.set_meta(LAST_OK, now)
     summary["would"] = [dict(a) for a in db.q("select ts, key, action, detail, shadow from actions where ts>=? "
                                                 "order by ts", now)]
     return summary
+
+
+def alert_blind(db, cfg, notifier, live, now):
+    """Tell the human once about each account whose last rules.blind.consecutive_failures collections all failed: by
+    email when live (an email that fails to send is retried next check), else in the digest."""
+    for h in db.collectors(cfg["rules"]["blind"]["consecutive_failures"]):
+        if h["alerted"]:
+            continue
+        subject, md = messages.blind(h["account"], h)
+        if live:
+            if notifier.email(subject, md, key=h["account"]) == "failed":
+                continue   # not marked alerted: the next check sends it again
+        else:
+            text = "%s: check failing (%s)" % (h["account"], (h["last_error"] or "")[:120])
+            db.add_digest("blind", h["account"], text, now)
+        db.collector_alerted(h["account"])
 
 
 def ingest_account(db, cfg, account, slow, ok, res, now):
     """Record one account's collection. One transaction: a check killed mid-ingest leaves the account exactly as
     the last complete check saw it, and the next tick collects it again."""
     if not ok:
-        db.x("insert into collector_health(account, last_error, last_error_at, consecutive_failures) values(?,?,?,1) "
-             "on conflict(account) do update set last_error=excluded.last_error, last_error_at=excluded.last_error_at, "
-             "consecutive_failures=collector_health.consecutive_failures+1", account, str(res)[:500], now)
+        db.collector_failed(account, str(res)[:500], now)
         return {"ok": False, "error": str(res)[:200]}
     with db.tx():
-        gone = observe.ingest(db, cfg, account, res, now, slow)
+        if "creators" in res:   # the creator lookups the collector made (Modal)
+            spend.cache_creators(db, account, res["creators"], now)
+        gone = observe.ingest(db, cfg, account, res, now)
         if res.get("spend"):
             spend.ingest(db, cfg, account, res["spend"], res.get("metrics") or {}, now)
-        db.x("insert into collector_health(account, last_ok_at, last_slow_at, consecutive_failures, alerted) "
-             "values(?,?,?,0,0) on conflict(account) do update set last_ok_at=excluded.last_ok_at, "
-             "last_slow_at=coalesce(?, collector_health.last_slow_at), consecutive_failures=0, alerted=0",
-             account, now, now if slow else None, now if slow else None)
-    return {"ok": True, "slow": slow, "n": len([r for r in res["resources"] if not r.get("dormant")]), "gone": gone}
+        warnings = res.get("warnings", [])   # lookups that failed while the collection as a whole worked (Modal)
+        for w in warnings:
+            # One line per account and lookup a day.
+            db.add_digest("collector_warning", "%s %s" % (account, w["lookup"]), "%s: %s" % (account, w["text"]), now)
+        db.collector_ok(account, now, slow)
+    return {"ok": True, "slow": slow, "n": len([r for r in res["resources"] if not r.get("dormant")]), "gone": gone,
+            "warnings": [w["text"] for w in warnings]}

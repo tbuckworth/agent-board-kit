@@ -1,7 +1,5 @@
 import argparse
 import contextlib
-import importlib.machinery
-import importlib.util
 import io
 import json
 import os
@@ -17,7 +15,11 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agentmail import config, registry, usage  # noqa: E402
+import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
+import fakes  # noqa: E402
+from homes import Homes, config_file, dead_pid  # noqa: E402
+from scripts import load_script  # noqa: E402
+from agentmail import accounts, commands, config, launch, registry, send, trust, usage  # noqa: E402
 
 NOW = 1791300000.0  # 2026-10-06
 # Shapes as Claude Code 2.1.291 and codex-cli 0.160.0 return them (identities removed).
@@ -43,14 +45,6 @@ CODEX_RESULT = {
 }
 
 
-def load_script(name):
-    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(ROOT / "bin" / name))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
-
-
 def snap(target, windows, **kw):
     cli = "codex" if target == "codex" else "claude"
     d = {"target": target, "cli": cli, "account": None if cli == "codex" else target.split(":", 1)[1],
@@ -64,13 +58,14 @@ def win(kind, name, remaining, model=None, resets=NOW + 3600):
             "resets_at": resets, "model": model}
 
 
-PERSONAL_DIR = tempfile.mkdtemp()   # a set-up second login: its config dir with a login in it
-Path(PERSONAL_DIR, ".credentials.json").write_text("{}")
-TWO = {"usage": {"claude_accounts": {"personal": {"config_dir": PERSONAL_DIR, "exclude_owners": ["Employer-Org"]},
-                                     "work": {"config_dir": None}},
-                 "order": ["claude:personal", "claude:work", "codex"],
+PRO_DIR = tempfile.mkdtemp()   # a set-up second login: its config dir with a login in it
+Path(PRO_DIR, ".credentials.json").write_text("{}")
+TWO = {"usage": {"claude_accounts": {"pro": {"config_dir": PRO_DIR, "exclude_owners": ["Example-Org"]},
+                                     "enterprise": {"config_dir": None}},
+                 "order": ["claude:pro", "claude:enterprise", "codex"],
                  "min_remaining": {"session": 15, "weekly": 10}},
        "spawn_claude_model": "claude-opus-5-5", "spawn_codex_model": "gpt-6.1-sol"}
+LADDER = dict(TWO, spawn_claude_model="claude-fable-5-2", claude_fallback_models=["claude-opus-5-5"])
 
 
 class Parsing(unittest.TestCase):
@@ -170,15 +165,15 @@ class Reading(unittest.TestCase):
         err = json.dumps({"type": "control_response", "response": {"subtype": "error", "error": "not supported"}})
         with self.assertRaisesRegex(usage.UsageError, "not supported"):
             usage.fetch_claude({}, claude="/bin/claude", run=self.fake_run(err, calls))
-        with self.assertRaisesRegex(usage.UsageError, "no usage answer"):
+        with self.assertRaisesRegex(usage.UsageError, "no answer to get_usage"):
             usage.fetch_claude({}, claude="/bin/claude", run=self.fake_run("", calls))
         with self.assertRaisesRegex(usage.UsageError, "does not exist"):
             usage.fetch_claude({"config_dir": "/nonexistent/claude-x"}, claude="/bin/claude", run=self.fake_run("", calls))
         d = tempfile.mkdtemp()
-        with mock.patch.object(usage.sys, "platform", "linux"), self.assertRaisesRegex(usage.UsageError, "no login"):
+        with mock.patch.object(accounts.sys, "platform", "linux"), self.assertRaisesRegex(usage.UsageError, "no login"):
             usage.fetch_claude({"config_dir": d}, claude="/bin/claude", run=self.fake_run("", calls))
         self.assertEqual(len(calls), 2)   # the not-ready accounts never started claude
-        self.assertEqual(usage.account_ready({"config_dir": d}, platform="darwin"), (True, ""))   # Keychain login
+        self.assertEqual(accounts.account_ready({"config_dir": d}, platform="darwin"), (True, ""))   # Keychain login
 
     def test_codex_app_server_protocol(self):
         fake = Path(tempfile.mkdtemp()) / "codex"
@@ -198,21 +193,21 @@ class Reading(unittest.TestCase):
 
 
 class Deciding(unittest.TestCase):
-    def snaps(self, personal_w, work_w, cx=(win("weekly", "weekly", 90),), **kw):
-        return {"claude:personal": snap("claude:personal", list(personal_w)), "claude:work": snap("claude:work", list(work_w), **kw),
+    def snaps(self, pro, ent, cx=(win("weekly", "weekly", 90),), **kw):
+        return {"claude:pro": snap("claude:pro", list(pro)), "claude:enterprise": snap("claude:enterprise", list(ent), **kw),
                 "codex": snap("codex", list(cx))}
 
     def test_pro_first_while_it_has_headroom(self):
         rec = usage.recommend(self.snaps([win("session", "5-hour", 60), win("weekly", "weekly", 70)],
                                          [win("session", "5-hour", 100)]), TWO, now=NOW)
-        self.assertEqual((rec["use"], rec["cli"], rec["account"]), ("claude:personal", "claude", "personal"))
+        self.assertEqual((rec["use"], rec["cli"], rec["account"]), ("claude:pro", "claude", "pro"))
         self.assertEqual(rec["avoid"], [])
 
-    def test_personal_under_threshold_moves_to_work(self):
+    def test_pro_under_threshold_moves_to_enterprise(self):
         rec = usage.recommend(self.snaps([win("session", "5-hour", 12), win("weekly", "weekly", 70)],
                                          [win("session", "5-hour", 80), win("weekly", "weekly", 50)]), TWO, now=NOW)
-        self.assertEqual(rec["use"], "claude:work")
-        self.assertEqual(rec["avoid"][0]["target"], "claude:personal")
+        self.assertEqual(rec["use"], "claude:enterprise")
+        self.assertEqual(rec["avoid"][0]["target"], "claude:pro")
         self.assertIn("under 15%", rec["avoid"][0]["why"])
 
     def test_claude_used_up_goes_to_codex_and_says_extra_usage_bills(self):
@@ -220,66 +215,104 @@ class Deciding(unittest.TestCase):
                                          extra_usage={"enabled": True}), TWO, now=NOW)
         self.assertEqual(rec["use"], "codex")
         why = {a["target"]: a["why"] for a in rec["avoid"]}
-        self.assertIn("used up", why["claude:personal"])
-        self.assertIn("bills credits", why["claude:work"])
+        self.assertIn("used up", why["claude:pro"])
+        self.assertIn("bills credits", why["claude:enterprise"])
         self.assertIn("Use codex", rec["line"])
 
-    def test_owner_exclusion_keeps_employer_repos_off_personal(self):
+    def test_each_login_on_fable_then_each_on_opus_then_codex_then_extra_usage_on_opus(self):
+        """The login and model order: personal Fable, work Fable, personal Opus 5.5, work Opus 5.5, and only then
+        work credits on Opus 5.5."""
+        def place(pro_fable, ent_fable, pro=90, ent=90, cx=90, **kw):
+            s = self.snaps([win("session", "5-hour", pro), win("model_weekly", "weekly Fable", pro_fable, "fable")],
+                           [win("session", "5-hour", ent), win("model_weekly", "weekly Fable", ent_fable, "fable")],
+                           cx=[win("weekly", "weekly", cx)], **kw)
+            rec = usage.recommend(s, LADDER, now=NOW)
+            return rec["use"], rec["model"], rec["line"]
+        self.assertEqual(place(50, 50)[:2], ("claude:pro", "claude-fable-5-2"))
+        self.assertEqual(place(0, 50)[:2], ("claude:enterprise", "claude-fable-5-2"))
+        use, model, line = place(0, 0)
+        self.assertEqual((use, model), ("claude:pro", "claude-opus-5-5"))
+        self.assertIn("Use claude:pro on claude-opus-5-5: ", line)
+        self.assertIn("Avoid claude:pro on claude-fable-5-2 (weekly Fable window used up", line)
+        self.assertEqual(place(0, 0, pro=0)[:2], ("claude:enterprise", "claude-opus-5-5"))
+        self.assertEqual(place(0, 0, pro=0, ent=0)[:2], ("codex", "gpt-6.1-sol"))
+        use, model, line = place(0, 0, pro=0, ent=0, cx=0, extra_usage={"enabled": True})
+        self.assertEqual((use, model), ("claude:enterprise", "claude-opus-5-5"))   # never Fable on extra usage
+        self.assertIn("this one bills its extra usage", line)
+        # an explicit model is the only one tried, as before
+        s = self.snaps([win("session", "5-hour", 90), win("model_weekly", "weekly Fable", 0, "fable")], [])
+        rec = usage.recommend(s, LADDER, models={"claude": "claude-fable-5-2"}, only_cli="claude", now=NOW)
+        self.assertEqual((rec["use"], rec["model"]), ("claude:enterprise", "claude-fable-5-2"))
+
+    def test_the_model_order_from_config(self):
+        self.assertEqual(config.claude_model_order(LADDER), ["claude-fable-5-2", "claude-opus-5-5"])
+        self.assertEqual(config.claude_model_order(dict(LADDER, claude_fallback_models=["claude-fable-5-2", "x"])),
+                         ["claude-fable-5-2", "x"])                       # the first is not repeated
+        self.assertEqual(config.claude_model_order(dict(LADDER, spawn_claude_model=None)), [None])   # the CLI's own
+        self.assertEqual(config.claude_model_order(TWO), ["claude-opus-5-5"])
+        for bad in ("claude-opus-5-5", [""], [None]):
+            with self.assertRaisesRegex(ValueError, "claude_fallback_models must be a list of model ids"):
+                config.claude_model_order(dict(LADDER, claude_fallback_models=bad))
+        self.assertEqual(config.claude_model_order(config.DEFAULTS), [None])     # the kit leaves it to Claude Code
+
+    def test_owner_exclusion_keeps_employer_repos_off_pro(self):
         rec = usage.recommend(self.snaps([win("session", "5-hour", 90)], [win("session", "5-hour", 80)]),
-                              TWO, owner="employer-org", now=NOW)
-        self.assertEqual(rec["use"], "claude:work")
+                              TWO, owner="example-org", now=NOW)
+        self.assertEqual(rec["use"], "claude:enterprise")
         self.assertEqual(rec["avoid"][0]["status"], "excluded")
         self.assertEqual(usage.recommend(self.snaps([win("session", "5-hour", 90)], []), TWO, owner="example-user",
-                                         now=NOW)["use"], "claude:personal")
+                                         now=NOW)["use"], "claude:pro")
 
     def test_model_windows_count_only_for_the_model_run(self):
-        personal_w = [win("session", "5-hour", 90), win("model_weekly", "weekly Fable", 0, "fable"),
+        pro = [win("session", "5-hour", 90), win("model_weekly", "weekly Fable", 0, "fable"),
                win("model_weekly", "weekly Opus", 5, "opus")]
-        a = usage.assess(snap("claude:personal", personal_w), usage.settings(TWO), "claude-opus-5-5", NOW)
+        a = usage.assess(snap("claude:pro", pro), usage.settings(TWO), "claude-opus-5-5", NOW)
         self.assertEqual(a["status"], "low")
         self.assertEqual(len(a["why"]), 1)
-        a = usage.assess(snap("claude:personal", personal_w), usage.settings(TWO), "claude-sonnet-5-5", NOW)
+        a = usage.assess(snap("claude:pro", pro), usage.settings(TWO), "claude-sonnet-5-5", NOW)
         self.assertEqual(a["status"], "ok")
 
     def test_per_account_threshold_and_low_fallback(self):
         cfg = json.loads(json.dumps(TWO))
-        cfg["usage"]["claude_accounts"]["personal"]["min_remaining"] = {"weekly": 50}
+        cfg["usage"]["claude_accounts"]["pro"]["min_remaining"] = {"weekly": 50}
         s = self.snaps([win("weekly", "weekly", 40)], [win("weekly", "weekly", 8)], cx=[win("weekly", "weekly", 9)])
         rec = usage.recommend(s, cfg, now=NOW)
-        self.assertEqual(rec["use"], "claude:personal")   # every one is low: the most left wins
+        self.assertEqual(rec["use"], "claude:pro")   # every one is low: the most left wins
         self.assertIn("every account is low", rec["why"])
 
     def test_unknown_and_order(self):
-        s = {"claude:personal": snap("claude:personal", [], error="no login"), "claude:work": snap("claude:work", [win("session", "5-hour", 0)]),
+        s = {"claude:pro": snap("claude:pro", [], error="no login"), "claude:enterprise": snap("claude:enterprise", [win("session", "5-hour", 0)]),
              "codex": snap("codex", [win("weekly", "weekly", 0)])}
         rec = usage.recommend(s, TWO, now=NOW)
-        self.assertEqual(rec["use"], "claude:personal")
+        self.assertEqual(rec["use"], "claude:pro")
         self.assertIn("unknown", rec["why"])
         cfg = json.loads(json.dumps(TWO))
-        cfg["usage"]["order"] = ["claude:personal", "claude:work"]   # codex never auto-picked
-        s["claude:personal"] = snap("claude:personal", [win("session", "5-hour", 0)])
+        cfg["usage"]["order"] = ["claude:pro", "claude:enterprise"]   # codex never auto-picked
+        s["claude:pro"] = snap("claude:pro", [win("session", "5-hour", 0)])
         s["codex"] = snap("codex", [win("weekly", "weekly", 100)])
-        self.assertEqual(usage.recommend(s, cfg, now=NOW)["use"], "claude:personal")
+        self.assertEqual(usage.recommend(s, cfg, now=NOW)["use"], "claude:pro")
         self.assertIn("codex", usage.targets(usage.settings(cfg)))   # still read and shown
         self.assertEqual(usage.recommend(s, cfg, only_cli="codex", now=NOW)["use"], None)
 
     def test_a_login_not_set_up_is_never_picked(self):
         cfg = json.loads(json.dumps(TWO))
-        cfg["usage"]["claude_accounts"]["personal"]["config_dir"] = "/nonexistent/claude-personal"
+        cfg["usage"]["claude_accounts"]["pro"]["config_dir"] = "/nonexistent/claude-pro"
         s = self.snaps([], [win("session", "5-hour", 0)], cx=[win("weekly", "weekly", 0)])
         rec = usage.recommend(s, cfg, now=NOW)
-        self.assertEqual(rec["use"], "claude:work")
-        self.assertEqual({a["target"]: a["status"] for a in rec["avoid"]}["claude:personal"], "unavailable")
+        self.assertEqual(rec["use"], "claude:enterprise")
+        self.assertEqual({a["target"]: a["status"] for a in rec["avoid"]}["claude:pro"], "unavailable")
 
     def test_parse_target(self):
         s = usage.settings(TWO)
-        self.assertEqual(usage.parse_target("personal", s), ("claude", "personal"))
-        self.assertEqual(usage.parse_target("claude:work", s), ("claude", "work"))
+        self.assertEqual(usage.parse_target("pro", s), ("claude", "pro"))
+        self.assertEqual(usage.parse_target("claude:enterprise", s), ("claude", "enterprise"))
         self.assertEqual(usage.parse_target("codex", s), ("codex", None))
         with self.assertRaises(ValueError):
             usage.parse_target("max", s)
-        self.assertEqual(usage.default_account(s), "work")
+        self.assertEqual(accounts.default_account(s), "enterprise")
         self.assertEqual(usage.settings({})["order"], ["claude:default", "codex"])
+        self.assertEqual(usage.claude_target("pro"), "claude:pro")
+        self.assertEqual([usage.account_of(t) for t in ("claude:pro", "codex")], ["pro", None])
 
 
 class Caching(unittest.TestCase):
@@ -297,9 +330,9 @@ class Caching(unittest.TestCase):
 
     def test_cache_reuse_refresh_and_stale_fallback(self):
         out = usage.snapshots(TWO, reader=self.reader(), cache_file=self.cache)
-        self.assertEqual(sorted(self.calls), ["claude:personal", "claude:work", "codex"])
+        self.assertEqual(sorted(self.calls), ["claude:enterprise", "claude:pro", "codex"])
         self.assertEqual(oct(stat.S_IMODE(os.stat(self.cache).st_mode)), "0o600")
-        self.assertEqual(out["claude:personal"]["account"], "personal")
+        self.assertEqual(out["claude:pro"]["account"], "pro")
         usage.snapshots(TWO, reader=self.reader(), cache_file=self.cache)
         self.assertEqual(len(self.calls), 3)              # all fresh: nothing read again
         out = usage.snapshots(TWO, refresh=True, reader=self.reader(fail=("codex",)), cache_file=self.cache)
@@ -314,156 +347,212 @@ class Caching(unittest.TestCase):
         self.assertEqual(out["codex"]["windows"], [])
         self.assertEqual(usage.assess(out["codex"], usage.settings(TWO))["status"], "unknown")
 
-    def test_only_and_text(self):
-        out = usage.snapshots(TWO, only="claude", reader=self.reader(), cache_file=self.cache)
-        self.assertEqual(sorted(out), ["claude:personal", "claude:work"])
+    @unittest.skipIf(os.geteuid() == 0, "root writes into a folder whatever its mode")
+    def test_a_cache_that_cannot_be_written_raises(self):
+        self.cache.parent.chmod(0o500)
+        self.addCleanup(self.cache.parent.chmod, 0o700)
+        with self.assertRaises(PermissionError):
+            usage.snapshots(TWO, reader=self.reader(), cache_file=self.cache)
+
+    def test_a_cache_that_is_not_json_raises_with_its_path(self):
+        self.cache.write_text('{"codex": ')
+        with self.assertRaisesRegex(ValueError, "%s is not JSON" % self.cache):
+            usage.snapshots(TWO, reader=self.reader(), cache_file=self.cache)
+        self.assertEqual(self.calls, [])
+
+    def test_times_and_spend_in_words(self):
+        self.assertEqual(usage.fmt_reset(NOW + 3600, NOW), time.strftime("%H:%M", time.localtime(NOW + 3600)))
+        self.assertEqual(usage.fmt_reset(NOW - 3600, NOW), time.strftime("%H:%M", time.localtime(NOW - 3600)))
+        self.assertEqual(usage.fmt_reset(NOW - 30 * 3600, NOW), time.strftime("%a %H:%M", time.localtime(NOW - 30 * 3600)))
+        self.assertEqual(usage.fmt_reset(None, NOW), "unknown")
+        self.assertEqual(usage.extra_spend({"used": 12.5, "monthly_limit": 500, "currency": "USD"}),
+                         "$12.50 used of a $500.00 monthly cap")
+        self.assertEqual(usage.extra_spend({"used": None, "monthly_limit": None, "currency": "EUR"}),
+                         "? used, no monthly cap")
+
+    def test_text(self):
+        out = usage.snapshots(TWO, reader=self.reader(), cache_file=self.cache)
         out["codex"] = snap("codex", [], error="codex binary not found")
-        out["claude:personal"]["extra_usage"] = {"enabled": True, "used": 211.41, "monthly_limit": None, "currency": "USD"}
+        out["claude:pro"]["extra_usage"] = {"enabled": True, "used": 211.41, "monthly_limit": None, "currency": "USD"}
         rec = usage.recommend(out, TWO, now=NOW)
         text = usage.render_text(out, rec, TWO, now=NOW)
         self.assertIn("50% left", text)
         self.assertIn("extra usage ON: $211.41 used, no monthly cap", text)
         self.assertIn("usage unknown: codex binary not found", text)
-        self.assertTrue(text.splitlines()[-1].startswith("Recommendation: Use claude:personal"))
+        self.assertTrue(text.splitlines()[-1].startswith("Recommendation: Use claude:pro"))
 
 
 class Accounts(unittest.TestCase):
     def setUp(self):
-        self.base = Path(tempfile.mkdtemp())
-        self.default = self.base / "home" / ".claude"
-        self.second = self.base / "home" / ".claude-personal"
-        for h, sid in ((self.default, "11111111-1111-1111-1111-111111111111"), (self.second, "22222222-2222-2222-2222-222222222222")):
-            (h / "sessions").mkdir(parents=True)
-            (h / "projects" / "-work").mkdir(parents=True)
-            (h / "sessions" / ("%d.json" % os.getpid())).write_text(json.dumps(
-                {"pid": os.getpid(), "sessionId": sid, "name": h.name, "cwd": "/work"}))
-            (h / "projects" / "-work" / (sid + ".jsonl")).write_text(json.dumps({"cwd": str(self.base)}) + "\n")
-        conf = self.base / "config.json"
-        conf.write_text(json.dumps({"usage": {"claude_accounts": {"personal": {"config_dir": str(self.second)},
-                                                                   "work": {"config_dir": None}}}}))
-        self.patches = [mock.patch.object(config, "CONFIG_PATH", conf),
-                        mock.patch.object(registry, "DEFAULT_CLAUDE_HOME", self.default),
-                        mock.patch.object(registry, "CLAUDE_HOME", self.default)]
-        for p in self.patches:
-            p.start()
-
-    def tearDown(self):
-        for p in self.patches:
-            p.stop()
+        h = Homes(self, logins=("enterprise", "pro"))
+        self.base, self.default, self.pro = h.base, h.default, h.homes["pro"]
+        for login, sid in (("enterprise", "11111111-1111-1111-1111-111111111111"),
+                           ("pro", "22222222-2222-2222-2222-222222222222")):
+            home = h.homes[login]
+            h.claude(sid, home.name, login=login, cwd="/work")
+            (home / "projects" / "-work").mkdir(parents=True)
+            (home / "projects" / "-work" / (sid + ".jsonl")).write_text(json.dumps({"cwd": str(self.base)}) + "\n")
 
     def test_registry_sees_both_logins(self):
         homes = registry.claude_homes()
-        self.assertEqual([(a, c) for a, _, c in homes], [("work", None), ("personal", str(self.second.resolve()))])
+        self.assertEqual([(a, c) for a, _, c in homes], [("enterprise", None), ("pro", str(self.pro.resolve()))])
         by = {s["name"]: s for s in registry.claude_sessions()}
-        self.assertEqual((by[".claude"]["account"], by[".claude"]["config_dir"]), ("work", None))
-        self.assertEqual((by[".claude-personal"]["account"], by[".claude-personal"]["config_dir"]), ("personal", str(self.second.resolve())))
+        self.assertEqual((by[".claude"]["account"], by[".claude"]["config_dir"]), ("enterprise", None))
+        self.assertEqual((by[".claude-pro"]["account"], by[".claude-pro"]["config_dir"]), ("pro", str(self.pro.resolve())))
         gone = registry.claude_transcript_session("22222222-2222-2222-2222-222222222222")
-        self.assertEqual(gone["config_dir"], str(self.second.resolve()))
+        self.assertEqual(gone["config_dir"], str(self.pro.resolve()))
         self.assertIsNone(registry.claude_transcript_session("11111111-1111-1111-1111-111111111111")["config_dir"])
 
+    def test_live_on_one_login(self):
+        self.assertEqual([s["name"] for s in registry.live_on(None)], [".claude"])
+        self.assertEqual([s["name"] for s in registry.live_on(str(self.pro))], [".claude-pro"])
+        self.assertEqual(registry.live_on(str(self.base / ".claude-other")), [])
+
+    def test_a_resumed_session_is_found_on_the_login_it_was_resumed_under(self):
+        # The memory cap waits for the resumed session's pid: the registry entry with its id on that login only.
+        pro_sid, waits = "22222222-2222-2222-2222-222222222222", []
+        conf = json.loads(config.CONFIG_PATH.read_text())
+        config.CONFIG_PATH.write_text(json.dumps(dict(conf, failover={"pinned": ["a"]})))   # resume where it ran
+        # claude itself and the systemd scope are the boundaries: the resume command and the cap call are stubbed.
+        with mock.patch.object(send, "claude_bin", return_value="/bin/claude"), \
+                mock.patch.object(send, "agent_caps", return_value=({"MemoryMax": 1}, None)), \
+                mock.patch.object(send.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")), \
+                mock.patch.object(send.memcap, "cap_bg_session",
+                                  side_effect=lambda *a, **k: waits.append(k["session_pid"]) or "capped"):
+            send.resume_claude({"id": pro_sid, "name": "a", "cwd": "", "config_dir": str(self.pro)}, "hi", True, lambda: None)
+            newer = self.default / "projects" / "-work" / (pro_sid + ".jsonl")   # now resumed on the default login
+            newer.write_text(json.dumps({"cwd": str(self.base)}) + "\n")
+            os.utime(newer, (time.time() + 60, time.time() + 60))
+            send.resume_claude({"id": pro_sid, "name": "a", "cwd": "", "config_dir": str(self.pro)}, "hi", True, lambda: None)
+        self.assertEqual(waits[0](), os.getpid())     # live on pro, the login it was resumed under
+        self.assertIsNone(waits[1]())                 # resumed on the default login, where no session has that id
+
     def test_inside_a_pro_agent_the_default_login_is_still_seen(self):
-        with mock.patch.object(registry, "CLAUDE_HOME", self.second):
-            self.assertEqual(sorted(a for a, _, _ in registry.claude_homes()), ["personal", "work"])
+        with mock.patch.object(registry, "CLAUDE_HOME", self.pro):
+            self.assertEqual(sorted(a for a, _, _ in registry.claude_homes()), ["enterprise", "pro"])
 
     def test_resume_uses_the_sessions_own_login(self):
-        send = load_script("agent-send")
         seen = []
+        # claude (its binary and its run) and the memory cap are the boundary
         with mock.patch.object(send, "claude_bin", return_value="/bin/claude"), \
                 mock.patch.object(send, "agent_caps", return_value=(None, "uncapped: test")), \
                 mock.patch.object(send.subprocess, "run", side_effect=lambda cmd, **kw: seen.append(kw["env"]) or
                                   subprocess.CompletedProcess(cmd, 0, "ok", "")), \
                 mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/somewhere/else"}):
-            send.resume_claude({"id": "x", "name": "a", "cwd": "", "config_dir": str(self.second)}, "hi", True)
-            send.resume_claude({"id": "y", "name": "b", "cwd": "", "config_dir": None}, "hi", True)
-        self.assertEqual(seen[0]["CLAUDE_CONFIG_DIR"], str(self.second.resolve()))   # the Mac's temp dir is a symlink
+            send.resume_claude({"id": "x", "name": "a", "cwd": "", "config_dir": str(self.pro)}, "hi", True, lambda: None)
+            send.resume_claude({"id": "y", "name": "b", "cwd": "", "config_dir": None}, "hi", True, lambda: None)
+        self.assertEqual(seen[0]["CLAUDE_CONFIG_DIR"], str(self.pro.resolve()))   # the Mac's temp dir is a symlink
         self.assertNotIn("CLAUDE_CONFIG_DIR", seen[1])
+
+    def test_a_resume_that_cannot_choose_a_login_fails(self):
+        """git cannot say who owns the session's repo, so its owner rules cannot pick a login. Nothing is started
+        and agent-send fails with git's error, the path the mailroom holds the mail and alerts on."""
+        repo = self.base / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        with open(repo / ".git" / "config", "a") as fh:
+            fh.write("[broken\n")
+        sid = "33333333-3333-3333-3333-333333333333"   # exited: a transcript and no registry entry
+        (self.pro / "projects" / "-work" / (sid + ".jsonl")).write_text(json.dumps({"cwd": str(repo)}) + "\n")
+        bins = fakes.install(self)   # the claude CLI is the boundary
+        sender = load_script("agent-send")
+        # the memory cap (systemd) is the boundary too
+        with mock.patch.object(send, "agent_caps", return_value=(None, "uncapped: test")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = sender.main(["--exact-id", "--raw", "--cli", "claude", "--offline", "resume", sid, "hi"])
+        self.assertEqual((rc, bins.calls("claude")), (1, []))
+        self.assertRegex(err.getvalue(), r"agent-send: delivery to claude .* failed: git ls-remote --get-url origin "
+                                         r"in .*repo failed \(exit 128\): fatal: bad config line")
+        # a dry run reports the same failure, not a traceback
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = sender.main(["--exact-id", "--raw", "--cli", "claude", "--offline", "resume", "--dry-run", sid, "hi"])
+        self.assertEqual(rc, 1)
+        self.assertRegex(err.getvalue(), r"agent-send: delivery to claude .* failed: git ls-remote --get-url origin ")
 
     def test_link_memory(self):
         repo = self.base / "repo"
-        mem = self.default / "projects" / usage.project_slug(repo.resolve()) / "memory"
+        mem = self.default / "projects" / accounts.project_slug(repo.resolve()) / "memory"
         mem.mkdir(parents=True)
-        link = usage.link_memory(repo, self.second, default_home=self.default)
+        link = accounts.link_memory(repo, self.pro, default_home=self.default)
         self.assertTrue(Path(link).is_symlink())
         self.assertEqual(os.readlink(link), str(mem))
-        self.assertIsNone(usage.link_memory(repo, self.second, default_home=self.default))   # already there
-        self.assertIsNone(usage.link_memory(self.base / "other", self.second, default_home=self.default))
-        self.assertEqual(usage.project_slug("/media/x/py/a.b_c d"), "-media-x-py-a-b-c-d")
+        self.assertIsNone(accounts.link_memory(repo, self.pro, default_home=self.default))   # already there
+        self.assertIsNone(accounts.link_memory(self.base / "other", self.pro, default_home=self.default))
+        blocked = self.base / "blocked"
+        blocked.write_text("")                    # a file where the login's projects folder would be made
+        with self.assertRaises(OSError):
+            accounts.link_memory(repo, blocked, default_home=self.default)
+        self.assertEqual(accounts.project_slug("/srv/x/py/a.b_c d"), "-srv-x-py-a-b-c-d")
+
+    def test_repo_owner_is_none_only_without_an_origin_and_a_git_failure_raises(self):
+        """The owner rules (exclude_owners, only_owners) need the owner: git failing must not read as "no owner"."""
+        repo = self.base / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        self.assertIsNone(accounts.repo_owner(repo))                    # no origin remote
+        self.assertIsNone(accounts.repo_owner(self.default))         # no repo
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:Example-Org/x.git"],
+                       check=True)
+        self.assertEqual(accounts.repo_owner(repo), "Example-Org")
+        with open(repo / ".git" / "config", "a") as fh:
+            fh.write("[broken\n")
+        with self.assertRaisesRegex(commands.CommandError, r"git ls-remote --get-url origin in .* failed \(exit 128\): "
+                                                           r"fatal: bad config line"):
+            accounts.repo_owner(repo)
 
     def test_init_account_shares_customisations_not_credentials(self):
         (self.default / "CLAUDE.md").write_text("# mine")
         (self.default / "settings.json").write_text("{}")
         (self.default / "skills").mkdir()
         (self.default / ".credentials.json").write_text("secret")
-        new = self.base / "home" / ".claude-two"
-        self.assertTrue(usage.init_account(new, default_home=self.default, dry_run=True))
+        new = self.base / ".claude-two"
+        src = self.base / ".claude.json"   # the default login's; only copying MCP servers reads it
+        self.assertTrue(accounts.init_account(new, self.default, src, dry_run=True))
         self.assertFalse(new.exists())
-        done = usage.init_account(new, default_home=self.default)
+        done = accounts.init_account(new, self.default, src)
         self.assertEqual(oct(stat.S_IMODE(new.stat().st_mode)), "0o700")
         self.assertTrue((new / "settings.json").is_symlink())
         self.assertTrue((new / "skills").is_symlink())
         self.assertFalse((new / ".credentials.json").exists())
         self.assertFalse((new / "projects").exists())
-        self.assertEqual(usage.init_account(new, default_home=self.default), [])   # idempotent
+        self.assertEqual(accounts.init_account(new, self.default, src), [])   # idempotent
         self.assertTrue(done)
         with self.assertRaises(ValueError):
-            usage.init_account(self.default, default_home=self.default)
-        src = self.base / "home" / ".claude.json"
+            accounts.init_account(self.default, self.default, src)
         src.write_text(json.dumps({"mcpServers": {"gmail": {"command": "g"}, "work": {"command": "w"}}, "oauthAccount": {"x": 1}}))
         with self.assertRaisesRegex(ValueError, "log in"):
-            usage.init_account(new, default_home=self.default, copy_mcp=["gmail"], default_json=src)
+            accounts.init_account(new, default_home=self.default, copy_mcp=["gmail"], default_json=src)
         (new / ".claude.json").write_text(json.dumps({"oauthAccount": {"y": 2}}))
-        usage.init_account(new, default_home=self.default, copy_mcp=["gmail"], default_json=src)
+        accounts.init_account(new, default_home=self.default, copy_mcp=["gmail"], default_json=src)
         d = json.loads((new / ".claude.json").read_text())
         self.assertEqual(d, {"oauthAccount": {"y": 2}, "mcpServers": {"gmail": {"command": "g"}}})
         with self.assertRaises(ValueError):
-            usage.init_account(new, default_home=self.default, copy_mcp=["nope"], default_json=src)
-
-
-def dead_pid():
-    p = subprocess.Popen(["true"])
-    p.wait()
-    return p.pid
+            accounts.init_account(new, default_home=self.default, copy_mcp=["nope"], default_json=src)
 
 
 class StaleEntry(unittest.TestCase):
-    """An agent moved from the work login back to personal. The move SIGKILLs claude, so its work entry stays
-    (pid gone, socket file still there) beside the live personal one; unhandled, every agent-send --exact-id to it
-    would fail with exit 3. The fixture is such a dead entry."""
+    """An agent moved from the work login back to personal. The move SIGKILLs claude, so its work entry stays (pid
+    gone, socket file still there) beside the live personal one, and every agent-send --exact-id to it would fail
+    with exit 3. The fixture is such a dead entry."""
 
     def setUp(self):
-        self.base = Path(tempfile.mkdtemp()).resolve()
-        self.personal, self.work = self.base / ".claude", self.base / ".claude-work"
+        self.h = Homes(self, logins=("personal", "work"))
+        self.base, self.personal, self.work = self.h.base, self.h.homes["personal"], self.h.homes["work"]
         dead = json.loads((ROOT / "tests" / "fixtures" / "stale-registry" / "4242424.json").read_text())
-        self.sid = dead["sessionId"]
-        self.pid = dead_pid()
-        old_sock, live_sock = self.base / "4242424.sock", self.base / "4343434.sock"
+        self.sid, self.name = dead["sessionId"], dead["name"]
+        self.cwd = str(self.base)   # a folder that exists, as the agent's did (a resume refuses a missing one)
+        self.fields = {k: v for k, v in dead.items() if k not in ("pid", "sessionId", "name", "cwd", "messagingSocketPath")}
+        old_sock = self.base / "4242424.sock"   # the killed claude's socket file stays behind
         old_sock.write_text("")
-        live_sock.write_text("")
-        dead.update(pid=self.pid, messagingSocketPath=str(old_sock))
-        # dated before the dead one, so only liveness can pick it
-        live = dict(dead, pid=os.getpid(), messagingSocketPath=str(live_sock), statusUpdatedAt=dead["statusUpdatedAt"] - 1)
-        live.pop("procStart")
-        for h in (self.personal, self.work):
-            (h / "sessions").mkdir(parents=True)
-        self.dead = self.work / "sessions" / ("%d.json" % self.pid)
-        self.dead.write_text(json.dumps(dead))
+        self.dead = self.entry("work", live=False, messagingSocketPath=str(old_sock))
+        self.pid = json.loads(self.dead.read_text())["pid"]
         self.key = self.work / "sessions" / ("%d.%s.key" % (self.pid, "a7" * 32))
         self.key.write_text("k")
-        self.live = self.personal / "sessions" / ("%d.json" % os.getpid())
-        self.live.write_text(json.dumps(live))
-        conf = self.base / "config.json"
-        conf.write_text(json.dumps({"usage": {"claude_accounts": {"personal": {"config_dir": None},
-                                                                   "work": {"config_dir": str(self.work)}}}}))
-        self.patches = [mock.patch.object(config, "CONFIG_PATH", conf),
-                        mock.patch.object(registry, "DEFAULT_CLAUDE_HOME", self.personal),
-                        mock.patch.object(registry, "CLAUDE_HOME", self.personal),
-                        mock.patch.object(registry, "CODEX_HOME", self.base / ".codex")]
-        for p in self.patches:
-            p.start()
+        # dated before the dead one, so only liveness can pick it
+        self.live = self.entry("personal", procStart=None, statusUpdatedAt=dead["statusUpdatedAt"] - 1)
 
-    def tearDown(self):
-        for p in self.patches:
-            p.stop()
+    def entry(self, login, live=True, **fields):
+        """The fixture's registry entry on login, with fields changed (None: left out)."""
+        fields = {k: v for k, v in dict(self.fields, **fields).items() if v is not None}
+        return self.h.claude(self.sid, self.name, login=login, live=live, cwd=self.cwd, **fields)
 
     def entries(self):
         return [s for a, h, c in registry.claude_homes() for s in registry._claude_sessions_in(h / "sessions", a, c)
@@ -472,6 +561,7 @@ class StaleEntry(unittest.TestCase):
     def send(self, *args):
         sender = load_script("agent-send")
         out, err = io.StringIO(), io.StringIO()
+        # the session's inbox socket and starting claude are the boundary
         with mock.patch.object(sender, "send_claude_socket", return_value="") as sock, \
                 mock.patch.object(sender, "resume_claude", return_value=(True, "resumed")) as resume, \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -485,13 +575,13 @@ class StaleEntry(unittest.TestCase):
                          [("personal", True)])
         rc, out, sock, _ = self.send("--offline", "fail")
         self.assertEqual(rc, 0, out)
-        self.assertEqual(sock.call_args.args[0]["socket"], str(self.base / "4343434.sock"))
+        self.assertEqual(sock.call_args.args[0]["socket"], str(self.h.socket))
         self.assertEqual(registry.by_id(self.entries(), self.sid)[0]["account"], "personal")
 
     def test_dead_entries_alone_are_one_offline_session(self):
         self.live.unlink()
-        older = dict(json.loads(self.dead.read_text()), pid=dead_pid(), updatedAt=1, statusUpdatedAt=1)
-        (self.personal / "sessions" / ("%d.json" % older["pid"])).write_text(json.dumps(older))
+        self.entry("personal", live=False, messagingSocketPath=json.loads(self.dead.read_text())["messagingSocketPath"],
+                   updatedAt=1, statusUpdatedAt=1)
         self.assertEqual(len(self.entries()), 2)
         rc, out, sock, resume = self.send("--offline", "fail")
         self.assertEqual(rc, 2, out)
@@ -500,6 +590,14 @@ class StaleEntry(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(resume.call_args.args[0]["account"], "work")   # the latest entry stands for the session
         sock.assert_not_called()
+
+    def test_two_live_entries_are_ambiguous(self):
+        self.entry("work", procStart=None, statusUpdatedAt=json.loads(self.live.read_text())["statusUpdatedAt"])  # live on work too
+        rc, out, sock, resume = self.send("--offline", "resume")
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(out.count("\n  claude "), 2)
+        sock.assert_not_called()
+        resume.assert_not_called()
 
     def resume(self, personal_left=90, saved_on_personal=False):
         """The agent offline, its newest conversation on work (where the move left it), an older copy on personal;
@@ -529,10 +627,11 @@ class StaleEntry(unittest.TestCase):
             runs.append((cmd, kw))
             return subprocess.CompletedProcess(cmd, 0, "backgrounded \u00b7 %s" % self.sid[:8], "")
         out = io.StringIO()
+        # the usage probes (Anthropic, OpenAI), the folder trust in the user's files, and claude are the boundary
         with mock.patch.object(usage, "snapshots", return_value=snaps), \
-                mock.patch.object(sender, "spawn_trust", side_effect=lambda c, d: trusted.append((c, d))), \
-                mock.patch.object(sender, "claude_bin", return_value="/bin/claude"), \
-                mock.patch.object(sender, "agent_caps", return_value=(None, "uncapped: test")), \
+                mock.patch.object(send, "spawn_trust", side_effect=lambda c, d: trusted.append((c, d))), \
+                mock.patch.object(send, "claude_bin", return_value="/bin/claude"), \
+                mock.patch.object(send, "agent_caps", return_value=(None, "uncapped: test")), \
                 mock.patch.object(subprocess, "run", side_effect=run), contextlib.redirect_stdout(out):
             rc = sender.main(["--exact-id", "--raw", "--cli", "claude", "--offline", "resume", self.sid, "hello"])
         return rc, out.getvalue(), runs, trusted, copies
@@ -541,7 +640,7 @@ class StaleEntry(unittest.TestCase):
         rc, out, runs, trusted, copies = self.resume()
         self.assertEqual(rc, 0, out)
         (cmd, kw), = runs
-        self.assertEqual(cmd, ["/bin/claude", "--resume", self.sid, "--bg", "--name", "nightly report r7k2m9xq",
+        self.assertEqual(cmd, ["/bin/claude", "--resume", self.sid, "--bg", "--name", self.name,
                                "--dangerously-skip-permissions", "hello"])
         self.assertNotIn("CLAUDE_CONFIG_DIR", kw["env"])                 # personal, the default login
         self.assertEqual(kw["cwd"], str(self.base))
@@ -577,101 +676,159 @@ class StaleEntry(unittest.TestCase):
 class Spawn(unittest.TestCase):
     def setUp(self):
         self.sp = load_script("agent-spawn")
-        self.second = Path(tempfile.mkdtemp()) / ".claude-personal"
-        self.second.mkdir()
-        (self.second / ".credentials.json").write_text("{}")
+        self.pro = Path(tempfile.mkdtemp()) / ".claude-pro"
+        self.pro.mkdir()
+        (self.pro / ".credentials.json").write_text("{}")
         self.cfg = json.loads(json.dumps(TWO))
-        self.cfg["usage"]["claude_accounts"]["personal"]["config_dir"] = str(self.second)
+        self.cfg["usage"]["claude_accounts"]["pro"]["config_dir"] = str(self.pro)
 
     def args(self, **kw):
         d = {"cli": None, "account": None, "model": None}
         d.update(kw)
         return argparse.Namespace(**d)
 
-    def reader(self, personal_left=90):
-        return lambda cfg: {"claude:personal": snap("claude:personal", [win("session", "5-hour", personal_left)]),
-                            "claude:work": snap("claude:work", [win("session", "5-hour", 80)]),
+    def reader(self, pro_left=90):
+        """Stands in for usage.snapshots, whose probes ask Anthropic and OpenAI: pro with pro_left percent left."""
+        return lambda cfg: {"claude:pro": snap("claude:pro", [win("session", "5-hour", pro_left)]),
+                            "claude:enterprise": snap("claude:enterprise", [win("session", "5-hour", 80)]),
                             "codex": snap("codex", [win("weekly", "weekly", 90)])}
 
     def test_explicit_flags_unchanged(self):
         boom = mock.Mock(side_effect=AssertionError("usage must not be read"))
         self.cfg["spawn_route"] = "auto"
         r = self.sp.choose_route(self.args(cli="claude"), self.cfg, None, read=boom)
-        self.assertEqual((r["cli"], r["account"], r["config_dir"], r["routed"]), ("claude", "work", None, False))
+        self.assertEqual((r["cli"], r["account"], r["config_dir"], r["routed"]), ("claude", "enterprise", None, False))
         r = self.sp.choose_route(self.args(cli="codex"), self.cfg, None, read=boom)
         self.assertEqual((r["cli"], r["account"]), ("codex", None))
-        r = self.sp.choose_route(self.args(account="personal"), self.cfg, None, read=boom)
-        self.assertEqual((r["cli"], r["account"], r["config_dir"]), ("claude", "personal", str(self.second.resolve())))
+        r = self.sp.choose_route(self.args(account="pro"), self.cfg, None, read=boom)
+        self.assertEqual((r["cli"], r["account"], r["config_dir"]), ("claude", "pro", str(self.pro.resolve())))
         r = self.sp.choose_route(self.args(model="claude-sonnet-5-5"), self.cfg, None, read=boom)
-        self.assertEqual((r["cli"], r["account"]), ("claude", "work"))
+        self.assertEqual((r["cli"], r["account"]), ("claude", "enterprise"))
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            self.sp.choose_route(self.args(cli="codex", account="personal"), self.cfg, None, read=boom)
+            self.sp.choose_route(self.args(cli="codex", account="pro"), self.cfg, None, read=boom)
 
     def test_routing_is_opt_in(self):
         r = self.sp.choose_route(self.args(), self.cfg, None, read=mock.Mock(side_effect=AssertionError))
-        self.assertEqual((r["cli"], r["account"], r["routed"]), ("claude", "work", False))
+        self.assertEqual((r["cli"], r["account"], r["routed"]), ("claude", "enterprise", False))
         self.cfg["spawn_route"] = "auto"
         r = self.sp.choose_route(self.args(), self.cfg, None, read=self.reader())
-        self.assertEqual((r["cli"], r["account"], r["routed"]), ("claude", "personal", True))
-        r = self.sp.choose_route(self.args(), self.cfg, None, read=self.reader(personal_left=5))
-        self.assertEqual(r["account"], "work")
-        self.assertIn("Avoid claude:personal", r["why"])
-        r = self.sp.choose_route(self.args(), self.cfg, "Employer-Org", read=self.reader())
-        self.assertEqual(r["account"], "work")
-        r = self.sp.choose_route(self.args(account="auto", cli="codex"), {}, None, read=self.reader())
+        self.assertEqual((r["cli"], r["account"], r["routed"]), ("claude", "pro", True))
+        r = self.sp.choose_route(self.args(), self.cfg, None, read=self.reader(pro_left=5))
+        self.assertEqual(r["account"], "enterprise")
+        self.assertIn("Avoid claude:pro", r["why"])
+        r = self.sp.choose_route(self.args(), self.cfg, "Example-Org", read=self.reader())
+        self.assertEqual(r["account"], "enterprise")
+        r = self.sp.choose_route(self.args(account="auto", cli="codex"), config.load(), None, read=self.reader())
         self.assertEqual(r["cli"], "codex")
 
-    def test_usage_failure_falls_back_and_unready_account_refused(self):
+    def test_routing_picks_the_model_too_and_the_plan_runs_it(self):
+        self.cfg.update(spawn_route="auto", spawn_claude_model="claude-fable-5-2", spawn_claude_effort="xhigh",
+                        claude_fallback_models=["claude-opus-5-5"])
+
+        def no_fable(cfg):   # stands in for usage.snapshots: both logins have room, but no Fable left
+            fable = win("model_weekly", "weekly Fable", 0, "fable")
+            return {"claude:pro": snap("claude:pro", [win("session", "5-hour", 90), fable]),
+                    "claude:enterprise": snap("claude:enterprise", [win("session", "5-hour", 80), fable]),
+                    "codex": snap("codex", [win("weekly", "weekly", 90)])}
+        r = self.sp.choose_route(self.args(), self.cfg, None, read=no_fable)
+        self.assertEqual((r["account"], r["model"]), ("pro", "claude-opus-5-5"))
+        a = argparse.Namespace(cli=None, account=None, model=None, effort=None, new_repo="x", org="example-user")
+        with mock.patch.object(self.sp.usage, "snapshots", no_fable):
+            plan = self.sp.plan_agent(a, self.cfg, {})
+        self.assertEqual((plan["account"], plan["model"], plan["effort"]), ("pro", "claude-opus-5-5", "xhigh"))
+        r = self.sp.choose_route(self.args(account="pro"), self.cfg, None, read=no_fable)
+        self.assertNotIn("model", r)   # an explicit login runs spawn_claude_model; failover moves it on a limit
+
+    def test_auto_routing_stops_when_usage_or_no_login_allows_it_and_unready_account_refused(self):
+        """No silent fall back to the default login, which may be the one an owner rule excludes."""
         self.cfg["spawn_route"] = "auto"
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            r = self.sp.choose_route(self.args(), self.cfg, None, read=mock.Mock(side_effect=OSError("down")))
-        self.assertEqual((r["cli"], r["account"], r["routed"]), ("claude", "work", False))
-        self.assertIn("usage read failed", err.getvalue())
-        (self.second / ".credentials.json").unlink()
-        with mock.patch.object(usage.sys, "platform", "linux"), contextlib.redirect_stderr(io.StringIO()) as err, \
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            self.sp.choose_route(self.args(), self.cfg, None, read=mock.Mock(side_effect=OSError("down")))
+        self.assertIn("reading usage failed (OSError: down)", err.getvalue())
+        self.cfg["usage"]["claude_accounts"]["enterprise"]["exclude_owners"] = ["Example-Org"]
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            self.sp.choose_route(self.args(cli="claude", account="auto"), self.cfg, "Example-Org",
+                                 read=self.reader())
+        self.assertIn("No usable account: claude:pro (repos owned by Example-Org are excluded from this account); "
+                      "claude:enterprise (repos owned by Example-Org are excluded", err.getvalue())
+        (self.pro / ".credentials.json").unlink()
+        with mock.patch.object(accounts.sys, "platform", "linux"), contextlib.redirect_stderr(io.StringIO()) as err, \
                 self.assertRaises(SystemExit):
-            self.sp.choose_route(self.args(account="personal"), self.cfg, None)
+            self.sp.choose_route(self.args(account="pro"), self.cfg, None)
         self.assertIn("no login", err.getvalue())
 
-    def test_launch_sets_the_login_for_the_tmux_session(self):
+    def test_launch_sets_the_login_for_the_pane_and_its_session(self):
         calls = []
-        with mock.patch.object(self.sp.registry, "claude_bin", return_value="/bin/claude"), \
-                mock.patch.object(self.sp, "tmux", side_effect=lambda *a, **k: calls.append(a)), \
-                mock.patch.object(self.sp.time, "sleep"):
-            self.sp.launch_claude("n", "/work", "/b.md", "m", "high", config_dir=str(self.second))
-            self.sp.launch_claude("n2", "/work", "/b.md", "m", "high")
-        self.assertIn("CLAUDE_CONFIG_DIR=" + str(self.second), calls[0])
-        self.assertFalse(calls[1][-1].startswith("unset"))
-        self.assertFalse(any("CLAUDE_CONFIG_DIR" in str(x) for x in calls[3]))
+        # tmux is the boundary: record what would be run in the pane
+        with mock.patch.object(launch.commands, "tmux", side_effect=lambda *a, **k: calls.append(a)), \
+                mock.patch.object(launch.time, "sleep"):
+            launch.start_claude("%5", "/bin/claude", "n", str(self.pro), "m", "high", "/b.md")
+            launch.start_claude("%6", "/bin/claude", "n2", None, "m", "high", "/b.md")
+        # another login: the pane's session gets its CLAUDE_CONFIG_DIR, and the pane's shell exports it
+        self.assertEqual(calls[0], ("set-environment", "-t", "%5", "CLAUDE_CONFIG_DIR", str(self.pro)))
+        self.assertEqual(calls[1][-1], "stty sane; export CLAUDE_CONFIG_DIR=%s; /bin/claude --name n "
+                                       "--dangerously-skip-permissions --model m --effort high \"$(cat /b.md)\""
+                         % self.pro)
         # the default login: removed from the session's environment and from the pane's shell
-        self.assertEqual(calls[4], ("set-environment", "-t", "n2", "-r", "CLAUDE_CONFIG_DIR"))
-        self.assertTrue(calls[5][-1].startswith("unset CLAUDE_CONFIG_DIR; /bin/claude "))
+        self.assertEqual(calls[3], ("set-environment", "-t", "%6", "-r", "CLAUDE_CONFIG_DIR"))
+        self.assertTrue(calls[4][-1].startswith("stty sane; unset CLAUDE_CONFIG_DIR; /bin/claude "))
 
     def test_codex_launch_skips_the_update_menu(self):
         calls = []
-        with mock.patch.object(self.sp.registry, "codex_bin", return_value="/bin/codex"), \
-                mock.patch.object(self.sp.registry, "codex_live_ids", return_value=set()), \
-                mock.patch.object(self.sp, "tmux", side_effect=lambda *a, **k: calls.append(a)), \
-                mock.patch.object(self.sp, "wait_for", return_value=None), \
-                mock.patch.object(self.sp.time, "sleep"):
-            self.sp.launch_codex("n", "/work", "/b.md", "gpt-6.1-sol", "xhigh")
+        # tmux and Codex's lock files are the boundary: no thread appears, and the start says so
+        with mock.patch.object(launch.registry, "codex_live_ids", return_value=set()), \
+                mock.patch.object(launch.commands, "tmux", side_effect=lambda *a, **k: calls.append(a)), \
+                mock.patch.object(launch, "CODEX_THREAD_SECONDS", 0), mock.patch.object(launch.time, "sleep"):
+            started = launch.start_codex("=n:", "/bin/codex", "/work", "gpt-6.1-sol", "xhigh", "brief", "n")
         typed = next(c[-1] for c in calls if c[:2] == ("send-keys", "-t") and "-l" in c)
-        self.assertTrue(typed.startswith("/bin/codex -s danger-full-access -a never -C /work "
-                                         "-c check_for_update_on_startup=false "), typed)
+        self.assertTrue(typed.startswith("stty sane; unset CLAUDE_CONFIG_DIR; /bin/codex -s danger-full-access -a never "
+                                         "-C /work -c check_for_update_on_startup=false "), typed)
+        self.assertIn("did not appear", started["error"])
 
     def test_trust_goes_to_the_accounts_own_claude_json(self):
         home_json = Path(tempfile.mkdtemp()) / ".claude.json"
         home_json.write_text("{}")
-        acct_json = self.sp.claude_json_for(str(self.second))
+        acct_json = trust.claude_json_for(str(self.pro))
         acct_json.write_text(json.dumps({"oauthAccount": {}}))
         d = tempfile.mkdtemp()
-        with mock.patch.object(self.sp, "CLAUDE_JSON", home_json), mock.patch.object(self.sp, "trust_codex", return_value=False):
-            self.sp.ensure_trust(d, acct_json)
+        with mock.patch.object(registry, "CLAUDE_JSON", home_json), mock.patch.object(trust, "trust_codex", return_value=False):
+            trust.ensure_trust(d, acct_json)
             self.assertEqual(json.loads(home_json.read_text()), {})
             self.assertTrue(json.loads(acct_json.read_text())["projects"][str(Path(d).resolve())]["hasTrustDialogAccepted"])
             acct_json.unlink()
-            self.sp.ensure_trust(d, acct_json)   # a login that is not set up gets no half-made .claude.json
+            trust.ensure_trust(d, acct_json)   # a login that is not set up gets no half-made .claude.json
             self.assertFalse(acct_json.exists())
+
+    def test_claude_trust_says_whether_it_wrote_and_raises_when_it_cannot(self):
+        """True when it writes the trust, False when the folder is trusted already, and an error when it cannot read
+        or write the file."""
+        d = Path(tempfile.mkdtemp())
+        cj = d / ".claude.json"
+        self.assertTrue(trust.trust_claude("/w", cj))
+        self.assertFalse(trust.trust_claude("/w", cj))   # already trusted
+        self.assertEqual(oct(cj.stat().st_mode & 0o777), "0o600")
+        cj.write_text("{not json")
+        with mock.patch.object(trust, "trust_codex", return_value=False):
+            with self.assertRaises(ValueError):
+                trust.ensure_trust(str(d), cj)
+        (d / "a-file").write_text("")
+        with self.assertRaises(OSError):
+            trust.trust_claude("/w", d / "a-file" / ".claude.json")   # its folder is a file: the write fails
+
+    def test_codex_trust_escapes_the_path_and_raises_when_it_cannot_write(self):
+        conf = Path(tempfile.mkdtemp()) / "config.toml"
+        conf.write_text('model = "gpt-6.1-sol"')
+        odd = '/w/a "quoted" \\ name'
+        with mock.patch.object(trust, "CODEX_CONFIG", conf):
+            self.assertTrue(trust.trust_codex(odd))
+            self.assertFalse(trust.trust_codex(odd))   # already trusted
+            self.assertTrue(trust.trust_codex("/plain"))
+        self.assertEqual(conf.read_text(), 'model = "gpt-6.1-sol"\n'
+                                           '\n[projects."/w/a \\"quoted\\" \\\\ name"]\ntrust_level = "trusted"\n'
+                                           '\n[projects."/plain"]\ntrust_level = "trusted"\n')
+        with mock.patch.object(trust, "CODEX_CONFIG", conf.parent / "config.toml" / "config.toml"), \
+                self.assertRaises(OSError):
+            trust.trust_codex("/w")   # its folder is a file: the write fails
 
 
 class Cli(unittest.TestCase):
@@ -679,7 +836,8 @@ class Cli(unittest.TestCase):
         au = load_script("agent-usage")
         s = {"claude:default": snap("claude:default", [win("session", "5-hour", 0)]),
              "codex": snap("codex", [win("weekly", "weekly", 90)])}
-        with mock.patch.object(au.config, "load", return_value={}), mock.patch.object(au.usage, "snapshots", return_value=s):
+        config_file(self, {})                                              # the defaults
+        with mock.patch.object(au.usage, "snapshots", return_value=s):   # the usage probes ask Anthropic and OpenAI
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(au.main(["--pick"]), 0)
             self.assertEqual(out.getvalue().strip(), "codex")

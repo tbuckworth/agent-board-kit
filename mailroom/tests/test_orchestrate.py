@@ -1,17 +1,20 @@
+import contextlib
+import io
 import json
 import os
+import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-TMP = tempfile.mkdtemp()
-os.environ["AGENT_MAIL_STATE_DIR"] = TMP
-os.environ["AGENT_MAIL_CONFIG_DIR"] = TMP          # defaults only: no real token, no real config
-os.environ["AGENT_STATUS_DIR"] = TMP
-from agentmail import config, orchestrate  # noqa: E402
+import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
+from scripts import load_script  # noqa: E402
+from agentmail import config, headless, orchestrate, registry  # noqa: E402
 
 LIMIT = json.dumps({"is_error": True, "num_turns": 1, "result": "You've hit your session limit · resets 3pm"})
 GOOD = json.dumps({"result": "done", "num_turns": 4, "session_id": "s-1", "total_cost_usd": 0.1})
@@ -38,56 +41,63 @@ CODEX_LIMIT = codex_out(
 class OrchestratorLoginsTest(unittest.TestCase):
     def setUp(self):
         self.calls, self.outputs = [], []
-        self.work_login, self.work = tempfile.mkdtemp(), tempfile.mkdtemp()
-        Path(self.work_login, ".credentials.json").write_text("{}")
-        self.cfg = dict(config.load(), orchestrator_dir=self.work, spawn_codex_model="gpt-x", usage={
-            "claude_accounts": {"personal": {"config_dir": None}, "work": {"config_dir": self.work_login}},
-            "order": ["claude:personal", "claude:work", "codex"]})
-        self.saved = (orchestrate.subprocess.run, orchestrate.registry.claude_bin, orchestrate.registry.codex_bin,
-                      orchestrate.fallback_available, orchestrate.fallback_command, orchestrate._fallback_env)
-        orchestrate.registry.claude_bin = lambda: "claude"
-        orchestrate.registry.codex_bin = lambda: "codex"
-        orchestrate.fallback_available = lambda cfg: True
-        orchestrate.fallback_command = lambda cfg, cmd: ["bws", "run", "--"] + cmd
-        orchestrate._fallback_env = lambda cfg, env: {"BWS_ACCESS_TOKEN": "t"}
+        self.work, self.orch, bws = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+        Path(self.work, ".credentials.json").write_text("{}")
+        Path(bws, "token").write_text("tok\n")
+        Path(bws, "project-id").write_text("proj-1\n")
+        self.cfg = dict(config.load(), orchestrator_dir=self.orch, spawn_codex_model="gpt-x",
+                        orchestrator_fallback_secret="AGENTS_ANTHROPIC_API_KEY",
+                        bws_token_file=str(Path(bws, "token")), bws_project_file=str(Path(bws, "project-id")), usage={
+                            "claude_accounts": {"personal": {"config_dir": None}, "work": {"config_dir": self.work}},
+                            "order": ["claude:personal", "claude:work", "codex"]})
 
         def run(cmd, **kw):
             if cmd[0] == "git":                                             # statuslog's branch lookup
-                return orchestrate.subprocess.CompletedProcess(cmd, 1, "", "")
+                return subprocess.CompletedProcess(cmd, 1, "", "")
             self.calls.append((cmd, kw.get("env"), kw.get("input")))
             out = self.outputs.pop(0)
             if isinstance(out, Exception):
                 raise out
             failed = "is_error" in out or "turn.failed" in out
-            return orchestrate.subprocess.CompletedProcess(cmd, 1 if failed else 0, out, "")
-        orchestrate.subprocess.run = run
-
-    def tearDown(self):
-        (orchestrate.subprocess.run, orchestrate.registry.claude_bin, orchestrate.registry.codex_bin,
-         orchestrate.fallback_available, orchestrate.fallback_command, orchestrate._fallback_env) = self.saved
+            return subprocess.CompletedProcess(cmd, 1 if failed else 0, out, "")
+        find_bin = registry.find_bin
+        # the CLIs: claude, codex and bws are never run here (run stands in for them), so none need be installed
+        for target, attr, fake in ((registry, "claude_bin", lambda: "claude"), (registry, "codex_bin", lambda: "codex"),
+                                   (registry, "find_bin", lambda name, extra: "/usr/bin/bws" if name == "bws"
+                                    else find_bin(name, extra)),
+                                   (subprocess, "run", run)):
+            patcher = patch.object(target, attr, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def names(self):
-        return [c[0][0] if c[0][0] != "bws" else "bws" for c in self.calls]
+        return [Path(c[0][0]).name for c in self.calls]
 
     def test_order_personal_work_codex_then_the_key(self):
-        got = orchestrate.logins(self.cfg, {"CLAUDE_CONFIG_DIR": "/elsewhere", "PATH": "/bin"}, self.work)
-        self.assertEqual([g[0] for g in got], ["personal", "work", "codex", "api-key"])
-        self.assertNotIn("CLAUDE_CONFIG_DIR", got[0][2])
-        self.assertEqual(got[1][2]["CLAUDE_CONFIG_DIR"], str(Path(self.work_login).resolve()))
-        codex = got[2][1]
-        self.assertEqual(codex[:2], ["codex", "exec"])
+        self.outputs = [LIMIT, LIMIT, CODEX_LIMIT, LIMIT]
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/elsewhere"}):
+            orchestrate.run_event("event", "test", self.cfg)
+        self.assertEqual(self.names(), ["claude", "claude", "codex", "bws"])
+        envs = [c[1] for c in self.calls]
+        self.assertFalse("CLAUDE_CONFIG_DIR" in envs[0])                    # the default login
+        self.assertEqual(envs[1]["CLAUDE_CONFIG_DIR"], str(Path(self.work).resolve()))
+        codex = self.calls[2][0]
         for flag in ("--json", "--ignore-user-config", "check_for_update_on_startup=false"):
             self.assertIn(flag, codex)
-        self.assertEqual(codex[codex.index("-C") + 1], self.work)
+        self.assertEqual(codex[codex.index("-C") + 1], self.orch)
         self.assertEqual(codex[codex.index("-m") + 1], "gpt-x")
         self.assertIn('model_reasoning_effort="high"', codex)
         self.assertEqual(codex[-1], "-")
-        self.assertEqual(got[3][1][:3], ["bws", "run", "--"])
+        self.assertEqual(self.calls[3][0], ["/usr/bin/bws", "run", "--project-id", "proj-1", "--",
+                                            'ANTHROPIC_API_KEY="$AGENTS_ANTHROPIC_API_KEY" exec '
+                                            + shlex.join(orchestrate.command(self.cfg))])
+        self.assertEqual(envs[3]["BWS_ACCESS_TOKEN"], "tok")
 
     def test_no_codex_installed_goes_straight_to_the_key(self):
-        orchestrate.registry.codex_bin = lambda: None
-        self.assertEqual([g[0] for g in orchestrate.logins(self.cfg, {}, self.work)],
-                         ["personal", "work", "api-key"])
+        self.outputs = [LIMIT, LIMIT, GOOD]
+        with patch.object(registry, "codex_bin", return_value=None):
+            info = orchestrate.run_event("event", "test", self.cfg)
+        self.assertEqual((info["ok"], info["auth"], self.names()), (True, headless.API_KEY, ["claude", "claude", "bws"]))
 
     def test_the_first_login_runs_it(self):
         self.outputs = [GOOD]
@@ -97,7 +107,12 @@ class OrchestratorLoginsTest(unittest.TestCase):
 
     def test_both_claude_logins_out_runs_on_codex(self):
         self.outputs = [LIMIT, LIMIT, CODEX_GOOD]
-        info = orchestrate.run_event("the event", "test", self.cfg)
+        inherited = {"CLAUDE_CODE_MESSAGING_SOCKET": "/run/s.sock", "CLAUDECODE": "1", "CLAUDE_CONFIG_DIR": "/elsewhere"}
+        with patch.dict(os.environ, inherited):
+            info = orchestrate.run_event("the event", "test", self.cfg)
+        for cmd, run_env, _ in self.calls:                                  # neither claude nor codex gets them
+            self.assertFalse({"CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDECODE"} & set(run_env), cmd[0])
+            self.assertNotEqual(run_env.get("CLAUDE_CONFIG_DIR"), "/elsewhere", cmd[0])
         self.assertEqual((info["ok"], info["auth"], info["session_id"]), (True, "codex", "t-1"))
         self.assertEqual(info["result"], "Replied to mail 9.")
         self.assertEqual(info["failed"].count("session limit"), 2)
@@ -108,10 +123,9 @@ class OrchestratorLoginsTest(unittest.TestCase):
     def test_codex_out_too_uses_the_key(self):
         self.outputs = [LIMIT, LIMIT, CODEX_LIMIT, GOOD]
         info = orchestrate.run_event("event", "test", self.cfg)
-        self.assertEqual((info["ok"], info["auth"]), (True, "api-key"))
+        self.assertEqual((info["ok"], info["auth"]), (True, headless.API_KEY))
         self.assertIn("codex: You've hit your usage limit.", info["failed"])
-        self.assertEqual(self.calls[3][:2], (["bws", "run", "--"] + orchestrate.command(self.cfg),
-                                             {"BWS_ACCESS_TOKEN": "t"}))
+        self.assertEqual(self.names()[3], "bws")
 
     def test_everything_out_fails(self):
         self.outputs = [LIMIT, LIMIT, CODEX_LIMIT, LIMIT]
@@ -124,10 +138,37 @@ class OrchestratorLoginsTest(unittest.TestCase):
         self.outputs = [json.dumps({"is_error": True, "num_turns": 6, "result": "You've hit your session limit"})]
         info = orchestrate.run_event("event", "test", self.cfg)
         self.assertEqual((info["ok"], len(self.calls)), (False, 1))        # it may have acted already
-        self.calls, self.outputs = [], [orchestrate.subprocess.TimeoutExpired("claude", 900)]
+        self.calls, self.outputs = [], [subprocess.TimeoutExpired("claude", 900)]
         info = orchestrate.run_event("event", "test", self.cfg)
         self.assertEqual((info["ok"], len(self.calls)), (False, 1))
         self.assertIn("timed out", info["error"])
+
+    def test_a_run_that_exits_0_without_a_result_fails(self):
+        # personal prints nothing, work prints text that is not JSON, codex prints no JSON events,
+        # the key's run prints a JSON list with no result object: each exits 0
+        self.outputs = ["", "Loading...", "codex started\n", json.dumps([{"type": "system"}])]
+        info = orchestrate.run_event("event", "test", self.cfg)
+        self.assertFalse(info["ok"])
+        self.assertEqual(len(self.calls), 4)                                # it returned nothing: the next login runs
+        self.assertIn("exit 0 without a result", info["error"])
+        for name, out in (("personal", "no output"), ("work", "Loading..."), ("codex", "codex started")):
+            self.assertIn("%s: exit 0 without a result: %s" % (name, out), info["failed"])
+
+    def test_a_run_log_that_cannot_be_written_fails_after_the_run(self):
+        self.outputs = [GOOD]
+        with patch.object(orchestrate, "RUNS_LOG", Path(tempfile.mkdtemp())):   # a directory: the append fails
+            with self.assertRaisesRegex(RuntimeError, r"test · ok · \$0.1 · 4 turns · personal\).*IsADirectoryError"):
+                orchestrate.run_event("event", "test", self.cfg)
+            self.assertEqual(len(self.calls), 1)                            # after the run, which happened
+            with self.assertRaisesRegex(RuntimeError, "orchestrator directory missing.*IsADirectoryError"):
+                orchestrate.run_event("event", "test", dict(self.cfg, orchestrator_dir=self.orch + "/gone"))
+
+    def test_a_status_log_that_cannot_be_written_fails_after_the_run(self):
+        self.outputs = [GOOD]
+        with patch.object(orchestrate.statuslog, "LOG", Path(tempfile.mkdtemp())):   # a directory: the append fails
+            with self.assertRaisesRegex(RuntimeError, r"test · ok .* not recorded: IsADirectoryError"):
+                orchestrate.run_event("event", "test", self.cfg)
+        self.assertEqual(orchestrate.logged_runs()[-1]["result"], "done")   # the run log has it
 
     def test_codex_result_reads_the_last_message_and_ignores_warning_items(self):
         j = orchestrate.codex_result(CODEX_GOOD)
@@ -135,6 +176,28 @@ class OrchestratorLoginsTest(unittest.TestCase):
                          ("Replied to mail 9.", "t-1", 1, False))
         j = orchestrate.codex_result(CODEX_LIMIT)
         self.assertEqual((j["is_error"], j["result"], j["num_turns"]), (True, "You've hit your usage limit.", 0))
+
+
+class RunsListing(unittest.TestCase):
+    def test_runs_lists_the_last_ones_and_totals_every_run(self):
+        log = Path(tempfile.mkdtemp(), "runs.jsonl")
+        log.write_text("".join(json.dumps({"ts": 0, "source": "mail", "ok": True, "cost": cost, "result": "run %d" % i}) + "\n"
+                               for i, cost in enumerate([0.5, 0.25, 1.0])))
+        script = load_script("agent-orchestrate")
+        out = io.StringIO()
+        with patch.object(orchestrate, "RUNS_LOG", log), contextlib.redirect_stdout(out):
+            self.assertEqual(script.main(["--runs", "--limit", "1"]), 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("run 2", lines[0])
+        self.assertEqual(lines[1], "total logged cost: $1.75 over 3 runs")
+
+    def test_a_damaged_run_line_is_skipped_and_counted(self):
+        log = Path(tempfile.mkdtemp(), "runs.jsonl")
+        log.write_text('{"ts": 0, "ok": true, "cost": 0.5}\n{"ts": 1, "ok": tr\n')
+        with patch.object(orchestrate, "RUNS_LOG", log), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(orchestrate.logged_runs(), [{"ts": 0, "ok": True, "cost": 0.5}])
+        self.assertEqual(err.getvalue(), "%s: skipped 1 line(s) that are not JSON objects\n" % log)
 
 
 if __name__ == "__main__":

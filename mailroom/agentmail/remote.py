@@ -4,8 +4,13 @@ import re
 import subprocess
 import uuid
 
+from . import config
+
 PROTOCOL = 1
-MAX_REQUEST = 2 * 1024 * 1024
+# A request's bytes, either way: room for the files of a Mail-tab reply (mailbox.MAX_ANSWER_FILE_BYTES) or an agent's
+# attachments (outbound.MAX_IMAGES_BYTES) once base64 has grown them by a third, and the text around them.
+MAX_REQUEST = 40 * 1024 * 1024
+TOO_LARGE = "request exceeds %d MiB" % (MAX_REQUEST >> 20)
 
 
 class RemoteError(RuntimeError):
@@ -13,7 +18,7 @@ class RemoteError(RuntimeError):
 
 
 def identity(data):
-    if not isinstance(data, dict) or data.get("cli") not in ("claude", "codex"):
+    if not isinstance(data, dict) or data.get("cli") not in config.CLIS:
         raise ValueError("origin must identify Claude or Codex")
     sid = data.get("id", "")
     if str(uuid.UUID(sid)) != sid:
@@ -25,20 +30,23 @@ def identity(data):
 
 
 def call(cfg, host, payload, timeout=None):
-    alias = cfg.get("remote_hosts", {}).get(host)
+    """Send payload to host (a config remote_hosts name) over SSH, where config remote_command answers it, and return
+    the response's result. Raises RemoteError when host is no configured peer, SSH fails or times out, or the answer
+    is not valid or is an error."""
+    alias = cfg["remote_hosts"].get(host)
     if not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", alias):
         raise RemoteError("host %r has no configured SSH peer" % host)
     request = dict(payload, protocol=PROTOCOL, source_host=cfg["host_id"], destination_host=host)
     wire = json.dumps(request)
     if len(wire.encode()) > MAX_REQUEST:
-        raise RemoteError("request exceeds 2 MiB")
+        raise RemoteError(TOO_LARGE)
     cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
            "-o", "ConnectionAttempts=1", "-o", "StrictHostKeyChecking=yes",
            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1",
-           alias, "~/.local/bin/agent-mail rpc"]
+           alias, cfg["remote_command"]]
     try:
         r = subprocess.run(cmd, input=wire, capture_output=True, text=True,
-                           timeout=timeout or cfg.get("remote_timeout", 30))
+                           timeout=timeout or cfg["remote_timeout"])
     except subprocess.TimeoutExpired:
         raise RemoteError("%s: SSH operation timed out; outcome may be unknown; no automatic retry" % host)
     except OSError as e:

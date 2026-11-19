@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { agentRequestBody, AGENT_REQUEST_MARKER } from '../js/parser.js';
 import { parseAgentsFile, filterAgents, ago, latestAgentStatus, stateWord } from '../js/agents.js';
 import * as api from '../js/api.js';
+import { requestedToast } from '../js/components/assign-dialog.js';
 
 const ID = '7680A777-1111-4222-8333-444455556666';
 
@@ -96,6 +97,7 @@ test('the status line takes the newest todo-agent comment and its first line', (
 
 test('fetchAgents reads the contents API, decodes UTF-8, and is null on 404', async () => {
   api.setToken('test-not-a-real-pat');
+  api.setRepo('example-user/tasks');
   const json = JSON.stringify({ v: 1, updated: '2026-10-16T09:30:00Z', agents: [{ id: ID, name: 'Café agent' }] });
   const b64 = Buffer.from(json, 'utf8').toString('base64').replace(/(.{60})/g, '$1\n');
   let url;
@@ -107,4 +109,10 @@ test('fetchAgents reads the contents API, decodes UTF-8, and is null on 404', as
   assert.equal(await api.fetchAgents(), null);
   globalThis.fetch = async () => ({ ok: false, status: 500 });
   await assert.rejects(api.fetchAgents());
+});
+
+test('the request toast says who acts, in two sentences', () => {
+  assert.equal(requestedToast({ name: 'invoice-export-fix' }),
+    'Requested. The desktop sends it to invoice-export-fix within a couple of minutes');
+  assert.equal(requestedToast(null), 'Requested. The desktop starts the agent within a couple of minutes');
 });

@@ -1,12 +1,10 @@
 """Memory caps for agents.
 
-Without them, one agent's batch of parallel workers can fill RAM and swap; the kernel then kills small services
-one by one, and finally the user systemd manager, which takes every agent and service with it.
-
-Every agent this toolkit starts now runs in its own systemd scope, `agent-<name>.scope`, with MemoryMax and
-MemorySwapMax (config agent_memory_max / agent_swap_max). A runaway batch is OOM-killed inside its agent's
-scope (the kernel picks the biggest process there, normally a worker), and nothing else is touched.
-`systemd-cgtop` shows memory per agent by name.
+Without a cap, one agent's batch that fills RAM and swap makes the kernel kill small services one by one, and
+finally the user systemd manager, which takes every agent and service with it. So every agent this toolkit
+starts runs in its own systemd scope, `agent-<name>.scope`, with MemoryMax and MemorySwapMax (config
+agent_memory_max / agent_swap_max). A runaway batch is OOM-killed inside its agent's scope (the kernel picks the
+biggest process there, normally a worker), and nothing else is touched.
 
 Agents are moved in just after they start: StartTransientUnit with the agent's top process (as tmux does for
 panes), then AttachProcessesToUnit for any descendant still outside. Only the top PID goes in the first call,
@@ -28,6 +26,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+from . import procs
 
 MANAGER = ["org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager"]
 UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
@@ -103,42 +103,6 @@ def cgroup(pid):
     return None
 
 
-def cmdline(pid):
-    try:
-        with open("/proc/%d/cmdline" % pid, "rb") as f:
-            return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
-    except OSError:
-        return []
-
-
-def parents():
-    """{pid: ppid} for every process we can see."""
-    out = {}
-    for d in Path("/proc").iterdir():
-        if not d.name.isdigit():
-            continue
-        try:
-            stat = (d / "stat").read_text()
-            out[int(d.name)] = int(stat.rsplit(")", 1)[1].split()[1])
-        except (OSError, IndexError, ValueError):
-            continue
-    return out
-
-
-def tree(root, ppids=None):
-    """root and all its descendants."""
-    ppids = parents() if ppids is None else ppids
-    kids = {}
-    for pid, ppid in ppids.items():
-        kids.setdefault(ppid, []).append(pid)
-    out, todo = [], [root]
-    while todo:
-        pid = todo.pop()
-        out.append(pid)
-        todo.extend(kids.get(pid, []))
-    return out
-
-
 # ------------------------------------------------------------------ scopes
 def unit_name(prefix, name):
     base = re.sub(r"[^A-Za-z0-9:_.-]+", "-", "%s-%s" % (prefix, name)).strip("-.")[:120]
@@ -194,17 +158,18 @@ def attach(unit, pids, call=call):
     return not failed, "; ".join(failed)[:200]
 
 
-def sweep(unit, root, call=call):
+def sweep(unit, root):
     """Move root's descendants that are not in root's cgroup yet (forked before root moved) into unit."""
     target = cgroup(root)
     if target is None:
         return True, ""
-    return attach(unit, [p for p in tree(root) if p != root and cgroup(p) not in (None, target)], call=call)
+    return attach(unit, [p for p in procs.tree(root) if p != root and cgroup(p) not in (None, target)])
 
 
 def adopt(root, name, props, description, settle=0.5):
     """Move an agent's process tree into agent-<name>.scope with these caps. Never raises; returns
-    (unit or None, message). Children forked while it moves are swept in after `settle` seconds."""
+    (unit or None, message). Children forked while it moves are swept in after `settle` seconds; any the last
+    sweep could not move are named in the message."""
     if not available():
         return None, "uncapped: no systemd user bus here"
     try:
@@ -214,10 +179,12 @@ def adopt(root, name, props, description, settle=0.5):
         if unit and not wait_moved(root, unit):
             return unit, msg + "; not yet moved after 5 s"
         if unit:
-            sweep(unit, root)
+            swept, why = sweep(unit, root)
             if settle:
                 time.sleep(settle)
-                sweep(unit, root)
+                swept, why = sweep(unit, root)
+            if not swept:
+                msg += "; some of its processes stayed outside it: " + why
         return unit, msg
     except Exception as e:  # noqa: BLE001 - a cap must never stop an agent from starting
         return None, "uncapped: %s: %s" % (type(e).__name__, e)
@@ -234,7 +201,8 @@ def free_from_service(pid, name, description, exclude=()):
     """If pid sits in a service's cgroup or an agent's scope (whoever started it first decided), move it and
     its descendants in that same cgroup to <name>.scope, with no cap. Anything already elsewhere (a terminal,
     its own scope) is left alone, and so is every PID in `exclude`: the agent being adopted, which may not
-    have left that cgroup yet."""
+    have left that cgroup yet. Returns (unit or None, message); a move not seen within 5 s, or descendants
+    systemd would not move, are said in the message."""
     if not available():
         return None, "no systemd user bus here"
     try:
@@ -244,17 +212,23 @@ def free_from_service(pid, name, description, exclude=()):
         skip = set(exclude)
         unit, msg = start_scope(name + ".scope", [pid], {},
                                 "%s (moved out of %s)" % (description, home.rsplit("/", 1)[-1]))
-        if unit:
-            wait_moved(pid, unit)
-            attach(unit, [p for p in tree(pid) if p != pid and p not in skip and cgroup(p) == home])
-        return unit, ("moved out of %s into %s" % (home.rsplit("/", 1)[-1], unit)) if unit else msg
+        if not unit:
+            return None, msg
+        leaf = home.rsplit("/", 1)[-1]
+        msg = "moved out of %s into %s" % (leaf, unit)
+        if not wait_moved(pid, unit):
+            msg += "; but %d was not seen in it within 5 s" % pid
+        attached, why = attach(unit, [p for p in procs.tree(pid) if p != pid and p not in skip and cgroup(p) == home])
+        if not attached:
+            msg += "; and some of its processes stayed in %s: %s" % (leaf, why)
+        return unit, msg
     except Exception as e:  # noqa: BLE001
         return None, "not moved: %s: %s" % (type(e).__name__, e)
 
 
 # ------------------------------------------------------------------ claude --bg
 def is_claude_daemon(pid):
-    argv = cmdline(pid)
+    argv = procs.cmdline(pid)
     return bool(argv) and "claude" in os.path.basename(argv[0]) and argv[1:3] == ["daemon", "run"]
 
 
@@ -267,10 +241,10 @@ def find_bg_session(session_id, timeout=10.0, step=0.25, session_pid=None):
     while True:
         pid = session_pid() if session_pid else None
         if pid and cgroup(pid):
-            host = parents().get(pid)
-            return host if host and "bg-pty-host" in " ".join(cmdline(host)) else pid
-        ppids = parents()
-        hits = [p for p in ppids if session_id in cmdline(p) and "--resume" in cmdline(p)]
+            host = procs.parents().get(pid)
+            return host if host and "bg-pty-host" in " ".join(procs.cmdline(host)) else pid
+        ppids = procs.parents()
+        hits = [p for p in ppids if session_id in procs.cmdline(p) and "--resume" in procs.cmdline(p)]
         tops = [p for p in hits if ppids.get(p) not in hits]
         if tops:
             return next((p for p in tops if is_claude_daemon(ppids.get(p, 0))), tops[0])
@@ -288,9 +262,9 @@ def cap_bg_session(session_id, name, props, session_pid=None):
     if root is None:
         return "uncapped: background session %s not found" % session_id[:8]
     freed = ""
-    daemon = parents().get(root)   # first, so the session's own move below is the last one
+    daemon = procs.parents().get(root)   # first, so the session's own move below is the last one
     if daemon and is_claude_daemon(daemon):
-        moved, how = free_from_service(daemon, "claude-bg-daemon", "Claude background daemon", exclude=tree(root))
+        moved, how = free_from_service(daemon, "claude-bg-daemon", "Claude background daemon", exclude=procs.tree(root))
         if moved:
             freed = "; daemon " + how
     unit, msg = adopt(root, name, props, "agent %s (resumed, claude --bg)" % name, settle=1.0)

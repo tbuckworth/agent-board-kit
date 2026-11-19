@@ -3,11 +3,11 @@
 import { getState, setState, subscribe, getTopLevelItems, getAllLists, getActiveCountByList } from './state.js';
 import { initRouter, navigate, getCurrentRoute } from './router.js';
 import { el, icon, mount, clear } from './render.js';
-import { parseIssue, titleCase, ratingFields, bodyFields, setUnrated, unratedFromConfig } from './parser.js';
-import { tagFields } from './tags.js';
+import { titleCase, setUnrated } from './parser.js';
 import * as api from './api.js';
 import * as db from './db.js';
-import { showToast } from './components/toast.js';
+import { syncAllIssues, loadCachedIssues } from './sync.js';
+import { reportSyncError } from './auth.js';
 import { renderHome } from './views/home.js';
 import { renderGroup } from './views/group.js';
 import { renderList } from './views/list.js';
@@ -43,7 +43,7 @@ function buildShell() {
     'aria-label': 'Sync',
     onClick: async () => {
       syncBtn.classList.add('spinning');
-      await syncAllIssues(true);
+      await sync(true);
       syncBtn.classList.remove('spinning');
     },
   }, icon('refresh', 20));
@@ -316,7 +316,7 @@ function onRoute(route) {
       renderTriage(mainContent);
       break;
     case 'archived':
-      renderArchived(mainContent, route.params, { refresh: () => syncAllIssues(true) });
+      renderArchived(mainContent, route.params, { refresh: () => sync(true) });
       break;
     default:
       renderHome(mainContent);
@@ -379,7 +379,7 @@ function showSetup() {
           await db.useRepo(repo);
           statusEl.className = 'setup-status success';
           statusEl.textContent = 'Connected! Loading tasks...';
-          await syncAllIssues(true);
+          await sync(true);
           navigate('#/');
           return;
         }
@@ -422,118 +422,12 @@ function showSetup() {
   (api.getRepo() ? tokenInput : repoInput).focus();
 }
 
-// Cached issues, with the label-derived fields that older versions did not store
-async function loadCachedIssues() {
-  const cached = await db.issues.getAll();
-  return cached.map(issue => ({
-    ...issue,
-    ...ratingFields(issue.labels || []),
-    ...tagFields(issue.labels || []),
-    ...(issue.rawBody !== undefined ? bodyFields(issue.rawBody) : {}),
-  }));
-}
-
-// Sync all issues
-const FULL_SYNC_EVERY_MS = 24 * 60 * 60 * 1000;
-
-export async function syncAllIssues(fullSync = false) {
-  setState({ syncState: 'syncing' });
-
+// A sync from the shell: its failure is reported here (sync.js only throws it)
+async function sync(fullSync = false) {
   try {
-    // Load from IndexedDB cache first
-    const cachedIssues = await loadCachedIssues();
-    const cachedGroups = await db.groups.getAll();
-    const cachedMeta = await db.listMeta.getAll();
-
-    if (cachedIssues.length > 0) {
-      setState({
-        issues: cachedIssues,
-        groups: cachedGroups,
-        listMetadata: cachedMeta,
-      });
-    }
-
-    // A sync since lastSync never sees an issue deleted on GitHub, so once a day it reloads everything
-    const lastFull = await db.meta.get('lastFullSync');
-    if (!lastFull || Date.now() - Date.parse(lastFull) > FULL_SYNC_EVERY_MS) fullSync = true;
-
-    // Fetch from API
-    const lastSync = fullSync ? null : await db.meta.get('lastSync');
-    const rawIssues = await api.fetchAllIssues(lastSync, (count) => {
-      setState({ syncState: 'syncing' });
-    });
-
-    const parsedIssues = rawIssues.map(parseIssue);
-
-    if (lastSync && !fullSync) {
-      // Merge with cache
-      const { issues } = getState();
-      const issueMap = new Map(issues.map(i => [i.number, i]));
-      for (const issue of parsedIssues) {
-        issueMap.set(issue.number, issue);
-      }
-      const merged = [...issueMap.values()];
-      setState({ issues: merged });
-      await db.issues.putAll(parsedIssues);
-    } else {
-      // Full replace
-      setState({ issues: parsedIssues });
-      await db.issues.clear();
-      await db.issues.putAll(parsedIssues);
-    }
-
-    // Save sync timestamp
-    await db.meta.set('lastSync', new Date().toISOString());
-    if (fullSync) await db.meta.set('lastFullSync', new Date().toISOString());
-
-    // Fetch config (groups/list metadata) from .todo/config.json
-    try {
-      const configResult = await api.fetchConfig();
-      // Which lists are not rated: from the config, remembered for the next start
-      const unrated = unratedFromConfig(configResult?.config);
-      setUnrated(unrated);
-      await db.meta.set('unrated', unrated);
-      if (configResult) {
-        const { config } = configResult;
-        const groups = (config.groups || []).map(g => ({ name: g.name, sortOrder: g.sortOrder }));
-        const listMetadata = (config.listMetadata || []).map(m => ({
-          listName: m.listName, groupName: m.groupName, sortOrder: m.sortOrder,
-        }));
-        await db.groups.clear();
-        if (groups.length > 0) await db.groups.putAll(groups);
-        await db.listMeta.clear();
-        if (listMetadata.length > 0) await db.listMeta.putAll(listMetadata);
-        setState({ groups, listMetadata });
-      }
-    } catch (e) {
-      console.warn('Config sync failed:', e);
-    }
-
-    // Also fetch labels
-    try {
-      const labels = await api.fetchLabels();
-      await db.labels.clear();
-      await db.labels.putAll(labels);
-      setState({ labels, syncState: 'success' });
-    } catch {
-      setState({ syncState: 'success' });
-    }
+    await syncAllIssues(fullSync);
   } catch (err) {
-    if (err instanceof api.RepoError) {
-      setState({ syncState: 'error', lastError: err.message });
-      showToast(err.message);
-      navigate('#/settings');
-    } else if (err instanceof api.AuthError) {
-      setState({ syncState: 'auth_error', lastError: err.message });
-      api.clearToken();
-      localStorage.removeItem('todo_pat');
-      sessionStorage.removeItem('todo_pat');
-      showToast('Authentication failed. Please reconnect.');
-      navigate('#/settings');
-    } else {
-      setState({ syncState: 'error', lastError: err.message });
-      showToast(`Sync error: ${err.message}`);
-    }
+    reportSyncError(err);
   }
 }
 
@@ -610,20 +504,20 @@ async function init() {
 
   // With a token and a repo, sync in the background
   if (api.isConfigured()) {
-    syncAllIssues().catch(console.error);
+    sync();
   }
 
   // Sync on tab focus
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && api.isConfigured()) {
-      syncAllIssues().catch(console.error);
+      sync();
     }
   });
 
   // Periodic sync every 5 minutes
   setInterval(() => {
     if (!document.hidden && api.isConfigured()) {
-      syncAllIssues().catch(console.error);
+      sync();
     }
   }, 5 * 60 * 1000);
 }

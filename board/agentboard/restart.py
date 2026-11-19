@@ -1,37 +1,37 @@
-"""Restart or update-and-restart the desktop without losing the agents.
+"""Restart or update-and-restart the desktop without losing the agents (agent-restart and the board's restart
+panel; the README's Restart the desktop section says what the owner sees and chooses).
 
-  plan     what a restart would do: pending updates, and every live agent with its state, last note, what it is
-           waiting on (background commands from its transcript) and the local processes a reboot would kill
-  run      write the manifest, then hand over to a detached worker (it must outlive the SSH connection that asked)
-  worker   heads-up to busy agents and wait (up to N min) for them to finish their turn; optional apt full-upgrade
-           and snap refresh (abort on failure, no reboot); email the owner; reboot
-  restore  at boot (a systemd user unit): bring every agent back in its tmux session with the same conversation,
-           login, model and effort. Quiet agents come back idle; agents that were working get one note saying what
-           they were doing and waiting on. Codex last (a locked keyring can stall it). Email a summary.
-
-Nothing here runs a model. The manifest lives in STATE; `status.json` is what the board shows while it runs.
-Mail goes to the mailroom config's owner_email (agent-mail send --unrouted); without one, nothing is mailed.
+plan only reads. run writes the manifest and hands over to a detached worker, which must outlive the SSH connection
+that asked. restore runs at boot (agent-restart-restore.service) and brings Codex agents back last, because a
+locked keyring can stall Codex. Nothing here runs a model. The manifest lives in STATE; `status.json` is what the
+board shows while it runs. Mail goes to the mailroom config's owner_email (sources.mail_owner, agent-mail send
+--unrouted); without one, nothing is mailed and the log says so.
 """
-import datetime
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
-from . import actions, classify, config, sources
+from . import actions, classify, relaunch, sources
+from .sources import read_json, write_json
 
-STATE = sources.HOME / ".local/state/agent-board/restart"
+STATE = sources.BOARD_STATE / "restart"
 MANIFEST = STATE / "manifest.json"
 STATUS = STATE / "status.json"
 LOG = STATE / "run.log"
 CANCEL = STATE / "cancel"
 CHOICES = ("nudge", "quiet", "skip")
 ACTIVE = ("pending", "waiting", "updating", "rebooting", "restoring")
+CANCELLABLE = ("pending", "waiting")     # the worker checks for CANCEL only before it updates or reboots
+STALE_AFTER = 6 * 3600    # an ACTIVE status not updated for this long is a worker that died
+RESTORE_WAIT = 60         # seconds a resumed agent has to come up (Codex gets 30 more)
+NETWORK_WAIT = 180        # seconds restore waits at boot for name lookups to work before resuming anyway
+RESTORED_DAYS = 7         # how long after a restore its quietly resumed agents keep their colour
+WAITS_SINCE = 24 * 3600   # a background command older than this is not something an agent still waits on
 TOOL_SEARCH = re.compile(r"^(\S*/)?(ugrep|rg) ")
 WRAPPER = re.compile(r"^(\S*/)?(bws run|nohup|setsid|timeout|env)\b")
 NOT_WORK = re.compile(r"mcp|npm exec|npx |uvx|context7|playwright|chrome-devtools|/claude$|^claude |codex-code-mode-host"
@@ -58,23 +58,7 @@ def now():
 
 
 def log(msg):
-    STATE.mkdir(parents=True, exist_ok=True)
-    with open(LOG, "a") as fh:
-        fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
-
-
-def read_json(path, default=None):
-    try:
-        return json.loads(Path(path).read_text())
-    except (OSError, ValueError):
-        return default
-
-
-def write_json(path, obj):
-    STATE.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=1, default=str))
-    os.replace(tmp, path)
+    sources.append_log(LOG, msg)
 
 
 def set_status(status, message, **extra):
@@ -82,96 +66,27 @@ def set_status(status, message, **extra):
     log("%s: %s" % (status, message))
 
 
+def in_progress(st):
+    """Whether a status dict (status.json) is a restart under way: an ACTIVE status updated in the last STALE_AFTER
+    seconds. Reads the clock only."""
+    return st.get("status") in ACTIVE and now() - (st.get("updated") or 0) < STALE_AFTER
+
+
 def status():
-    return read_json(STATUS, {}) or {}
-
-
-def boot_time():
-    try:
-        for line in Path("/proc/stat").read_text().splitlines():
-            if line.startswith("btime "):
-                return float(line.split()[1])
-    except OSError:
-        pass
-    return 0.0
+    """The last restart's status.json, {} when there is none, with two flags the file does not hold: `active`
+    (in_progress) and `cancellable` (active, and early enough that cancel() stops it). Reads STATUS; a damaged one
+    raises (read_json)."""
+    st = read_json(STATUS, {}) or {}
+    if not st:
+        return {}
+    active = in_progress(st)
+    return dict(st, active=active, cancellable=active and st.get("status") in CANCELLABLE)
 
 
 # ------------------------------------------------------------------ what is pending
-def _run(cmd, timeout=60, env=None):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        return r.returncode, r.stdout, r.stderr
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return 127, "", str(e)
-
-
-def _kver(name):
-    return [int(x) if x.isdigit() else 0 for x in re.split(r"[.-]", name)]
-
-
-def updates_info(run=_run):
-    """Pending apt and snap updates, whether a reboot is needed, the running and newest kernels, the GPU."""
-    out = {"checked": now()}
-    code, _, err = run(["/usr/lib/update-notifier/apt-check"], timeout=120)
-    m = re.match(r"\s*(\d+);(\d+)", err or "")
-    out["total"], out["security"] = (int(m.group(1)), int(m.group(2))) if m else (None, None)
-    rr = Path("/var/run/reboot-required")
-    out["reboot_required"] = rr.exists()
-    out["reboot_since"] = rr.stat().st_mtime if rr.exists() else None
-    try:
-        pkgs = Path("/var/run/reboot-required.pkgs").read_text().split()
-        out["reboot_pkgs"] = sorted(set(pkgs))[:8]
-    except OSError:
-        out["reboot_pkgs"] = []
-    out["kernel"] = os.uname().release
-    try:
-        kernels = sorted((d for d in os.listdir("/lib/modules") if d[0].isdigit()), key=_kver)
-        out["newest_kernel"] = kernels[-1] if kernels else ""
-    except OSError:
-        out["newest_kernel"] = ""
-    smi = sources.find_bin("nvidia-smi")
-    if smi:
-        code, so, se = run([smi, "-L"], timeout=20)
-        out["gpu_ok"] = code == 0
-        out["gpu_message"] = "" if code == 0 else ((so or se).strip().splitlines() or [""])[0][:160]
-    else:                        # no NVIDIA tools: no GPU to check, which is not a fault
-        out["gpu_ok"], out["gpu_message"] = None, ""
-    code, so, se = run(["snap", "refresh", "--list"], timeout=60)
-    lines = [l for l in (so or "").splitlines()[1:] if l.strip()] if code == 0 else []
-    out["snaps"] = [l.split()[0] for l in lines]
-    code, so, _ = run(["apt", "list", "--upgradable"], timeout=120)
-    names = [l.split("/")[0] for l in (so or "").splitlines() if "/" in l]
-    out["highlights"] = [n for n in names if re.match(r"(linux-(image|generic|headers-generic)|nvidia-(driver|dkms|utils|kernel))", n)][:10]
-    return out
 
 
 # ------------------------------------------------------------------ what each agent is doing
-def _cmdline(pid, proc="/proc"):
-    try:
-        with open("%s/%d/cmdline" % (proc, int(pid)), "rb") as fh:
-            return [a.decode("utf-8", "replace") for a in fh.read().split(b"\x00") if a]
-    except (OSError, ValueError, TypeError):
-        return []
-
-
-def model_effort(agent):
-    """(model, effort) as the agent runs now: its process arguments first, else its transcript / thread."""
-    argv = _cmdline(agent.get("pid")) if agent.get("pid") else []
-    model = effort = None
-    for i, a in enumerate(argv):
-        if a in ("--model", "-m") and i + 1 < len(argv):
-            model = argv[i + 1]
-        elif a == "--effort" and i + 1 < len(argv):
-            effort = argv[i + 1]
-        elif a.startswith("model_reasoning_effort="):
-            effort = a.split("=", 1)[1].strip("'\"")
-    if agent["cli"] == "codex" and not (model and effort):
-        m, e = actions.codex_settings(agent["id"])
-        model, effort = model or m, effort or e
-    if agent["cli"] == "claude" and not model:
-        _, home = actions.claude_home_of(agent["id"])
-        model = actions.last_claude_model(home, agent["id"]) if home else None
-    return model, effort
 
 
 NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
@@ -183,28 +98,26 @@ BG_KEYS = ('"run_in_background"', "task-notification", "running in background wi
 
 def _epoch(iso):
     try:
-        return datetime.datetime.fromisoformat(iso).timestamp()
-    except (TypeError, ValueError):
+        return sources.iso_ts(iso)
+    except (AttributeError, TypeError, ValueError):
         return None
 
 
-def background_waits(agent, since=24 * 3600, limit=3, now=None):
-    """What a Claude agent said it was waiting for: the descriptions of its recent `run_in_background` commands
+def background_waits(agent, now=None):
+    """What a Claude agent said it was waiting for: the descriptions of its last three `run_in_background` commands
     that are still running. One that ended has a `<task-notification>` with a status (completed, failed, killed)
     or a TaskStop of its task id (the tool result that started it gives that id); one from before this process
-    started (a resume) or older than `since` isn't a wait now."""
+    started (a resume) or older than WAITS_SINCE isn't a wait now."""
     if agent["cli"] != "claude":
         return []
-    _, home = actions.claude_home_of(agent["id"])
+    _, home = sources.claude_home_of(agent["id"])
     if not home:
         return []
-    after = max((now or time.time()) - since, agent.get("started_at") or 0)
+    after = max((now or time.time()) - WAITS_SINCE, agent.get("started_at") or 0)
     out, task_of, ended = [], {}, set()         # ended: tool-use ids and task ids
     for path in Path(home).glob("projects/*/%s.jsonl" % agent["id"]):
         try:
-            with open(path, "rb") as fh:
-                fh.seek(max(0, os.path.getsize(path) - 3_000_000))
-                lines = fh.read().decode("utf-8", "replace").splitlines()
+            lines = sources.transcript_tail(path, 3_000_000)
         except OSError:
             continue
         for line in lines:
@@ -238,14 +151,14 @@ def background_waits(agent, since=24 * 3600, limit=3, now=None):
                                     "what": (inp.get("description") or "")[:160],
                                     "command": (inp.get("command") or "")[:200]})
     return [{k: v for k, v in w.items() if k != "id"} for w in out
-            if w["id"] not in ended and task_of.get(w["id"]) not in ended][-limit:]
+            if w["id"] not in ended and task_of.get(w["id"]) not in ended][-3:]
 
 
-def agent_processes(agent, proc="/proc", limit=8):
-    """Local processes a reboot would kill for this agent: its descendants, and (Claude) anything started with its
-    CLAUDE_CODE_SESSION_ID, which detached jobs keep. MCP servers, the CLI itself and the turn in progress are left
-    out. Claude's Bash tool now ends background commands with `&& pwd -P >| ...` like foreground ones, so a tool
-    shell is the turn's only while the agent is mid-turn, and then only the newest one."""
+def agent_processes(agent, proc="/proc"):
+    """Up to eight local processes a reboot would kill for this agent: its descendants, and (Claude) anything started
+    with its CLAUDE_CODE_SESSION_ID, which detached jobs keep. MCP servers, the CLI itself and the turn in progress
+    are left out. Claude's Bash tool now ends background commands with `&& pwd -P >| ...` like foreground ones, so a
+    tool shell is the turn's only while the agent is mid-turn, and then only the newest one."""
     pid = agent.get("pid")
     busy = agent.get("state") == "busy"
     kids = {}
@@ -292,7 +205,7 @@ def agent_processes(agent, proc="/proc", limit=8):
                 pass
         if not mine:
             continue
-        raw = " ".join(_cmdline(p, proc))
+        raw = " ".join(sources.cmdline(p, proc))
         if "&& pwd -P >|" in raw:
             shells.append(p)                 # a Bash tool call: the turn's or a background job, decided below
             raws[p] = raw
@@ -317,15 +230,25 @@ def agent_processes(agent, proc="/proc", limit=8):
         while WRAPPER.match(kids[p]) and len(children.get(p, [])) == 1:
             p = children[p][0]
         out.append({"pid": p, "cmd": kids[p]})
-    return out[:limit]
+    return out[:8]
 
 
 def default_choice(agent):
     return "nudge" if agent["state"] in ("busy", "background") else "quiet"
 
 
-def plan(collector=None, run=_run, include_updates=True):
-    """Everything the confirmation panel shows. Read-only."""
+def inspect_agent(a):
+    """What a restart records about a live agent beyond its board row: {model, effort, waits, processes}. Reads its
+    login's settings and transcript (sources.model_effort, background_waits) and /proc (agent_processes)."""
+    model, effort = sources.model_effort(a)
+    return {"model": model, "effort": effort, "waits": background_waits(a) if a["state"] == "background" else [],
+            "processes": agent_processes(a)}
+
+
+def plan(collector=None, include_updates=True, inspect=inspect_agent):
+    """Everything the confirmation panel shows: {created, updates, agents, warnings, status}. Read-only. collector
+    gives the board's agent rows (collect.Collector when None); inspect(row) adds what inspect_agent returns;
+    include_updates runs collect.updates_info."""
     from . import collect
     col = collector or collect.Collector()
     rows, _, _ = col.agents(with_git=False)
@@ -333,16 +256,14 @@ def plan(collector=None, run=_run, include_updates=True):
     for a in rows:
         if not a["live"]:
             continue
-        model, effort = model_effort(a)
-        waits = background_waits(a) if a["state"] == "background" else []
-        agents.append({
+        agents.append(dict({
             "id": a["id"], "cli": a["cli"], "name": a.get("name") or "", "display": a["display"], "state": a["state"],
             "reason": a["reason"], "tmux": a.get("tmux") or "", "cwd": a["cwd"], "kind": a.get("kind") or "",
-            "config_dir": a.get("config_dir") or "", "account": a.get("account") or "", "model": model, "effort": effort,
-            "last_activity": a.get("last_activity"), "last_note": a.get("last_note"), "waits": waits,
-            "processes": agent_processes(a), "choice": default_choice(a)})
+            "config_dir": a.get("config_dir") or "", "account": a.get("account") or "",
+            "last_activity": a.get("last_activity"), "last_note": a.get("last_note"), "choice": default_choice(a)},
+            **inspect(a)))
     agents.sort(key=lambda x: (classify.STATES.index(x["state"]) if x["state"] in classify.STATES else 99, x["display"]))
-    upd = updates_info(run) if include_updates else {}
+    upd = collect.updates_info() if include_updates else {}
     warnings = []
     busy = [a["display"] for a in agents if a["state"] == "busy"]
     if busy:
@@ -360,14 +281,15 @@ def plan(collector=None, run=_run, include_updates=True):
 
 
 # ------------------------------------------------------------------ run
-def start_run(update, wait_minutes, choices, dry_run=False, launcher=None, collector=None):
-    """Write the manifest and start the detached worker. choices: {id or name: nudge|quiet|skip}."""
+def start_run(update, wait_minutes, choices, dry_run=False, launcher=None, collector=None, inspect=inspect_agent):
+    """Write the manifest and start the detached worker. choices: {id or name: nudge|quiet|skip}; collector and
+    inspect go to plan."""
     st = status()
-    if st.get("status") in ACTIVE and now() - (st.get("updated") or 0) < 6 * 3600:
+    if in_progress(st):
         return {"ok": False, "error": "a restart is already in progress (%s: %s)" % (st["status"], st.get("message", ""))}
     if not isinstance(wait_minutes, int) or not 0 <= wait_minutes <= 60:
         return {"ok": False, "error": "wait must be 0 to 60 minutes"}
-    p = plan(collector=collector, include_updates=False)
+    p = plan(collector=collector, include_updates=False, inspect=inspect)
     gone = []
     for key, choice in (choices or {}).items():
         if choice not in CHOICES:
@@ -414,22 +336,20 @@ def steps(m):
 def launch_worker():
     """systemd-run --user: the worker lives in the user manager, not in the SSH session that asked (the reboot ends
     that), and it has no SSH_CONNECTION, so agent-mail --unrouted can mail the owner."""
-    exe = str(Path(__file__).resolve().parent.parent / "bin" / "agent-restart")
-    code, out, err = _run(["systemd-run", "--user", "--collect", "--unit", "agent-restart-run-%d" % int(now()),
-                           "--setenv=PATH=%s" % sources_path(), sys.executable, exe, "worker"], timeout=30)
+    exe = str(sources.BOARD_BIN / "agent-restart")
+    code, out, err = sources.run(sources.detached_argv("agent-restart-run-%d" % int(now()), [sys.executable, exe, "worker"],
+                                                       {}, ()), timeout=30)
     return None if code == 0 else "could not start the worker: %s" % (err or out).strip()[-300:]
 
 
-def sources_path():
-    home = str(sources.HOME)
-    return ":".join([home + "/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/snap/bin"])
-
-
 def cancel():
+    """Ask the worker to stop before it updates or reboots: touches CANCEL and logs the request. {ok, output}, or
+    {ok: False, error} when the status is not cancellable."""
     st = status()
-    if st.get("status") not in ("pending", "waiting"):
+    if not st.get("cancellable"):
         return {"ok": False, "error": "nothing to cancel (status %s)" % (st.get("status") or "idle")}
     CANCEL.touch()
+    log("cancel requested (status %s)" % st["status"])
     return {"ok": True, "output": "cancel requested; the restart stops before updating or rebooting"}
 
 
@@ -438,26 +358,17 @@ def cancelled():
 
 
 def mail(subject, body):
-    """One mail to the owner (mailroom config owner_email) through agent-mail; logged and skipped without one."""
-    to = config.owner_email()
-    if not to:
-        log("no owner_email in %s; not mailing: %s" % (config.MAIL_CONFIG, subject))
-        return
-    exe = sources.find_bin("agent-mail")
-    if not exe:
-        log("agent-mail not found; not mailing: %s" % subject)
-        return
-    env = {k: v for k, v in os.environ.items() if not k.startswith("SSH_")}
-    env["PATH"] = sources_path()
-    try:
-        subprocess.run([exe, "send", "--unrouted", "--to", to, "--subject", subject], input=body, text=True,
-                       capture_output=True, timeout=120, env=env)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log("mail failed: %s" % e)
+    """Email the owner (mailroom config owner_email; sources.mail_owner), and log whether it went."""
+    sent, why = sources.mail_owner(subject, body)
+    log("mail '%s': %s" % (subject, "sent" if sent else "NOT SENT: " + why))
 
 
-def worker(reboot=None, run=_run, sleep=time.sleep, collector=None):
-    """The detached half of run: heads-up and wait, update, reboot."""
+def worker(run=sources.run, sleep=time.sleep, collector=None):
+    """The detached half of run, from MANIFEST: heads-up to busy agents (agent-send) and wait, the updates, the
+    reboot. run (as sources.run) carries the apt, snap and reboot commands, all under sudo -n. Returns 0 once the
+    reboot command is accepted or the restart is cancelled, else non-zero with a "failed" status. Writes STATUS,
+    MANIFEST and LOG, and mails the owner when an apt step or the reboot command fails and just before it reboots. A
+    damaged MANIFEST raises (read_json)."""
     from . import collect
     m = read_json(MANIFEST)
     if not m or m.get("status") != "pending":
@@ -470,15 +381,15 @@ def worker(reboot=None, run=_run, sleep=time.sleep, collector=None):
     targets = {a["id"]: a for a in m["agents"] if a["choice"] != "skip"}
     waiting_for = busy_now() & set(targets)
     if waiting_for and m["wait_minutes"]:
-        exe = sources.find_bin("agent-send")
         for sid in waiting_for:
             a = targets[sid]
             try:
-                subprocess.run([exe, "--raw", "--cli", a["cli"], sid],
-                               input=actions.header() + HEADS_UP.format(minutes=m["wait_minutes"], why=why),
-                               text=True, capture_output=True, timeout=45)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+                code, out = sources.run_merged(sources.agent_send_argv(a["cli"], sid),
+                                               stdin=actions.header() + HEADS_UP.format(minutes=m["wait_minutes"],
+                                                                                        why=why), timeout=45)
+            except RuntimeError as e:
+                code, out = 127, str(e)
+            log("heads-up to %s: %s" % (a["display"], "sent" if code == 0 else "FAILED (%d): %s" % (code, out[-200:])))
         deadline = now() + 60 * m["wait_minutes"]
         while now() < deadline:
             if cancelled():
@@ -497,9 +408,11 @@ def worker(reboot=None, run=_run, sleep=time.sleep, collector=None):
         m["status"] = "cancelled"
         write_json(MANIFEST, m)
         return 0
+    # the last cancel check: CANCELLABLE lists the statuses set before it, so the two change together
     # 2. updates
+    snap_failed = ""
     if m["update"]:
-        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive", PATH=sources_path())
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive", PATH=sources.LOGIN_PATH)
         lock = ["-o", "DPkg::Lock::Timeout=900"]       # unattended-upgrades may hold the lock: wait for it, don't fail
         for label, cmd in (("apt-get update", ["sudo", "-n", "apt-get"] + lock + ["update"]),
                            ("apt-get full-upgrade", ["sudo", "-n", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-y"] + lock +
@@ -519,6 +432,8 @@ def worker(reboot=None, run=_run, sleep=time.sleep, collector=None):
         set_status("updating", "snap refresh")
         code, so, se = run(["sudo", "-n", "snap", "refresh"], timeout=1800, env=env)
         log("snap refresh exit %d\n%s\n%s" % (code, so[-2000:], se[-1000:]))
+        if code != 0:               # snaps refresh again on their own: the restart goes on, and the owner is told
+            snap_failed = "snap refresh failed (exit %d): %s" % (code, " ".join((se or so).split())[-300:])
     # 3. last snapshot of activity times (quiet agents keep them), then reboot
     rows = {a["id"]: a for a in col.agents(with_git=False)[0]}
     for a in m["agents"]:
@@ -528,37 +443,27 @@ def worker(reboot=None, run=_run, sleep=time.sleep, collector=None):
     m["status"] = "rebooting"
     m["rebooting_at"] = now()
     write_json(MANIFEST, m)
-    set_status("rebooting", "rebooting now; agents come back after boot")
-    mail("Desktop restarting now", "The desktop is restarting%s. %s\nYou'll get a summary when the agents are back." % (
-        why, "; ".join(steps(m))))
+    set_status("rebooting", "rebooting now; agents come back after boot" + ("; " + snap_failed if snap_failed else ""))
+    mail("Desktop restarting now", "The desktop is restarting%s. %s\n%sYou'll get a summary when the agents are back." % (
+        why, "; ".join(steps(m)), snap_failed + "\n" if snap_failed else ""))
     sleep(3)
-    return (reboot or (lambda: run(["sudo", "-n", "systemctl", "reboot"], timeout=60)[0]))()
+    code, so, se = run(["sudo", "-n", "systemctl", "reboot"], timeout=60)
+    if code != 0:
+        failed = "reboot command failed (exit %d): %s" % (code, " ".join((se or so).split())[-300:])
+        set_status("failed", failed + "; not rebooting")
+        m["status"] = "failed"          # restore must not act on this manifest at some later boot
+        write_json(MANIFEST, m)
+        mail("Desktop restart failed: the reboot command failed",
+             "The desktop did not restart: %s.\nThe agents are still running. No later boot resumes them from this "
+             "restart, so start a new one once the cause is fixed." % failed)
+    return code
 
 
 # ------------------------------------------------------------------ restore
 def launch_line(a):
     """Resume exactly as it ran: its own login (no re-placement), model and effort."""
-    sid, cwd = a["id"], a["cwd"]
-    if a["cli"] == "claude":
-        exe = sources.find_bin("claude") or "claude"
-        cd = a.get("config_dir") or ""
-        env = ("env %s -u CLAUDE_CONFIG_DIR" % actions.SCRUB_ENV if not cd or Path(cd).resolve() == sources.DEFAULT_CLAUDE_HOME.resolve()
-               else "env %s CLAUDE_CONFIG_DIR=%s" % (actions.SCRUB_ENV, shlex.quote(cd)))
-        parts = [env, shlex.quote(exe), "--resume", sid, "--dangerously-skip-permissions"]
-        if a.get("model"):
-            parts += ["--model", shlex.quote(a["model"])]
-        if a.get("effort"):
-            parts += ["--effort", shlex.quote(a["effort"])]
-        parts += ["--name", shlex.quote(a.get("name") or a["display"])]
-        return " ".join(parts)
-    exe = sources.find_bin("codex") or "codex"
-    parts = ["env", actions.SCRUB_ENV, shlex.quote(exe), "resume", "-s", "danger-full-access", "-a", "never", "-C", shlex.quote(cwd),
-             actions.CODEX_NO_UPDATE_PROMPT]
-    if a.get("model"):
-        parts += ["-m", shlex.quote(a["model"])]
-    if a.get("effort"):
-        parts += ["-c", "model_reasoning_effort=%s" % shlex.quote(a["effort"])]
-    return " ".join(parts + [sid])
+    return relaunch.resume_command(a["cli"], a["id"], a["cwd"], a.get("config_dir") or None, a.get("model"),
+                                   a.get("effort"), a.get("name") or a["display"])
 
 
 def nudge_text(a, at, tmux, why):
@@ -578,53 +483,75 @@ def nudge_text(a, at, tmux, why):
         note=(" (your last note: %s)" % note["text"][:300]) if note.get("text") else "", waits=waits, procs=procs)
 
 
-def restore_one(a, run=actions._run, live=None, wait=60, why=""):
+def restore_one(a, why=""):
     if a["choice"] == "skip":
         return {"id": a["id"], "name": a["display"], "result": "not resumed (your choice)"}
     if not a.get("cwd") or not os.path.isdir(a["cwd"]):
         return {"id": a["id"], "name": a["display"], "result": "failed: its folder is gone", "ok": False}
-    live = live or actions.is_live
-    if live(a):
+    if sources.is_live(a):
         return {"id": a["id"], "name": a["display"], "result": "already running", "ok": True}
-    name = a.get("tmux") or actions.tmux_name_for(a, set())
+    name = a.get("tmux") or relaunch.tmux_name_for(a, set())
     if name in sources.tmux_sessions():
-        name = actions.tmux_name_for(dict(a, name=name), set(sources.tmux_sessions()))
-    up, memory, err = actions.launch_in_tmux(a, launch_line(a), name, run=run, live=live,
-                                             wait=wait + (30 if a["cli"] == "codex" else 0))
+        name = relaunch.tmux_name_for(dict(a, name=name), set(sources.tmux_sessions()))
+    wait = RESTORE_WAIT + (30 if a["cli"] == "codex" else 0)
+    up, memory, err, note = relaunch.launch_in_tmux(a, launch_line(a), name, run=sources.run_merged,
+                                                    live=sources.is_live, wait=wait)
     res = {"id": a["id"], "name": a["display"], "tmux": name, "ok": up, "choice": a["choice"]}
+    note = "; " + note if note else ""
     if err or not up:
-        res["result"] = "failed: " + (err or "not live after %ds (open tmux '%s' to see why)" % (wait, name))
+        res["result"] = "failed: " + (err or "not live after %ds (open tmux '%s' to see why)%s" % (wait, name, note))
         return res
     res["result"] = "resumed" + (" and nudged" if a["choice"] == "nudge" else " quietly")
     if a["choice"] == "nudge":
-        exe = sources.find_bin("agent-send")
         time.sleep(2)
-        run([exe, "--raw", "--cli", a["cli"], a["id"]], stdin=nudge_text(a, now(), name, why), timeout=45)
+        try:
+            code, out = sources.run_merged(sources.agent_send_argv(a["cli"], a["id"]),
+                                           stdin=nudge_text(a, now(), name, why), timeout=45)
+        except RuntimeError as e:
+            code, out = 127, str(e)
+        if code != 0:
+            res["result"] = "resumed; nudge FAILED (%s)" % (out[-200:] or "agent-send exit %d" % code)
+    res["result"] += note
     return res
 
 
-def wait_for_network(timeout=180, sleep=time.sleep):
+def wait_for_network(timeout=NETWORK_WAIT, sleep=time.sleep):
+    """True once api.anthropic.com resolves (getent), False after `timeout` seconds of trying."""
     t0 = now()
     while now() - t0 < timeout:
-        if _run(["getent", "hosts", "api.anthropic.com"], timeout=10)[0] == 0:
+        if sources.run(["getent", "hosts", "api.anthropic.com"], timeout=10)[0] == 0:
             return True
         sleep(5)
     return False
 
 
-def restore(force=False, resume=None, sleep=time.sleep, parallel=4):
-    """At boot: resume what the manifest says, once. `force` restores without a reboot (the test cycle)."""
+def restore(force=False, resume=None, sleep=time.sleep, parallel=4, network=wait_for_network):
+    """At boot: resume what the manifest says, once, and return 0, or 2 when an agent failed. `force` restores without
+    a reboot or the network wait (the test cycle). resume(agent) defaults to restore_one; network(timeout, sleep) to
+    wait_for_network, and when it gives up the restore goes on and says so in LOG and the summary mail. Without
+    `force`, a boot whose time is unknown (sources.boot_time) restores nothing, says so in LOG and returns 1. Writes
+    STATUS, MANIFEST and LOG, and mails the owner the summary (not for a test cycle). A damaged MANIFEST raises
+    (read_json)."""
     m = read_json(MANIFEST)
     if not m or m.get("status") != "rebooting":
         return 0
-    if not force and boot_time() < (m.get("rebooting_at") or 0):
-        return 0                       # this boot is older than the restart request: not ours to act on yet
+    boot = sources.boot_time()
+    if not force and boot is None:
+        log("not restoring: this boot's time is unknown (no btime in /proc/stat), so whether the restart's reboot "
+            "has happened cannot be told")
+        return 1
+    if not force and boot < (m.get("rebooting_at") or 0):
+        # this boot is older than the restart request: not ours to act on yet
+        log("not restoring: this boot (%d) predates the restart request (%d)" % (boot, m["rebooting_at"]))
+        return 0
     tag = {"test": True} if m.get("test") else {}      # a test cycle: no chip on the board, no mail
     set_status("restoring", "bringing %d agents back" % sum(1 for a in m["agents"] if a["choice"] != "skip"), **tag)
     m["status"] = "restoring"
     write_json(MANIFEST, m)
-    if not force:
-        wait_for_network(sleep=sleep)
+    offline = ""
+    if not force and not network(timeout=NETWORK_WAIT, sleep=sleep):
+        offline = "network not up after %d s; restoring anyway" % NETWORK_WAIT
+        log(offline)
     why = " for system updates" if m.get("update") else ""
     one = resume or (lambda a: restore_one(a, why=why))
     results, lock = [], threading.Lock()
@@ -658,27 +585,27 @@ def restore(force=False, resume=None, sleep=time.sleep, parallel=4):
                restored_at=m["restored_at"], **tag)
     if not tag:
         mail("Desktop is back: %d of %d agents restored" % (len(ok), len(results)),
-             "The desktop restarted%s and the agents are back.\n\n" % why + "\n".join(
+             "The desktop restarted%s and the agents are back.\n\n%s" % (why, offline + "\n\n" if offline else "") + "\n".join(
                  "- %s: %s" % (r["name"], r["result"]) for r in sorted(results, key=lambda r: (r.get("ok") is not False, r["name"]))))
     return 0 if not bad else 2
 
 
-def restored_activity(window=7 * 86400):
-    """{session id: (restored_at, last activity before the restart)} for quietly resumed agents, so the board keeps
-    their colour: a resume is not activity."""
+def restored_activity():
+    """{session id: (restored_at, last activity before the restart)} for agents quietly resumed in the last
+    RESTORED_DAYS, so the board keeps their colour: a resume is not activity. A damaged MANIFEST raises
+    (read_json)."""
     m = read_json(MANIFEST)
-    if not m or m.get("status") != "done" or now() - (m.get("restored_at") or 0) > window:
+    if not m or m.get("status") != "done" or now() - (m.get("restored_at") or 0) > RESTORED_DAYS * 86400:
         return {}
     before = {a["id"]: a.get("last_activity") or 0 for a in m.get("agents", [])}
     return {r["id"]: (m["restored_at"], before.get(r["id"], 0)) for r in m.get("results", [])
             if r.get("ok") and r.get("choice") == "quiet"}
 
 
-def test_cycle(names, choices=None, wait=30):
+def test_cycle(names, choices=None):
     """The restore path for real, without a reboot: record these agents, kill their tmux sessions (as a reboot
     would), then restore them. For testing on scratch agents only."""
-    st = status()
-    if st.get("status") in ACTIVE and now() - (st.get("updated") or 0) < 6 * 3600:
+    if in_progress(status()):
         print("a restart is in progress; not testing")
         return 1
     p = plan(include_updates=False)
@@ -699,9 +626,9 @@ def test_cycle(names, choices=None, wait=30):
         if a.get("tmux"):
             subprocess.run([tmux, "kill-session", "-t", "=" + a["tmux"]], capture_output=True)
     t0 = now()
-    while now() - t0 < wait and any(actions.is_live(a) for a in agents):
+    while now() - t0 < 30 and any(sources.is_live(a) for a in agents):        # 30 s for them to exit
         time.sleep(1)
-    print("killed: %s" % ", ".join("%s (%s)" % (a["display"], "gone" if not actions.is_live(a) else "STILL LIVE") for a in agents))
+    print("killed: %s" % ", ".join("%s (%s)" % (a["display"], "gone" if not sources.is_live(a) else "STILL LIVE") for a in agents))
     code = restore(force=True)
     for r in read_json(MANIFEST)["results"]:
         print("  %s: %s" % (r["name"], r["result"]))

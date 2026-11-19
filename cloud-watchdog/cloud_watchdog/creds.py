@@ -14,7 +14,9 @@ keys come from is the account's `secrets` backend (config.resolve_account fills 
   none      no keys at all (Slurm over SSH; a Modal account that uses a ~/.modal.toml profile).
 
 Why the command travels base64-encoded in the environment: `bws run` re-joins the words after `--`
-through /bin/sh, which destroys quoting.
+through /bin/sh, which destroys quoting. Only the command and the variable names travel there, because
+Linux caps each environment string at 128 KiB; a request of any size goes on stdin, which `bws run`
+leaves to the child.
 """
 import base64
 import json
@@ -33,12 +35,13 @@ VAULT_BUSY = re.compile(r"Received error message from server: \[(?:429|503)\b")
 BACKENDS = ("env-file", "bws", "environ", "none")
 
 
-def base_env(extra=None):
+def base_env():
+    """The environment of every command the watchdog runs: the BASE_NAMES variables this process has, PATH as
+    config.service_path makes it from this process's, PYTHONPATH the repo, and HOME."""
     env = {k: os.environ[k] for k in BASE_NAMES if k in os.environ}
-    env["PATH"] = ":".join([str(config.HOME / ".local" / "bin"), env.get("PATH", "/usr/local/bin:/usr/bin:/bin")])
+    env["PATH"] = config.service_path(env.get("PATH"))
     env["PYTHONPATH"] = str(config.REPO_DIR)
     env.setdefault("HOME", str(config.HOME))
-    env.update(extra or {})
     return env
 
 
@@ -108,29 +111,31 @@ def _payload(argv, env, remap, need, env_file=None):
     return base64.b64encode(json.dumps(p).encode()).decode()
 
 
-def run_as(acct, argv, timeout=300, extra_env=None):
-    """Run argv with this account's credentials (acct as resolved by config.load). Returns (code, stdout, stderr)."""
-    env = base_env(extra_env)
+def run_as(acct, argv, timeout=300, input_text=None):
+    """Run argv in base_env() with this account's credentials (acct as resolved by config.load), with `input_text`
+    on its stdin (None: this process's stdin): (code, stdout, stderr). Under bws, tried up to 3 times while the vault
+    answers 429 or 503."""
+    env = base_env()
     backend, remap, need, problem = plan(acct)
     if problem:
         return 1, "", problem
     if backend == "none":
-        return util.run(argv, env=env, timeout=timeout)
+        return util.run(argv, env=env, timeout=timeout, input_text=input_text)
     child = [sys.executable, str(CHILDEXEC)]
     if backend == "env-file":
         return util.run(child, env=dict(env, CW_CHILD=_payload(argv, env, remap, need, acct["env_file"])),
-                        timeout=timeout)
+                        timeout=timeout, input_text=input_text)
     if backend == "environ":
         child_env = dict(env, CW_CHILD=_payload(argv, env, remap, need))
         child_env.update({s: os.environ[s] for s in remap.values() if s in os.environ})
-        return util.run(child, env=child_env, timeout=timeout)
+        return util.run(child, env=child_env, timeout=timeout, input_text=input_text)
     # bws
     bws_env = dict(env, CW_CHILD=_payload(argv, env, remap, need))
     bws_env["BWS_ACCESS_TOKEN"] = config.expand(acct["bws_token_file"]).read_text().strip()
     cmd = ["bws", "run", "--project-id", config.expand(acct["bws_project_file"]).read_text().strip(), "--",
            " ".join(child)]
     for attempt in range(3):
-        code, out, err = util.run(cmd, env=bws_env, timeout=timeout)
+        code, out, err = util.run(cmd, env=bws_env, timeout=timeout, input_text=input_text)
         # Bitwarden's API occasionally answers 503/429 when several children start at once. Retry only
         # that: bws's own server-error line, and only when the child never ran (no output). A provider's
         # 429/503 inside the child is reported by collect.py as JSON on stdout and is never retried here.

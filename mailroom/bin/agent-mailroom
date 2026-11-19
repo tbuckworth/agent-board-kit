@@ -1,30 +1,12 @@
 #!/usr/bin/env python3
-"""agent-mailroom: poll the agents Gmail inbox and route replies to sessions.
+"""agent-mailroom: poll the agents Gmail inbox and route replies to sessions, with the replies written in the Mail tab.
 
-    agent-mailroom            run forever (systemd --user service)
+    agent-mailroom            run forever (systemd/agent-mailroom.service)
     agent-mailroom --once     one poll, then exit
     agent-mailroom --dry-run  decide and log, but deliver nothing and change no labels
     agent-mailroom --baseline reset the history cursor to now (ignore anything older)
 
-Every 30 s (config poll_seconds) it asks Gmail for messages added to INBOX since the last
-history id, and for each one walks the routing slip:
-
-  1. sender not on the allowlist       -> held   (never delivered anywhere)
-     reply/forward to [mailroom] notice -> the orchestrator, before any session hints
-  2. In-Reply-To/References we sent    -> that session
-  3. Gmail thread we sent in           -> that session
-  4. agents+TAG@ in To/Delivered-To    -> the session that owns TAG
-  5. [#TAG] in the subject             -> the session that owns TAG
-  6. no match, sender known            -> the orchestrator: one fresh `claude -p` run per event
-     (agentmail/orchestrate.py); a failed run holds the mail and alerts the owner
-
-Two sender tiers: `allowlist` is the owner; `collaborators` are other people's agents, whose
-mail is delivered marked as external-agent input and is rate-limited and loop-guarded. Both tiers
-need a DKIM pass for the sender's domain (require_dkim). Everyone else is held.
-
-Delivered mail goes to the session via agent-send (resuming it if it is not live) and is
-labelled mailroom/delivered and marked read. Held mail is labelled mailroom/held and left
-unread. Own outbound copies are ignored. State: ~/.local/state/agent-mail/mailroom.sqlite.
+Details: README.md, sections "The mailroom", "Sender tiers, DKIM, collaborators" and "The Mail tab's mailbox".
 """
 import argparse
 import fcntl
@@ -35,14 +17,15 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import alerts, config, deliver, gmail, orchestrate, recovery, registry, review, routing, statuslog  # noqa: E402
+from agentmail import (alerts, config, deliver, gmail, groupmail, mailroom, orchestrate, recovery,  # noqa: E402
+                       review, routing, statuslog)
+from agentmail.groups import GroupError  # noqa: E402
+from agentmail.watch import log  # noqa: E402
 from agentmail.store import Store  # noqa: E402
 
 STOP = False
-
-
-def log(msg):
-    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
+# When Gmail has dropped the history cursor, the inbox is searched from the last poll for at most this many messages.
+RESCAN_LIMIT = 1000
 
 
 def on_signal(signum, frame):
@@ -52,6 +35,9 @@ def on_signal(signum, frame):
 
 
 def process(svc, st, cfg, gid, dry_run):
+    """Gmail message gid, once: read it, skip the agents account's own mail, record it (pending) with the session the
+    routing slip finds (mailroom.claim), hold a sender on neither list or without a DKIM pass, and route the rest
+    (route)."""
     if st.seen(gid):
         return
     msg = gmail.get_full(svc, gid)
@@ -59,8 +45,6 @@ def process(svc, st, cfg, gid, dry_run):
     from_name, from_addr = routing.sender(hdrs.get("from", ""))
     subject = hdrs.get("subject", "")
     thread_id = msg.get("threadId")
-    labels = cfg["labels"]
-    owner = config.owner_name(cfg)
 
     if from_addr == cfg["account"]:
         st.record_inbound(gmail_id=gid, thread_id=thread_id, message_id=hdrs.get("message-id"),
@@ -70,162 +54,266 @@ def process(svc, st, cfg, gid, dry_run):
         return
 
     body = routing.strip_quotes(gmail.body_text(msg))
-    session, rule = routing.match(st, hdrs, thread_id, cfg["account"])
-    if session is not None and session["cli"] == "orchestrator":
-        session, rule = None, "orchestrator-thread"   # the orchestrator has no session; run it with the thread
+    session, rule = mailroom.claim(st, hdrs, thread_id, cfg["account"])
     tier = routing.sender_tier(from_addr, cfg)
     auth = gmail.auth_results(hdrs)
-    collab = cfg["collaborators"].get(from_addr, {}) if tier == "collaborator" else {}
-    who_name = (collab.get("name") if collab else None) or from_name
-
-    def hold(inbound_id, detail, alert=None):
-        st.update_inbound(inbound_id, action="held", detail=detail)
-        log("hold   #%d from %s %r: %s (match %s)" % (inbound_id, from_addr, subject, detail, rule or "none"))
-        if not dry_run:
-            gmail.modify(svc, gid, add=[gmail.ensure_label(svc, labels["held"])])
-            if alert:
-                alerts.send_alert(svc, st, cfg, *alert)
-
     inbound_id = st.record_inbound(
         gmail_id=gid, thread_id=thread_id, message_id=hdrs.get("message-id"),
         from_addr=from_addr, from_name=from_name, subject=subject,
         matched_tag=session["tag"] if session else None, match_rule=rule, action="pending", body=body)
 
-    if tier is None:
-        return hold(inbound_id, "sender not on allowlist")
-    if cfg.get("require_dkim", True) and not routing.dkim_ok(from_addr, auth):
-        return hold(inbound_id, "DKIM check failed for %s (auth: %s)" % (from_addr, auth["raw"][:120] or "no Authentication-Results header"),
-                    alert=("dkim", from_addr, "mail from %s failed DKIM; held" % from_addr,
-                           "Subject %r. Authentication-Results: %s\n\nMail that fails DKIM is never released (it could be forged; it is "
-                           "inbound #%d). If it was genuine, send it again from a client that signs it. If it keeps happening "
-                           "for a real sender, set require_dkim=false." % (subject, auth["raw"] or "(none)", inbound_id)))
+    refused = mailroom.sender_hold(cfg, tier, from_addr, auth, subject, inbound_id)
+    if refused:
+        detail, alert = refused
+        return hold_mail(svc, st, cfg, st.inbound(inbound_id), rule, detail, alert, dry_run)
+    route(svc, st, cfg, st.inbound(inbound_id), tier, dry_run)
+
+
+def process_local(svc, st, cfg, row, dry_run):
+    """A reply the owner wrote in the Mail tab (inbound row row, which `agent-mail mailbox answer` recorded with action
+    "local" and the session the routing slip found): made pending first, so that a crash never routes it twice, as a
+    Gmail mail is recorded pending, then routed as the owner's mail (route), with no DKIM check, since it came in through no
+    mail server. It has no Gmail copy, so it gets no labels (mailroom.label)."""
+    if not st.take_local_reply(row["id"]):
+        return
+    log("tab    #%d from %s %r: a reply written in the Mail tab" % (row["id"], row["from_addr"], row["subject"]))
+    route(svc, st, cfg, st.inbound(row["id"]), "owner", dry_run)
+
+
+def log_hold(svc, st, cfg, row, rule, detail, alert, dry_run):
+    """Log the hold of inbound mail row, already saved, under routing rule rule, and send alert (alerts.send_alert's
+    kind, key, subject and body, or None) unless dry_run."""
+    log("hold   #%d from %s %r: %s (match %s)" % (row["id"], row["from_addr"], row["subject"], detail, rule or "none"))
+    if alert and not dry_run:
+        alerts.send_alert(svc, st, cfg, *alert)
+
+
+def hold_mail(svc, st, cfg, row, rule, detail, alert, dry_run):
+    """Hold inbound mail row with detail, labelled held unless dry_run (mailroom.set_state), then log_hold."""
+    mailroom.set_state(svc, st, cfg, row["id"], row["gmail_id"], "held", not dry_run, detail=detail)
+    log_hold(svc, st, cfg, row, rule, detail, alert, dry_run)
+
+
+def route(svc, st, cfg, row, tier, dry_run):
+    """Route inbound mail row, recorded pending with the session the routing slip found (matched_tag, match_rule),
+    from a sender of tier ("owner" or "collaborator"): a reply to a group's mail is posted in the group; a
+    collaborator's mail may be held by the flood and loop guards; mail a session claimed is delivered to it, and the
+    owner's mail to a session that has gone goes to the orchestrator (the orphan fallback); the rest goes to the
+    orchestrator, with the thread (mailroom.thread_messages). Gmail mail (process) and replies written in the Mail
+    tab (process_local) both come here. The files of a Mail-tab reply go to the machine of the session it is
+    delivered to, or of the orchestrator, first (mailroom.delivered_body); files that cannot be put there make a failed
+    delivery, which is held."""
+    inbound_id, gid, thread_id, rule = row["id"], row["gmail_id"], row["thread_id"], row["match_rule"]
+    from_name, from_addr, subject, body = row["from_name"], row["from_addr"], row["subject"], row["body"]
+    session = st.session_by_tag(row["matched_tag"]) if row["matched_tag"] else None
+    collab = cfg["collaborators"].get(from_addr, {}) if tier == "collaborator" else {}
+    who_name = collab.get("name") or from_name
+
+    def held(detail, alert=None):
+        """Log a hold already saved, and send its alert."""
+        log_hold(svc, st, cfg, row, rule, detail, alert, dry_run)
+
+    def hold(detail, alert=None):
+        hold_mail(svc, st, cfg, row, rule, detail, alert, dry_run)
+
+    if session is not None and session["cli"] == routing.GROUP_CLI:
+        return post_in_group(svc, st, cfg, inbound_id, gid, session, tier, from_addr, subject, body, dry_run, hold)
+
+    def fetch_thread():
+        """The thread's messages and their transcript for the event text. A fetch that fails raises
+        (hold_after_error holds the mail): without the thread the loop guard counts nothing."""
+        msgs = mailroom.thread_messages(svc, st, row) if thread_id else []
+        return msgs, routing.thread_context(msgs, cfg["account"], cfg["collaborators"]) if msgs else ""
 
     # thread transcript: for the orchestrator always; for a session only when a collaborator wrote
-    thread_msgs = []
-    if thread_id and (session is None or tier == "collaborator"):
-        try:
-            thread_msgs = gmail.thread_messages(svc, thread_id)
-        except Exception as e:
-            log("warn   could not fetch thread %s: %s" % (thread_id, e))
-    thread_txt = routing.thread_context(thread_msgs, cfg["account"], cfg["collaborators"]) if thread_msgs else ""
-    if session is None and any(routing.sender(h.get("from", ""))[1] == cfg["account"] and
-                               h.get("x-agent-mailroom") == "alert" for h, _b, _ts, _gid in thread_msgs):
+    thread_msgs, thread_txt = fetch_thread() if session is None or tier == "collaborator" else ([], "")
+    if session is None and any(routing.is_alert(h, cfg["account"]) for h, _b, _ts, _gid in thread_msgs):
         rule = "mailroom-notice"
         st.update_inbound(inbound_id, match_rule=rule)
 
     if tier == "collaborator":
-        n_hour = st.count_from_since(from_addr, time.time() - 3600)
-        if n_hour > int(cfg.get("collaborator_hourly_cap", 10)):
-            return hold(inbound_id, "collaborator hourly cap (%d) exceeded" % cfg["collaborator_hourly_cap"],
-                        alert=("flood", from_addr, "%s sent more than %d mails in an hour; holding" % (who_name, cfg["collaborator_hourly_cap"]),
-                               "Latest subject %r. Held mail: `agent-mail inbox --held`." % subject))
         run = routing.trailing_agent_run(thread_msgs, cfg["account"], cfg["collaborators"]) if thread_msgs else 0
-        if run > int(cfg.get("agent_thread_cap", 12)):
-            return hold(inbound_id, "agent-to-agent thread has %d messages with no human; loop guard" % run,
-                        alert=("loop", thread_id or from_addr, "possible agent loop with %s; thread held" % who_name,
-                               "Thread %r has %d consecutive agent messages. Reply in the thread yourself to reset the guard, "
-                               "or `agent-mail release %d <session>`." % (subject, run, inbound_id)))
-        if cfg.get("notify_owner_new_collab_thread", True) and thread_id and not st.thread_seen_before(thread_id, gid) and not dry_run:
+        refused = mailroom.collaborator_hold(cfg, who_name, from_addr, subject, thread_id, inbound_id,
+                                             st.count_from_since(from_addr, time.time() - 3600), run)
+        if refused:
+            return hold(*refused)
+        if cfg["notify_owner_new_collab_thread"] and thread_id and not st.thread_seen_before(thread_id, gid) and not dry_run:
             alerts.send_alert(svc, st, cfg, "collab-thread", thread_id,
                               "%s started a thread: %s" % (who_name, subject),
                               "From %s. First message:\n\n%s\n\nNo action needed; this is the visibility notice for a new "
                               "agent-to-agent thread. It is being handled by %s." % (
                                   from_addr, body[:1500], ("session %s" % (session["session_name"] or session["session_id"][:8])) if session else "the orchestrator"))
 
+    gone = None   # the closed session, when the owner's mail to it goes to the orchestrator instead
     if session is not None:
         who = "%s@%s %s [%s]" % (session["cli"], session["origin_host"], session["session_name"] or "", session["session_id"][:8])
-        if tier == "collaborator":
-            text = routing.collaborator_text(inbound_id, who_name, from_addr, collab.get("owner"), subject, body, thread_txt,
-                                             owner_name=owner)
-        else:
-            text = routing.inbound_text(inbound_id, from_name, from_addr, subject, body)
         if dry_run:
             log("would deliver #%d (%s) from %s %r -> %s via %s" % (inbound_id, tier, from_addr, subject, who, rule))
             st.update_inbound(inbound_id, action="dry-run", detail="would deliver to " + who)
             return
-        rc, out = deliver.deliver_session(session, text, cfg)
-        if rc == 0:
-            action = "queued" if session["origin_host"] != cfg["host_id"] else "delivered"
-            st.update_inbound(inbound_id, action=action, detail="%s: %s" % (tier, out))
-            gmail.modify(svc, gid, add=[gmail.ensure_label(svc, labels["delivered"])], remove=["UNREAD"])
-            log("deliver #%d (%s) from %s %r -> %s via %s: %s" % (inbound_id, tier, from_addr, subject, who, rule, out))
+        try:
+            delivered, files = mailroom.delivered_body(cfg, row, session["origin_host"])
+        except mailroom.FILES_NOT_PLACED as e:   # a failed delivery: held, and the owner told
+            rc, out = 1, "the files were not put on %s: %s" % (session["origin_host"], e)
         else:
-            hold(inbound_id, "delivery failed (%d): %s" % (rc, out))
+            if files:
+                log("files  #%d: %d put on %s for %s" % (inbound_id, len(files), session["origin_host"], who))
+            text = routing.event_text("session", tier, inbound_id, from_name, from_addr, collab, subject, delivered,
+                                      thread_txt, cfg["owner_name"],
+                                      reminder=mailroom.owner_reminder(st, cfg, tier, inbound_id, body))
+            rc, out = mailroom.deliver_to_session(svc, st, cfg, inbound_id, gid, session, text, tier, True)
+        if rc == 0:
+            log("deliver #%d (%s) from %s %r -> %s via %s: %s" % (inbound_id, tier, from_addr, subject, who, rule, out))
+            return
+        if tier != "owner" or rc not in deliver.SESSION_GONE:
+            hold("delivery failed (%d): %s" % (rc, out))
             recovery.hold_delivery(st, st.inbound(inbound_id), session, "delivery failed (%d): %s" % (rc, out))
             recovery.notify(svc, st, cfg, st.inbound(inbound_id))
-        return
+            return
+        # the orphan fallback: the session has closed or exited, so the owner's mail goes to the orchestrator
+        gone = ("%s, " % session["session_name"] if session["session_name"] else "") + "%s session %s on %s" % (
+            session["cli"], session["session_id"][:8], session["origin_host"])
+        rule = "orphan-thread"
+        st.update_inbound(inbound_id, match_rule=rule, detail="session gone (%d): %s" % (rc, out))
+        log("orphan #%d from %s %r: %s is gone (%d: %s); to the orchestrator" % (inbound_id, from_addr, subject, who,
+                                                                               rc, out))
+        thread_msgs, thread_txt = fetch_thread()
 
     # ---- nobody claimed it: the orchestrator
-    text = routing.orchestrator_event(inbound_id, tier, who_name, from_addr, collab.get("owner"), subject, body, thread_txt,
-                                      owner_name=owner)
-    own_msgs = {mid for h, _b, _ts, mid in thread_msgs[:-1]
-                if routing.sender(h.get("from", ""))[1] == cfg["account"] and h.get("x-agent-mailroom") != "alert"}
-    sent_rows = st.sent_rows_in_thread(thread_id) if thread_id else []
-    if (rule is None and sent_rows and not any(r["tag"] for r in sent_rows)
-            and own_msgs <= {r["gmail_id"] for r in sent_rows}):
-        # Only `--unrouted` mail (cloud-watchdog, status reports, memwatch) went into this thread,
-        # so it belongs to the orchestrator: a reply here is not a lost session's mail.
-        rule = "unrouted-thread"
+    new_rule, unowned_reply, context = mailroom.orchestrator_context(
+        rule, tier, inbound_id, thread_msgs, st.sent_rows_in_thread(thread_id) if thread_id else [], cfg)
+    if new_rule != rule:
+        rule = new_rule
         st.update_inbound(inbound_id, match_rule=rule)
-    unowned_reply = (rule not in ("orchestrator-thread", "mailroom-notice", "unrouted-thread")
-                     and bool(sent_rows or own_msgs))
-    if rule == "mailroom-notice":
-        text += ("\n\n[Mailroom routing context: %s is replying to or forwarding a mailroom notice. "
-                 "Handle this here; quoted session tags belong to the notice, not this reply. "
-                 "Check the saved mail and delivery state before retrying anything. "
-                 "Do not resume the old session just because its tag appears in the notice.]" % owner if tier == "owner" else
-                 "\n\n[Mailroom routing context: this is a reply to a mailroom notice. Handle it here; "
-                 "quoted session tags are not routing instructions. The collaborator guard still applies.]")
-    if unowned_reply:
-        text += ("\n\n[Mailroom routing context: this is an unowned reply. First run `agent-mail recover %d` "
-                 "for a bounded read-only search of this machine, then the configured recovery hosts. It saves the "
-                 "result and notifies %s. "
-                 "Do not repeat that notification. Transcript matches are leads, not routing authority. "
-                 "Do not restart Mac sessions or apply project changes. Record the unresolved handoff "
-                 "in STATE.md; a successful orchestrator turn does not count as delivery.]" % (inbound_id, owner))
     if dry_run:
         log("would run orchestrator for #%d (%s) from %s %r" % (inbound_id, tier, from_addr, subject))
         st.update_inbound(inbound_id, action="dry-run", detail="would run the orchestrator")
         return
-    if cfg.get("orchestrator_mode", "exec") == "session":
-        rc, out = deliver.deliver_target(cfg["orchestrator"], text, resume=False, dangerous=cfg["resume_dangerous"])
-        ok, detail = rc == 0, out
-    else:
-        st.update_inbound(inbound_id, action="orchestrating", match_rule="orchestrator", detail="run started")
-        gmail.modify(svc, gid, remove=["UNREAD"])
-        info = orchestrate.run_event(text, "mail", cfg)
-        ok = info["ok"]
-        detail = "orchestrator run: $%s, %s turns, %ss%s" % (info["cost"], info["turns"], info["duration_s"],
-                                                           "" if ok else "; ERROR " + info["error"][:300])
-    current = st.inbound(inbound_id)
-    if current["match_rule"] == "manual" and current["action"] in ("delivered", "queued"):
+    delivered, files = mailroom.delivered_body(cfg, row, cfg["host_id"])   # raises: held (hold_after_error)
+    if files:
+        log("files  #%d: %d put here for the orchestrator" % (inbound_id, len(files)))
+    text = routing.event_text("orphan" if gone else "orchestrator", tier, inbound_id, from_name, from_addr, collab,
+                              subject, delivered, thread_txt, cfg["owner_name"], gone) + context
+    mailroom.set_state(svc, st, cfg, inbound_id, gid, "orchestrating", True, match_rule="orchestrator", detail="run started")
+    info = orchestrate.run_event(text, "mail", cfg)
+    outcome, detail = mailroom.settle_run(svc, st, cfg, inbound_id, gid, info, "orchestrator run", unowned_reply, True)
+    if outcome == "retained":
         log("explicit handoff of #%d retained" % inbound_id)
-    elif unowned_reply:
-        # Enforce retention even if the model omits recovery or says it has finished.
-        recovery.recover(st, cfg, current)
-        st.update_inbound(inbound_id, action="held")
-        gmail.modify(svc, gid, add=[gmail.ensure_label(svc, labels["held"])],
-                     remove=[gmail.ensure_label(svc, labels["delivered"])])
-        recovery.notify(svc, st, cfg, st.inbound(inbound_id))
-        log("held unowned reply #%d after recovery; orchestrator ok=%s" % (inbound_id, ok))
-    elif current["recovery_json"] and current["action"] == "held":
-        recovery.notify(svc, st, cfg, current)
-    elif ok:
-        st.update_inbound(inbound_id, action="delivered", match_rule="orchestrator", detail=detail)
-        gmail.modify(svc, gid, add=[gmail.ensure_label(svc, labels["delivered"])], remove=["UNREAD"])
+    elif outcome == "unowned":
+        log("held unowned reply #%d after recovery; orchestrator ok=%s" % (inbound_id, info["ok"]))
+    elif outcome == "recovery":
+        log("held   #%d: recovery saved during the run; orchestrator ok=%s: %s" % (inbound_id, info["ok"], detail))
+    elif outcome == "delivered":
         log("orchestrated #%d (%s) from %s %r: %s" % (inbound_id, tier, from_addr, subject, detail))
-    else:
-        hold(inbound_id, "orchestrator failed: " + detail,
+    elif outcome == "failed":
+        held(st.inbound(inbound_id)["detail"],
              alert=("orchestrator-fail", "run", "orchestrator run failed on mail #%d" % inbound_id,
                     "The orchestrator couldn't finish handling your email. Nothing has been lost: the email is "
-                    "saved in Gmail and in the mailroom. It may have done part of the work before stopping.\n\n"
+                    "saved %s. It may have done part of the work before stopping.\n\n"
                     "Reply here if you need help continuing. Delivery stays on hold until someone checks what "
                     "was done and fixes the problem; you don't need to resend your email.\n\n"
                     "From: %s\nSubject: %s\nFor diagnosis: %s\nSaved mail: agent-mail show %d\n"
-                    "After checking the outcome: agent-mail rerun %d." % (from_addr, subject, detail, inbound_id, inbound_id)))
+                    "After checking the outcome: agent-mail rerun %d." % (routing.saved_where(gid), from_addr, subject,
+                                                                          detail, inbound_id, inbound_id)))
+    else:
+        raise ValueError("settle_run gave an unknown outcome %r" % outcome)
+
+
+def post_in_group(svc, st, cfg, inbound_id, gid, group_row, tier, from_addr, subject, body, dry_run, hold):
+    """A reply to a group's mail (groupmail): the owner's becomes their post in the group; anyone else's is held. A
+    reply of theirs that cannot be posted (an empty one, say) is held, and they are told why."""
+    title = group_row["session_name"]
+    if tier != "owner":
+        return hold("a reply to the mail of group %r from %s: only %s posts in a group by mail"
+                    % (title, from_addr, cfg["owner_name"]))
+    if dry_run:
+        log("would post #%d from %s in group %r" % (inbound_id, from_addr, title))
+        st.update_inbound(inbound_id, action="dry-run", detail="would post in group %r" % title)
+        return
+    try:
+        out = groupmail.post_reply(cfg, group_row["session_id"], body, gid)
+    except GroupError as e:
+        return hold("not posted in group %r: %s" % (title, e),
+                    alert=("group-post", str(inbound_id), "your reply to group %r was not posted" % title,
+                           "Your reply (subject %r) was not posted in the group: %s\n\nThe mail is saved: agent-mail "
+                           "show %d. Reply to the group's mail again, or post on the Agent Board." % (subject, e,
+                                                                                              inbound_id)))
+    mailroom.set_state(svc, st, cfg, inbound_id, gid, "delivered", True, detail=out.splitlines()[0])
+    log("group  #%d from %s posted in %r:\n%s" % (inbound_id, from_addr, title, out.rstrip()))
+
+
+def hold_after_error(svc, st, cfg, gid, e, dry_run):
+    """process() or process_local() raised e on the mail of Gmail id gid (a Mail-tab reply's: routing.local_gmail_id).
+    Mail it saved but had not settled (pending or orchestrating) is held with the error, labelled held (but for a
+    Mail-tab reply: mailroom.label), and the owner is alerted, once per error type per alerts.DEDUPE_SECONDS. A row that
+    already records an outcome keeps it; mail it never saved gets an "error" row. A label or alert that fails here is
+    logged as ERROR."""
+    reason = "%s: %s" % (type(e).__name__, e)
+    row = st.inbound_by_gmail_id(gid)
+    if row is None:
+        log("error  %s: %s" % (gid, reason))
+        st.record_inbound(gmail_id=gid, action="error", detail=reason)
+        return
+    if row["action"] not in ("pending", "orchestrating"):
+        log("error  %s (#%d, already %s; kept): %s" % (gid, row["id"], row["action"], reason))
+        return
+    mailroom.set_state(svc, st, cfg, row["id"], gid, "held", False, detail="error: " + reason)
+    log("error  %s (#%d held): %s" % (gid, row["id"], reason))
+    if dry_run:
+        return
+    try:
+        mailroom.label(svc, cfg, gid, "held")
+    except Exception as e2:
+        log("ERROR  #%d: could not label it held: %s: %s" % (row["id"], type(e2).__name__, e2))
+    group = st.session_by_tag(row["matched_tag"]) if row["matched_tag"] else None
+    if group is not None and group["cli"] == routing.GROUP_CLI:   # a reply to a group's mail: nobody reruns it
+        retry = "%s, with the reply's text" % groupmail.post_command(cfg, group["session_id"])
+    else:
+        retry = "agent-mail rerun %d (the orchestrator) or agent-mail release %d <session>" % (row["id"], row["id"])
+    try:
+        alerts.send_alert(svc, st, cfg, "process-error", type(e).__name__, "mail #%d hit an error and is held" % row["id"],
+                          "The mailroom hit an error while handling an email and stopped. Nothing has been lost: the "
+                          "email is saved %s. It may have been partly handled before the error.\n\n"
+                          "From: %s\nSubject: %s\nFor diagnosis: %s\nSaved mail: agent-mail show %d\n"
+                          "After fixing the cause: %s.\n\n"
+                          "Other mail that fails with %s in the next %d hours is held without another alert; "
+                          "agent-mail inbox --held lists it." % (
+                              routing.saved_where(gid), row["from_addr"], row["subject"], reason, row["id"], retry,
+                              type(e).__name__, alerts.DEDUPE_SECONDS // 3600))
+    except Exception as e2:
+        log("ERROR  #%d: could not alert %s: %s: %s" % (row["id"], cfg["owner_name"], type(e2).__name__, e2))
+
+
+def rescan(svc, st, cfg, cursor, dry_run):
+    """Gmail no longer has history from the saved cursor: search the inbox from the start of the last successful
+    poll (when that cursor was read), at most RESCAN_LIMIT messages, and alert the owner that the gap was rescanned.
+    Returns the ids, oldest first, and the history id to save. Raises if no poll was ever recorded."""
+    since = st.get_meta("last_poll")
+    if since is None:
+        raise RuntimeError("history id %s is gone and no successful poll is recorded to search from; "
+                           "agent-mailroom --baseline restarts from now, ignoring older mail" % cursor)
+    # Read before searching: mail that arrives during the search comes in through history on the next poll.
+    newest = str(gmail.profile(svc)["historyId"])
+    q = "in:inbox after:%s" % since
+    ids = gmail.search(svc, q, RESCAN_LIMIT)[::-1]   # Gmail lists newest first; handle mail in arrival order
+    full = len(ids) >= RESCAN_LIMIT
+    log("history id %s is gone; searched %r: %d message(s)%s" % (cursor, q, len(ids), "; stopped at the limit" if full else ""))
+    if dry_run:
+        return ids, newest
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(since)))
+    # No catch: if the owner cannot be told, the poll stops before the cursor moves and the next poll rescans.
+    alerts.send_alert(svc, st, cfg, "history-gone", cursor, "Gmail history lost; inbox since %s rescanned" % when,
+                      "Gmail no longer had the mailroom's place in the inbox history (history id %s), so the "
+                      "mailroom searched the inbox for mail since its last successful poll at %s (Gmail search: %s) "
+                      "and found %d message(s). Mail it had already handled is skipped; the rest is handled as usual.%s"
+                      % (cursor, when, q, len(ids),
+                         "\n\nThe search stopped at %d messages, so mail older than the oldest of them was not "
+                         "handled. Search the agents account for it with the same query." % RESCAN_LIMIT if full else ""))
+    return ids, newest
 
 
 def poll(svc, st, cfg, dry_run):
+    started = int(time.time())
     start = st.get_meta("history_id")
     if not start:
         start = str(gmail.profile(svc)["historyId"])
@@ -234,9 +322,7 @@ def poll(svc, st, cfg, dry_run):
     try:
         ids, newest = gmail.history_since(svc, start)
     except gmail.HistoryGone:
-        log("history id %s is gone; falling back to a 2-day search" % start)
-        ids = gmail.list_recent(svc)
-        newest = str(gmail.profile(svc)["historyId"])
+        ids, newest = rescan(svc, st, cfg, start, dry_run)
     for gid in ids:
         if STOP:
             # Keep the old cursor: the next poll skips saved messages and picks up
@@ -245,20 +331,29 @@ def poll(svc, st, cfg, dry_run):
         try:
             process(svc, st, cfg, gid, dry_run)
         except Exception as e:  # one bad message must not stall the queue
-            log("error  %s: %s: %s" % (gid, type(e).__name__, e))
-            if not st.seen(gid):
-                st.record_inbound(gmail_id=gid, action="error", detail="%s: %s" % (type(e).__name__, e))
+            hold_after_error(svc, st, cfg, gid, e, dry_run)
     st.set_meta("history_id", newest)
-    st.set_meta("last_poll", int(time.time()))
+    st.set_meta("last_poll", started)
+    local = st.local_replies_waiting()   # replies written in the Mail tab, oldest first
+    for row in local:
+        if STOP:
+            return len(ids)   # the rest wait, still "local", for the next poll
+        try:
+            process_local(svc, st, cfg, row, dry_run)
+        except Exception as e:
+            hold_after_error(svc, st, cfg, row["gmail_id"], e, dry_run)
     if not dry_run and not STOP:
         watchdog(svc, st, cfg)
-    return len(ids)
+    return len(ids) + len(local)
 
 
 def watchdog(svc, st, cfg):
-    """No model here either. Two detectors for 'an agent is stuck and cannot say so'."""
+    """After a poll, with no model call: alert the owner to quota events in the status log (the store's
+    watchdog_quota_ts records how far it has read), retry the notices of held replies that failed to go out, mail
+    the owner about each new group (groupmail.announce), and send the drafts the pre-send review held past
+    fallback_minutes by running `agent-mail flush-drafts`."""
     now = time.time()
-    # 1. quota notifications written to the status log by the Notification hook
+    # quota notifications written to the status log by the Notification hook
     last = float(st.get_meta("watchdog_quota_ts", now - 3600))
     for e in statuslog.read(since=last, event="quota"):
         who = e.get("name") or e.get("session_id", "")[:8]
@@ -268,13 +363,18 @@ def watchdog(svc, st, cfg):
             log("alert  quota event from %s" % who)
     st.set_meta("watchdog_quota_ts", now)
     # A transient alert failure must not strand a retained reply without a notice.
-    for row in st.con.execute("select * from inbound where action='held' and recovery_json is not null "
-                              "and notified_at is null order by id limit 10").fetchall():
+    for row in st.unnotified_recoveries(10):
         try:
             recovery.notify(svc, st, cfg, row)
         except Exception as e:
             log("reply #%s notification failed: %s" % (row["id"], e))
-    # 2. mail the pre-send review sent back that its agent neither revised nor withdrew in time: send it as is
+    # one mail to the owner for each new group, whose thread they post in by replying
+    try:
+        for g in groupmail.announce(svc, st, cfg):
+            log("group  mailed %s about group %r (%s)" % (cfg["owner_name"], g.title, g.id))
+    except Exception as e:
+        log("group mail failed: %s: %s; tried again after the next poll" % (type(e).__name__, e))
+    # mail the pre-send review sent back that its agent neither revised nor withdrew in time: send it as is
     if st.stale_drafts(now - 60 * review.settings(cfg)["fallback_minutes"]):
         try:
             r = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "agent-mail"), "flush-drafts"],
@@ -283,8 +383,6 @@ def watchdog(svc, st, cfg):
                 log("review " + line)
         except Exception as e:
             log("review flush-drafts failed: %s" % e)
-    # (the orchestrator now runs as a synchronous `claude -p` per event, so its outcome is known
-    #  immediately; see process())
 
 
 def main(argv=None):
@@ -315,7 +413,7 @@ def main(argv=None):
     st = Store()
     try:
         svc = gmail.service()
-    except RuntimeError as e:   # no token yet: say what to run instead of a traceback
+    except gmail.NoToken as e:   # no token yet: say what to run instead of a traceback
         print("agent-mailroom: %s" % e, file=sys.stderr)
         return 2
     if a.baseline:

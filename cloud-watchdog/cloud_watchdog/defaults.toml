@@ -4,12 +4,15 @@
 
 owner_name = ""                # empty: the mailroom's owner_name, else "the owner"
 owner_email = ""               # empty: the mailroom's owner_email, else its allowlist[0]
-repos_root = ""                # empty: the mailroom's repos_root, else ~/code (owner search looks for commits here)
-slow_interval_min = 60         # billing, Slurm, spend APIs (the fast pass runs every timer tick)
-digest_hour_local = 8          # the daily digest goes out on the first check at/after this hour
-timezone = ""                  # IANA name such as "America/New_York"; empty = the machine's local time zone
-shadow_days = 0                # `cloud-watch install`: days of shadow before going live by itself; 0 = never
+repos_root = ""                # empty: the mailroom's repos_root, else ~/code
+repo_roots = []                # git repos sit directly under these (owner search: which repo holds a deploy's
+                               # commit; the investigator may read them); empty: [repos_root]
+slow_interval_min = 60         # how often each account gets a slow pass (billing; slow_only accounts)
+digest_hour_local = 8          # the daily digest goes out on the first check at/after this hour (the machine's time zone)
+shadow_days = 0                # shadow period from `cloud-watch install` (if no mode was set) or "stay in shadow"; 0 = no end
 max_emails_per_day = 6         # beyond this, emails fold into the next digest
+heartbeat_stale_min = 60       # the heartbeat emails you once no check has succeeded for this long
+failure_alert_every_hours = 6  # a failed check emails you at most this often
 # modal_python = "/path/to/python"   # the Python the `modal` CLI runs on; found from its shebang if unset
 
 [identity]
@@ -44,7 +47,7 @@ bws_project_file = "~/.config/bws/project-id"
 # None by default. Add yours in ~/.config/cloud-watchdog/config.toml (example at the end of this file).
 
 # ---------------------------------------------------------------- rules
-# Rules are independent: any one firing is enough. Inside a rule every condition must hold.
+# Rules are independent: any one firing is enough. Inside a rule every condition must hold (README, "Rules").
 
 [rules.crash_loop]
 window_min = 120           # a container failing every ~30 min still shows several failures in 2 h
@@ -56,29 +59,30 @@ owner_wait_min = 15
 [rules.high_burn]
 usd_per_hour = 25
 
-[rules.long_running]
-lambda_hours = 24
-hf_hours = 24              # also used for DeepInfra deployments
-slurm_hours = 12
-modal_active_hours = 12    # at least one container running non-stop
+[rules.long_running.hours]   # per provider: from launch, except Modal, which counts its current active stretch
+modal = 12
+lambda = 24
+hf = 24
+deepinfra = 24
+slurm = 12
 
 [rules.cost]
 ask_owner_usd = 150        # no ack: message the owning agent
 email_owner_usd = 500      # no ack: email you, then again at each doubling
 acked_floor_usd = 500      # acked: email you at max(floor, multiple * X), then each doubling
-acked_multiple = 2
+acked_multiple = 2         # X: the ack's --expect-cost, else the resource's cost when it was acked
 
 [rules.idle_gpu]
 consecutive_checks = 3
 gpu_util_max_pct = 5
 work_pattern = 'main\.py|python.*train|python.*eval|vllm|torchrun|accelerate'
 
-[rules.account_spend]      # "provider:account" = USD per rolling 24 h -> a digest line. None by default.
+[rules.account_spend]      # "provider:account" = USD spent in the last 24 h -> a digest line. None by default.
 # "modal:main" = 200
 # "openrouter:main" = 50
 
 [rules.storage]
-modal_volumes_usd_month = 100   # weekly digest line (Mondays)
+volumes_usd_month = 100    # each account's volume storage this month (Modal) -> weekly digest line (Mondays)
 
 [rules.blind]
 consecutive_failures = 3
@@ -86,7 +90,7 @@ consecutive_failures = 3
 # ---------------------------------------------------------------- ladder
 [ladder]
 owner_wait_min = 30
-max_pings = 3
+max_pings = 2              # messages to a live owner before you are emailed (crash loops: one)
 reemail_hours = 24
 
 [investigator]
@@ -101,8 +105,8 @@ timeout_s = 600
 [transcripts]
 roots = ["~/.claude/projects", "~/.codex/sessions"]
 lookback_days = 1          # search files modified since launch minus this
-# Transcript dirs that only talk *about* resources (never launch them).
-exclude = ["-orchestrator", "-cloud-watchdog", "cloud-watchdog-investigator"]
+# Transcript dirs that only talk *about* resources (never launch them). The investigator's own is always left out.
+exclude = ["-orchestrator", "-cloud-watchdog"]
 launch_verbs = ['modal deploy', 'modal run', 'modal serve', 'instance-operations/launch',
                 'sbatch', 'Submitted batch job']
 

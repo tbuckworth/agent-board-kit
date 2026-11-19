@@ -45,7 +45,7 @@ CLAUDE_INCLUDE = "@~/.config/agent-kit/AGENTS.agents.md"
 REQUIRED = ["OWNER_NAME", "OWNER_EMAIL", "AGENT_EMAIL", "AGENT_FROM_NAME", "GITHUB_OWNER", "TASKS_REPO",
             "REPOS_ROOT", "GENERAL_REPO", "ORCHESTRATOR_DIR", "HOST_ID", "DESKTOP_HOST"]
 OPTIONAL = {"MAC_HOST": "", "WITH_MEMWATCH": "yes", "WITH_RESTART": "yes", "WITH_CLOUD_WATCHDOG": "no",
-            "WITH_TODO_DISPATCH": "yes", "WITH_CLI_UPDATE": "yes"}
+            "WITH_TODO_DISPATCH": "yes", "WITH_CLI_UPDATE": "yes", "WITH_TIME_PAGE": "no", "MAIL_BACKUP_DIRS": ""}
 EXAMPLE_VALUES = {"alex@example.com", "yourname.agents@gmail.com", "alex-gh", "alex-gh/tasks"}
 DESKTOP_STEPS = ["config", "venv", "wrappers", "configs", "instructions", "hooks", "orchestrator",
                  "general-repo", "systemd", "cron"]
@@ -146,6 +146,12 @@ def load_env(path, allow_example=False, quiet=False):
 
 def yes(env, key):
     return str(env.get(key, "")).strip().lower() in ("1", "y", "yes", "true", "on")
+
+
+def backup_dirs(env):
+    """MAIL_BACKUP_DIRS as a list: the directories (space-separated, each on another disk) the mailroom's hourly
+    backup copies to. [] = no backup timer."""
+    return str(env.get("MAIL_BACKUP_DIRS") or "").split()
 
 
 def python_for(env, role):
@@ -319,6 +325,8 @@ def mailroom_config(env, role, cur):
         cfg["send_enabled"] = False
         remote[env["HOST_ID"]] = env["DESKTOP_HOST"]
     cfg["remote_hosts"] = remote
+    if role == "desktop" and backup_dirs(env):          # empty leaves a backup.targets set by hand alone
+        cfg["backup"] = dict(cur.get("backup") or {}, targets=backup_dirs(env))
     return cfg
 
 
@@ -493,6 +501,10 @@ def units(env):
             if "dispatch" in name and not yes(env, "WITH_TODO_DISPATCH"):
                 continue
             if "cli-update" in name and not yes(env, "WITH_CLI_UPDATE"):
+                continue
+            if "board-time" in name and not yes(env, "WITH_TIME_PAGE"):
+                continue
+            if "mail-backup" in name and not backup_dirs(env):
                 continue
             want.append((comp, p, name))
     return want
@@ -704,6 +716,14 @@ def cmd_doctor(args):
                     == env["DESKTOP_HOST"] and m.get("send_enabled") is False,
                     "mac proxies mail through %s (ssh %s)" % (env["HOST_ID"], env["DESKTOP_HOST"]),
                     "./install.sh --role mac --only configs")
+    if role == "desktop" and m and backup_dirs(env):
+        targets = (m.get("backup") or {}).get("targets") or []
+        d.check(targets == backup_dirs(env), "mailroom backup.targets = MAIL_BACKUP_DIRS", "./install.sh --only configs")
+        for t in backup_dirs(env):
+            parent = Path(expand(t)).parent
+            d.check(parent.is_dir(), "backup target %s: %s exists (its disk is mounted)" % (t, parent),
+                    "mount the disk or create %s; `agent-mail status` shows each target's last copy" % parent,
+                    warn_only=True)
     if role == "desktop":
         t = HOME / ".config" / "todo-desk" / "config.json"
         d.check(t.exists() and _load_json(t).get("repo") == env["TASKS_REPO"], "todo-desk config names %s"
@@ -740,6 +760,10 @@ def cmd_doctor(args):
     cmds = {h.get("command", "") for g in (s.get("hooks") or {}).get("Stop", []) for h in g.get("hooks", [])}
     d.check(any("agent-status hook --cli claude" in c for c in cmds), "Claude Stop hook runs agent-status",
             "./install.sh --only hooks")
+    ups = {h.get("command", "") for g in (s.get("hooks") or {}).get("UserPromptSubmit", []) for h in g.get("hooks", [])}
+    d.check(any("agent-group hook --cli claude" in c for c in ups),
+            "Claude UserPromptSubmit hook runs agent-group (group chats' quiet posts)",
+            "./install.sh --only hooks, then restart running sessions")
     cm = HOME / ".claude" / "CLAUDE.md"
     d.check(cm.exists() and CLAUDE_INCLUDE in cm.read_text(), "~/.claude/CLAUDE.md includes the agent instructions",
             "./install.sh --only instructions")
@@ -748,11 +772,15 @@ def cmd_doctor(args):
         ch = HOME / ".codex" / "hooks.json"
         d.check(ch.exists() and "agent-status hook --cli codex" in ch.read_text(), "Codex hooks run agent-status",
                 "./install.sh --only hooks", warn_only=True)
+        d.check(ch.exists() and "agent-group hook --cli codex" in ch.read_text(),
+                "Codex UserPromptSubmit hook runs agent-group",
+                "./install.sh --only hooks; accept Codex's hook review once (/hooks)", warn_only=True)
         ca = HOME / ".codex" / "AGENTS.md"
         d.check(ca.exists() and BLOCK_BEGIN in ca.read_text(), "~/.codex/AGENTS.md has the agent instructions",
                 "./install.sh --only instructions", warn_only=True)
 
     if role == "desktop":
+        doctor_board(d, env)
         print("\n[orchestrator]")
         od = env["ORCHESTRATOR_DIR_PATH"]
         d.check((od / "AGENTS.md").exists() and (od / ".git").exists(), "%s is a git repo with AGENTS.md" % od,
@@ -790,6 +818,41 @@ def cmd_doctor(args):
 
     print("\n%d failure(s), %d warning(s)." % (d.fails, d.warns))
     return 1 if d.fails else 0
+
+
+def doctor_board(d, env):
+    """The board's optional logins (its config), and the mailroom commands the Mac's Chats and Mail tab call."""
+    print("\n[board]")
+    bpath = HOME / ".config" / "agent-board" / "config.json"
+    try:
+        b = _load_json(bpath)
+    except SystemExit as e:
+        d.bad(str(e))
+        b = {}
+    for key, what in (("gmail_credentials", "your Gmail login (read-check, Sync with Gmail)"),
+                      ("google_token", "your Google login (Time page calendar and documents, meeting alerts)")):
+        if not b.get(key):
+            d.ok("%s not set: %s off" % (key, what))
+            continue
+        f = Path(expand(str(b[key])))
+        if d.check(f.is_file(), "%s %s exists" % (key, f), "write the OAuth file there, or remove the key"):
+            mode = f.stat().st_mode & 0o777
+            d.check(mode & 0o077 == 0, "%s is private (mode %o)" % (f, mode), "chmod 600 %s" % f)
+    if b.get("meeting_alerts") is True:
+        d.check(bool(b.get("google_token")), "meeting_alerts on, with google_token",
+                "set google_token (Calendar read access), or meeting_alerts false", warn_only=True)
+    group = BIN_DIR / "agent-group"
+    if group.exists():
+        code, out = _out([str(group), "--help"])
+        d.check(code == 0, "agent-group runs (the board's Chats)", "./install.sh --only wrappers,venv")
+    db = Path(os.environ.get("AGENT_MAIL_STATE_DIR") or HOME / ".local" / "state" / "agent-mail") / "mailroom.sqlite"
+    mail = BIN_DIR / "agent-mail"
+    if not db.exists():
+        d.ok("mailbox not created yet (the mailroom makes it; the board's Mail tab reads it)")
+    elif mail.exists():
+        code, out = _out([str(mail), "mailbox", "summary"], timeout=40)
+        d.check(code == 0 and out.lstrip().startswith("{"), "agent-mail mailbox summary answers (the Mail tab)",
+                "run it by hand to see the error: agent-mail mailbox summary")
 
 
 # ---------------------------------------------------------------------------------------------- misc
@@ -834,7 +897,8 @@ def cmd_uninstall(args):
                  if l.strip() != CLAUDE_INCLUDE and "(agent-board-kit)" not in l]
         ctx.write(cm, "\n".join(lines).rstrip("\n") + "\n")
     print("Left in place: your configs (~/.config/agent-mail, agent-kit, todo-desk, agent-board), the Gmail token, "
-          "the hooks in ~/.claude/settings.json and ~/.codex/hooks.json (remove the agent-status entries by hand), "
+          "the hooks in ~/.claude/settings.json and ~/.codex/hooks.json (remove the agent-status and agent-group entries by "
+          "hand), "
           "the orchestrator dir, state in ~/.local/state, the venv (%s) and any crontab line." % VENV)
     return 0
 

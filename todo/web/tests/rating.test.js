@@ -8,8 +8,9 @@ import { webcrypto } from 'node:crypto';
 import {
   extractImportance, extractUrgency, extractDue, ratingFields, parseIssue, buildLabels,
   isEffectivelyUrgent, daysUntil, localDateString, formatDue, isRatedList,
-  agentRequestBody, AGENT_REQUEST_MARKER, setUnrated, unratedFromConfig,
+  agentRequestBody, AGENT_REQUEST_MARKER, setUnrated, unratedFromConfig, withList,
 } from '../js/parser.js';
+import { ratingLabels } from '../js/labels.js';
 import { linkSegments } from '../js/render.js';
 import { setState, matchesFilters, groupForList, isTaskRated } from '../js/state.js';
 
@@ -164,8 +165,8 @@ test('linkSegments finds bare URLs and markdown links', () => {
     { text: 'https://example.com/a', href: 'https://example.com/a' },
     { text: '.' },
   ]);
-  assert.deepEqual(linkSegments('[the form](https://gov.uk/form) then http://x.org/p?q=1'), [
-    { text: 'the form', href: 'https://gov.uk/form' },
+  assert.deepEqual(linkSegments('[the form](https://example.org/form) then http://x.org/p?q=1'), [
+    { text: 'the form', href: 'https://example.org/form' },
     { text: ' then ' },
     { text: 'http://x.org/p?q=1', href: 'http://x.org/p?q=1' },
   ]);
@@ -185,4 +186,15 @@ test('linkSegments finds bare URLs and markdown links', () => {
     { text: 'https://a.io/x', href: 'https://a.io/x' },
     { text: '**' },
   ]);
+});
+
+test('withList replaces the list label, whatever its case, and null removes it', () => {
+  assert.deepEqual(withList(['List:Old', 'focus:week'], 'tasks'), ['focus:week', 'list:tasks']);
+  assert.deepEqual(withList(['list:old', 'focus:week'], null), ['focus:week']);
+});
+
+test('ratingLabels writes the rating in label order and skips what is unset', () => {
+  assert.deepEqual(ratingLabels({ importance: 'high', urgency: 'low', due: '2026-11-01' }),
+    ['importance:high', 'urgency:low', 'due:2026-11-01']);
+  assert.deepEqual(ratingLabels({ importance: null, urgency: 'high', due: null }), ['urgency:high']);
 });

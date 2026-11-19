@@ -12,7 +12,8 @@ RestartSec=20
 # and orchestrator children. Remaining service processes are killed after the daemon
 # exits or the drain deadline expires, so it must wait for delivery before exiting.
 KillMode=mixed
-# An event can wait for the orchestrator lock, then make two 15-minute attempts.
+# An event can wait orchestrator_timeout (config) for the orchestrator lock, then run for up to that long:
+# orchestrate.run_event tries no other login after a timeout. Raise this with orchestrator_timeout.
 TimeoutStopSec=1h
 Environment=PYTHONUNBUFFERED=1
 # claude and codex live in ~/.local/bin; systemd --user does not read ~/.bashrc

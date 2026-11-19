@@ -30,7 +30,8 @@ Every key is explained in the file ([kit.example.env](../kit.example.env)). The 
 | `GENERAL_REPO` | `~/code/general` | home for tasks that belong to no project (created if missing) |
 | `ORCHESTRATOR_DIR` | `~/code/orchestrator` | the orchestrator's brief and memory (created) |
 | `HOST_ID`, `DESKTOP_HOST`, `MAC_HOST` | `desktop`, `desktop`, `mac` or empty | routing name of the Linux machine, the Mac's ssh alias for it, its ssh alias for the Mac ([07-mac.md](07-mac.md)) |
-| `WITH_*` | `yes`/`no` | optional parts: memory watch, agent-restart, cloud-watchdog, to-do dispatch |
+| `WITH_*` | `yes`/`no` | optional parts: memory watch, agent-restart, cloud-watchdog, to-do dispatch, CLI updates, the board's Time page timer (`WITH_TIME_PAGE`, default `no`) |
+| `MAIL_BACKUP_DIRS` | empty, or `/mnt/backup/agent-mail` | directories on another disk the mailroom copies its message store and database to every hour; empty = no backup timer |
 
 ## Install
 
@@ -46,12 +47,12 @@ What it does, step by step (each step is idempotent; `--only STEP` or `--skip ST
 |---|---|
 | `venv` | `~/.local/share/agent-kit/venv` with the Google client libraries |
 | `wrappers` | one small script per command in `~/.local/bin` (`agent-mail`, `agent-send`, `agent-spawn`, ..., `kit`). An existing file that is not a kit wrapper is left alone unless `--force` (then backed up) |
-| `configs` | `~/.config/agent-mail/config.json` (identity keys; your other keys are kept), `~/.config/todo-desk/config.json`, `~/.config/agent-board/config.json` |
+| `configs` | `~/.config/agent-mail/config.json` (identity keys, and `backup.targets` from `MAIL_BACKUP_DIRS`; your other keys are kept), `~/.config/todo-desk/config.json`, `~/.config/agent-board/config.json` (created empty: every board feature that reaches your own accounts is off until you name it there) |
 | `instructions` | renders the global agent instructions to `~/.config/agent-kit/AGENTS.agents.md`; adds one `@` include line to `~/.claude/CLAUDE.md`; adds a marked block to `~/.codex/AGENTS.md` |
-| `hooks` | merges the `agent-status` hooks and `"crossSessionInbound": "accept"` into `~/.claude/settings.json`, and hooks into `~/.codex/hooks.json` (backups kept; existing hooks untouched) |
+| `hooks` | merges the `agent-status` and `agent-group` hooks and `"crossSessionInbound": "accept"` into `~/.claude/settings.json`, and hooks into `~/.codex/hooks.json` (backups kept; existing hooks untouched) |
 | `orchestrator` | renders [orchestrator/](../orchestrator) into `ORCHESTRATOR_DIR` and makes it a git repo. Never overwrites its `STATE.md`; other changed files only with `--force` |
 | `general-repo` | creates `GENERAL_REPO` as a local git repo if it does not exist |
-| `systemd` | renders the user units into `~/.config/systemd/user/` (not started without `--start`) |
+| `systemd` | renders the user units into `~/.config/systemd/user/` (not started without `--start`): only those your `WITH_*` keys and `MAIL_BACKUP_DIRS` ask for |
 | `cron` | only where no `todo-dispatch.timer` is installed: with `--start`, a crontab line for `todo-desk dispatch` |
 
 ## Give Gmail consent
@@ -84,7 +85,8 @@ loginctl enable-linger "$USER"
 ```
 
 `--start` enables and starts `agent-mailroom` (only once the Gmail token exists), the optional
-`agent-memwatch`, the after-boot `agent-restart-restore` unit and the `todo-dispatch.timer`.
+`agent-memwatch`, the after-boot `agent-restart-restore` unit and the timers you asked for
+(`todo-dispatch`, `agent-cli-update`, and, if set, `agent-board-time` and `agent-mail-backup`).
 `--labels` creates the to-do labels in `TASKS_REPO` (the repo must exist). Lingering keeps user
 services running while you are logged out.
 
@@ -114,9 +116,12 @@ Each failure prints the fix. Common ones are in [troubleshooting](09-troubleshoo
 ## Updating
 
 ```bash
-cd ~/code/agent-board-kit && git pull && ./install.sh
+cd ~/code/agent-board-kit && git pull && ./install.sh --start
 systemctl --user restart agent-mailroom     # after mailroom code changes; not mid-orchestrator-run
 ```
+
+Each release's entry in [CHANGELOG.md](../CHANGELOG.md) ends with what to do for that update (a
+restart, rebuilding the Mac apps, re-rendering the orchestrator brief with `--force`).
 
 ## Uninstalling
 

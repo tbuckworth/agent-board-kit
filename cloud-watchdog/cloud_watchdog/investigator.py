@@ -1,4 +1,4 @@
-"""Fallback owner search by a model, used only when the deterministic search finds nobody confident.
+"""Fallback owner search by a model, used only when the deterministic search finds no owner with confidence.
 
 A fresh `claude -p`: read-only tools, no MCP servers, no session persistence, no provider keys in
 its environment, `--max-budget-usd` per run and a daily cap checked here. It returns a verdict; it
@@ -20,15 +20,16 @@ Deterministic search said: {evidence}
 Candidate sessions from transcript search (may be empty): {candidates}
 
 Useful, all read-only: `agent-send --list --json` (live and recent sessions, their cwd), `agent-status report
---since 7d` (what each agent has been doing), `agent-mail sent --limit 200` (mail history), Grep/Read over
-~/.claude/projects/*/*.jsonl and ~/.codex/sessions (transcripts; look for the launch command), and
-`git -C <repo> log` in the repos under {repos_root}. Be quick: a few searches, not an essay. Do not run
-anything else.
+--since 7d` (what each agent has been doing), `agent-mail sent --limit 200` (mail history), Grep/Read over the
+transcripts (.jsonl) under {transcript_dirs} (look for the launch command), and `git -C <repo> log` in the repos
+under {repo_dirs}. Be quick: a few searches, not an essay. Do not run anything else.
 
 Answer with ONLY a JSON object, no prose around it:
 {{"owner_session_id": "<uuid or null>", "owner_name": "<session name or null>", "confidence": "high|medium|low",
   "evidence": "<one or two sentences>", "recommendation": "stop|keep|ask_human", "summary": "<one sentence for {human}>"}}
 """
+
+WORKDIR_NAME = "cloud-watchdog-investigator"   # its working directory, under the state dir
 
 ALLOWED = ["Read", "Grep", "Glob", "Bash(agent-send --list:*)", "Bash(agent-status report:*)",
            "Bash(agent-status log:*)", "Bash(agent-mail sent:*)", "Bash(git -C:*)", "Bash(git log:*)"]
@@ -39,24 +40,32 @@ def budget_left(db, cfg, now):
 
 
 def run(db, cfg, res, findings, candidates, now):
+    """Ask `claude -p`, run in a work dir under the state dir, who launched `res`: (verdict or None, status). It may
+    read the transcripts under transcripts.roots and the repos under repo_roots. Not run when investigator.enabled is
+    off or the daily cap is used up. Logs one `investigate` action either way, with the run's cost (the per-run cap
+    when the real cost is unknown), which counts toward the daily cap."""
     icfg = cfg["investigator"]
-    if not icfg.get("enabled"):
-        return None, "investigator disabled"
-    if budget_left(db, cfg, now) < icfg["max_budget_usd"]:
-        return None, "daily model budget used up"
+    skip = ("investigator disabled" if not icfg["enabled"] else
+            "daily model budget used up" if budget_left(db, cfg, now) < icfg["max_budget_usd"] else None)
+    if skip:
+        db.log("investigate", skip, key=res["key"], ok=False, shadow=False, now=now)
+        return None, skip
     cands = [{k: c.get(k) for k in ("session_id", "cli", "cwd", "launch_hit", "score")} for c in candidates or []]
+    transcript_dirs = [str(config.expand(r)) for r in cfg["transcripts"]["roots"]]
+    repo_dirs = [str(config.expand(r)) for r in cfg["repo_roots"]]
     prompt = PROMPT.format(facts="\n".join(messages.facts(res, now)) + "\nname: %s\nkey: %s" % (res["name"], res["key"]),
                            why="; ".join(f["text"] for f in findings), evidence=res["owner_evidence"] or "nothing",
-                           candidates=json.dumps(cands), repos_root=cfg.get("repos_root") or "~/code",
-                           human=cfg.get("owner_name") or "the owner")
-    workdir = config.STATE_DIR / "cloud-watchdog-investigator"
+                           candidates=json.dumps(cands), transcript_dirs=" and ".join(transcript_dirs),
+                           repo_dirs=" and ".join(repo_dirs), human=messages.human(cfg))
+    workdir = config.STATE_DIR / WORKDIR_NAME
     workdir.mkdir(parents=True, exist_ok=True)
     cmd = ["claude", "-p", "--model", icfg["model"], "--output-format", "json",
            "--max-budget-usd", str(icfg["max_budget_usd"]), "--permission-mode", "dontAsk",
            "--tools", "Read,Grep,Glob,Bash", "--allowedTools"] + ALLOWED + [
-           "--strict-mcp-config", "--no-session-persistence",
-           "--add-dir", str(config.HOME / ".claude" / "projects"), "--add-dir", str(config.HOME / ".codex" / "sessions"),
-           "--add-dir", str(config.expand(cfg.get("repos_root") or "~/code")), "--", prompt]
+           "--strict-mcp-config", "--no-session-persistence"]
+    for d in transcript_dirs + repo_dirs:
+        cmd += ["--add-dir", d]
+    cmd += ["--", prompt]
     code, out, err = util.run(cmd, env=creds.base_env(), timeout=icfg["timeout_s"], cwd=str(workdir))
     cost, verdict = None, None
     try:
@@ -66,6 +75,11 @@ def run(db, cfg, res, findings, candidates, now):
         verdict = json.loads(m.group(0)) if m else None
     except ValueError:
         pass
-    db.log("investigate", {"exit": code, "verdict": verdict, "stderr": err.strip()[-200:] if code else ""},
-           key=res["key"], cost=cost, ok=verdict is not None, now=now)
+    detail = {"exit": code, "verdict": verdict, "stderr": err.strip()[-200:] if code else ""}
+    if cost is None:   # timed out or unparseable: assume the run spent its whole cap, so the daily cap still holds
+        cost = icfg["max_budget_usd"]
+        detail["cost"] = "unknown, counted as the %s per-run cap" % util.money(cost)
+    if verdict is None:
+        detail["stdout"] = out.strip()[-200:]
+    db.log("investigate", detail, key=res["key"], cost=cost, ok=verdict is not None, shadow=False, now=now)
     return verdict, ("ok" if verdict else "no verdict (exit %s)" % code)

@@ -1,5 +1,6 @@
 """agent-close: refuses unlanded work, removes only linked worktrees, ends the session. No tmux."""
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -10,10 +11,9 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-TMP = tempfile.mkdtemp()
-os.environ["AGENT_MAIL_STATE_DIR"] = TMP
-os.environ["AGENT_STATUS_DIR"] = TMP
-from agentmail import close, statuslog  # noqa: E402
+import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
+import homes  # noqa: E402
+from agentmail import close, commands, statuslog  # noqa: E402
 
 
 def git(*args, cwd=None):
@@ -40,7 +40,7 @@ def branches(repo):
 
 class Close(unittest.TestCase):
     def setUp(self):
-        statuslog.LOG = Path(tempfile.mkdtemp()) / "events.jsonl"
+        homes.status_log(self)
         self.repo, self.wt = setup_repo()
         self.ended = []
         p = patch.object(close, "end_session", side_effect=lambda info, delay=0: self.ended.append(delay) or "ended")
@@ -163,6 +163,68 @@ class Close(unittest.TestCase):
         self.assertIn("kept branch inbox/1-x: 1 commit(s) not landed", lines[-1])
         self.assertIn("inbox/1-x", branches(self.repo))
 
+    def dangle_origin_main(self):
+        """Point origin/main at an object that does not exist: rev-parse --verify still accepts the
+        ref, fetch fails on it, and git rev-list cannot count against it."""
+        (self.repo / ".git" / "refs" / "remotes" / "origin" / "main").write_text("1" * 40 + "\n")
+
+    def test_failed_commit_count_is_unknown_not_zero(self):
+        g = lambda *a: close.git(self.wt, *a)  # noqa: E731
+        self.assertEqual(close.unmerged(g, "no-such-ref", "HEAD")[0], -1)
+        self.dangle_origin_main()
+        ahead, why = close.unmerged(g, "origin/main", "HEAD")
+        self.assertEqual(ahead, -1)
+        self.assertIn("git rev-list failed", why)      # git's own reason reaches the message
+
+    def test_deleted_worktree_keeps_branch_when_git_cannot_count(self):
+        self.commit_in_wt()
+        shutil.rmtree(self.wt)
+        self.dangle_origin_main()
+        code, lines = close.close(self.info())
+        self.assertEqual(code, 0, lines)
+        self.assertIn("kept branch inbox/1-x: unknown (git rev-list failed: ", lines[-1])
+        self.assertIn("inbox/1-x", branches(self.repo))
+
+    def test_a_fetch_that_fails_is_said_with_the_result(self):
+        """Without it, "N commit(s) not in origin/main" could not be told apart from an origin never fetched."""
+        shutil.rmtree(self.repo.parent / "origin.git")
+        self.commit_in_wt()
+        code, lines = close.close(self.info())
+        self.assertEqual(code, 2, lines)
+        self.assertIn("1 commit(s) on inbox/1-x not in origin/main", lines[0])
+        self.assertRegex(lines[1], r"^could not fetch origin \(.*origin\.git.*\); checked against the last fetched refs")
+        code, lines = close.close(self.info(), force=True)
+        self.assertEqual(code, 0, lines)
+        self.assertIn("could not fetch origin", statuslog.read(event="closed")[-1]["text"])
+        repo2, wt2 = setup_repo()   # a worktree deleted by hand: the same for the stale branch's check
+        shutil.rmtree(repo2.parent / "origin.git")
+        shutil.rmtree(wt2)
+        code, lines = close.close(self.info(wt2))
+        self.assertEqual(code, 0, lines)
+        self.assertTrue(any(l.startswith("could not fetch origin") for l in lines), lines)
+
+    @unittest.skipIf(os.geteuid() == 0, "root deletes in a folder whatever its mode")
+    def test_a_prune_that_fails_is_an_error_and_keeps_the_branch(self):
+        shutil.rmtree(self.wt)
+        entry = self.repo / ".git" / "worktrees" / "wt"
+        entry.chmod(0o500)                           # git worktree prune cannot delete the stale entry's files
+        self.addCleanup(entry.chmod, 0o700)
+        code, lines = close.close(self.info())
+        self.assertEqual(code, 1, lines)
+        self.assertRegex(lines[-1], r"^stale worktree .*wt not pruned: .*failed to delete")
+        self.assertIn("inbox/1-x", branches(self.repo))
+        self.assertIn("not pruned", statuslog.read(event="closed")[-1]["text"])
+
+    def test_failed_git_status_refuses(self):
+        index = git("rev-parse", "--path-format=absolute", "--git-path", "index", cwd=self.wt).strip()
+        Path(index).write_bytes(b"not an index")      # git status fails: "index file smaller than expected"
+        code, lines = close.close(self.info())
+        self.assertEqual(code, 2, lines)
+        self.assertIn("git status failed", lines[0])
+        self.assertIn("index file smaller than expected", lines[0])
+        self.assertTrue(self.wt.exists())
+        self.assertEqual(self.ended, [])             # the session is left running
+
     def test_main_checkout_and_plain_dirs_are_never_removed(self):
         code, lines = close.close(self.info(self.repo))
         self.assertEqual(code, 0)
@@ -198,28 +260,62 @@ class Close(unittest.TestCase):
         self.assertEqual(statuslog.read(event="closed"), [])
 
     def test_find_by_name_or_tmux(self):
-        sess = {"name": "rm-1-x", "id": "abc", "cli": "claude", "cwd": str(self.wt), "live": True}
-        with patch.object(close.registry, "resolve", return_value=(sess, 0, [sess])), \
-                patch.object(close, "tmux_has", side_effect=lambda n: n == "rm-1-x"):
+        homes.Homes(self).claude("abc", "rm-1-x", cwd=str(self.wt))
+        # tmux is the boundary: which tmux sessions exist is made up, Alex's tmux server is not asked
+        with patch.object(close.commands, "tmux_has", side_effect=lambda n: n == "rm-1-x"):
             info, err = close.find("rm-1-x")
         self.assertIsNone(err)
         self.assertEqual((info["tmux"], info["cwd"], info["session_id"]), ("rm-1-x", str(self.wt), "abc"))
-        with patch.object(close.registry, "resolve", return_value=(None, 4, [])), \
-                patch.object(close, "tmux_has", return_value=False):
+        with patch.object(close.commands, "tmux_has", return_value=False):
             info, err = close.find("nobody")
         self.assertIn("no session", err)
 
     def test_partial_name_is_refused(self):
-        sess = {"name": "rm-1-x", "id": "abcdef123456", "cli": "claude", "cwd": str(self.wt), "live": True}
-        with patch.object(close.registry, "resolve", return_value=(sess, 0, [sess])), \
-                patch.object(close, "tmux_has", return_value=False):
+        homes.Homes(self).claude("abcdef123456", "rm-1-x", cwd=str(self.wt))
+        with patch.object(close.commands, "tmux_has", return_value=False):   # tmux, the boundary: no such session
             self.assertIn("only partly matches", close.find("rm-1")[1])
             self.assertIsNone(close.find("abcdef123456")[1])     # exact id is fine
-        with patch.object(close.registry, "resolve", return_value=(sess, 0, [sess])), \
-                patch.object(close, "tmux_has", side_effect=lambda n: n == "rm-1"):
+        with patch.object(close.commands, "tmux_has", side_effect=lambda n: n == "rm-1"):
             info, err = close.find("rm-1")                       # an exact tmux name wins over the fuzzy hit
         self.assertIsNone(err)
         self.assertEqual((info["tmux"], info["session_id"]), ("rm-1", ""))
+
+
+class Commands(unittest.TestCase):
+    def test_a_command_that_must_succeed_raises_the_callers_error(self):
+        not_a_repo = commands.run(["git", "-C", tempfile.mkdtemp(), "rev-parse", "HEAD"], timeout=30)
+        with self.assertRaisesRegex(ValueError, r"^git rev-parse failed \(exit 128\): .*not a git repository"):
+            commands.checked(not_a_repo, "git rev-parse", ValueError)
+        ok = commands.run([sys.executable, "-c", "print('fine')"], timeout=30)
+        self.assertIs(commands.checked(ok, "python", ValueError), ok)
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
+    def test_a_tmux_command_that_must_succeed_raises(self):
+        # a tmux socket folder of its own, so this tmux reaches no server (Alex's least of all)
+        env, sockets = {k: v for k, v in os.environ.items() if k != "TMUX"}, tempfile.mkdtemp()
+        with patch.dict(os.environ, env, clear=True), patch.dict(os.environ, {"TMUX_TMPDIR": sockets}):
+            self.assertEqual(commands.tmux("has-session", "-t", "=x", check=False).returncode, 1)
+            # tmux's own words differ by version; both name the socket it could not reach
+            with self.assertRaisesRegex(commands.CommandError,
+                                        r"^tmux has-session -t =x failed \(exit 1\): .*" + re.escape(sockets)):
+                commands.tmux("has-session", "-t", "=x", check=True)
+
+    def test_a_command_that_cannot_start_or_times_out_is_a_failed_one(self):
+        """agent-close counts a git it could not run as unlanded work; that needs a result, not an exception."""
+        r = commands.run(["/nonexistent/no-such-command"], timeout=10)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("No such file", r.stderr)
+        r = commands.run([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.5)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("timed out", r.stderr)
+
+    def test_a_worktrees_main_checkout_is_its_repos(self):
+        repo, wt = setup_repo()
+        self.assertEqual(commands.repo_root(wt), str(repo.resolve()))
+        self.assertEqual(commands.repo_root(repo / ".git"), str(repo.resolve()))
+        plain = tempfile.mkdtemp()
+        self.assertIsNone(commands.common_dir(plain))
+        self.assertEqual(commands.repo_root(plain), str(Path(plain).resolve()))
 
 
 if __name__ == "__main__":

@@ -2,26 +2,30 @@
 
 Modal's billing report is per app (object_id) with no user field, and a workspace may be shared by
 several people. Each app's lifecycle does name a user, though: `created_by` (who started it: `modal run`,
-`modal deploy`, or an `App.lookup(create_if_missing=True)`) and `deployed_by` (its latest deploy). So:
+`modal deploy`, or an `App.lookup(create_if_missing=True)`) and `deployed_by` (who ran its latest deploy). So:
 
-- yours:  every person on the app is in identity.owner_modal_users or is the user behind the watchdog's own
-          token for that workspace. Any token of that user counts, so you and all your agents, on any machine;
-- shared: an app on the identity.modal_shared_apps list, or one created and deployed by different people.
-          Modal bills the whole app to that app; it records no user per container or sandbox, so this
+- yours:  the app's creator and latest deployer are each in identity.owner_modal_users or are the user behind the
+          watchdog's own token for that workspace. Any token of those users counts, so this covers you and all
+          your agents, on any machine;
+- shared: an app on the identity.modal_shared_apps list, or one created and deployed by different people, not
+          all yours. Modal bills the app as one object and records no user per container or sandbox, so this
           part cannot be split (e.g. `inspect_modal_sandbox` holds every Inspect sandbox in the workspace);
-- others: apps whose people are all someone else;
+- others: apps whose creator and latest deployer are one other person;
 - unknown: not looked up yet, the lookup failed, or Modal no longer has the app's record.
 
 Volume storage is billed per workspace, never per volume, so it is outside the split.
-Creators are cached in `modal_app_owner`: they never change, so each app is looked up once (a deployed
-app again after a day, in case someone else redeployed it).
+The lookups are cached in `modal_app_owner`. A billed app is looked up again after RECHECK_S unless its state is
+in FINAL_STATES, since a redeploy can change its deployer; a tracked `modal run` app only until its creator is known.
 """
-import datetime as dt
-
 from . import util
 
 FINAL_STATES = {"stopped", "ephemeral", "detached", "stopping", "not-found"}   # deployed_by can't change
 RECHECK_S = 86400
+
+
+def meta_key(account):
+    """The meta key that holds the account's split (ingest keeps it; the digest and `cloud-watch status` show it)."""
+    return "spend:" + account
 
 
 def known_ids(db, account, now):
@@ -30,28 +34,30 @@ def known_ids(db, account, now):
             if r["state"] in FINAL_STATES or r["checked_at"] >= now - RECHECK_S]
 
 
-def ingest(db, cfg, account, spend, metrics, now):
-    """Store the creators the child found, compute the split, keep it for the digest. Inside ingest's tx."""
-    for app_id, c in (spend.get("creators") or {}).items():
-        name = (spend["month"].get(app_id) or [None])[0]
+def cache_creators(db, account, creators, now):
+    """Store in modal_app_owner the apps the collector looked up this pass ({app_id: {name, created_by, deployed_by,
+    state}}), checked at `now`. Inside ingest's tx."""
+    for app_id, c in creators.items():
         db.x("insert into modal_app_owner(account, app_id, name, created_by, deployed_by, state, checked_at) "
              "values(?,?,?,?,?,?,?) on conflict(account, app_id) do update set name=excluded.name, "
              "created_by=excluded.created_by, deployed_by=excluded.deployed_by, state=excluded.state, "
-             "checked_at=excluded.checked_at", account, app_id, name, c.get("created_by"), c.get("deployed_by"),
-             c.get("state"), now)
+             "checked_at=excluded.checked_at", account, app_id, c["name"], c["created_by"], c["deployed_by"],
+             c["state"], now)
+
+
+def ingest(db, cfg, account, spend, metrics, now):
+    """Compute the split from the creators in modal_app_owner and keep it for the digest. Inside ingest's tx."""
     owners = {r["app_id"]: dict(r) for r in db.q("select * from modal_app_owner where account=?", account)}
-    token_user = spend.get("token_user") or (db.meta("spend:" + account) or {}).get("token_user")
+    token_user = spend.get("token_user") or (db.meta(meta_key(account)) or {}).get("token_user")
     users = your_users(cfg["identity"], token_user)
-    s = split(spend["month"], owners, users, cfg["identity"], now)
+    s = split(spend["month"], owners, users, cfg["identity"])
     s.update(through=spend.get("through"), users=sorted(users), token_user=token_user, error=spend.get("error"),
              lookup_errors=spend.get("lookup_errors") or 0, month_total_usd=metrics.get("month_metered_usd"),
-             volumes_usd=metrics.get("month_volumes_usd"))
+             volumes_usd=metrics.get("month_volumes_usd"), volumes_error=spend.get("volumes_error"))
     vols = spend.get("volumes_by")
     if vols is not None:
         s["volumes"] = {"yours": sum(n for who, n in vols.items() if who in users), "total": sum(vols.values())}
-    db.set_meta("spend:" + account, s)
-    for k in ("apps_usd", "yours_usd", "shared_usd", "others_usd", "unknown_usd"):
-        db.x("insert into metrics(account, ts, name, value) values(?,?,?,?)", account, now, "month_" + k, s[k])
+    db.set_meta(meta_key(account), s)
     return s
 
 
@@ -70,11 +76,10 @@ def family(name):
     return name or "?"
 
 
-def split(month, owners, ours, identity, now, top=6):
+def split(month, owners, ours, identity, top=6):
     """month: {app_id: [name, usd]}; owners: {app_id: {created_by, deployed_by}}; ours: your user names. Pure."""
-    shared_names = set(identity.get("modal_shared_apps") or [])
-    out = {"as_of": now, "month": dt.datetime.fromtimestamp(now, util.UTC).strftime("%Y-%m"),
-           "apps_usd": 0.0, "yours_usd": 0.0, "shared_usd": 0.0, "others_usd": 0.0, "unknown_usd": 0.0,
+    shared_names = set(identity["modal_shared_apps"])
+    out = {"apps_usd": 0.0, "yours_usd": 0.0, "shared_usd": 0.0, "others_usd": 0.0, "unknown_usd": 0.0,
            "yours_apps": 0}
     others, shared, fam = {}, [], {}
     for app_id, (name, usd) in month.items():
@@ -111,20 +116,30 @@ def _pct(part, whole):
     return " (%d%% of app spend)" % round(100 * part / whole) if whole else ""
 
 
-def lines(account, s):
+def lines(s):
     """Markdown sub-bullets for one Modal account's split (indented under its Spend line)."""
     if not s:
         return []
     users = s.get("users") or []
     who = " or ".join("`%s`" % u for u in users) or "you"
-    if s.get("error") and not s.get("yours_apps") and not s.get("yours_usd"):
-        return ["    - Yours: unavailable (creator lookup failed: `%s`)." % s["error"][:120]]
+    unavailable = s.get("error") and not s.get("yours_apps") and not s.get("yours_usd")
+    failed = []   # lookups that failed on the last billing pass
+    if s.get("error") and not unavailable:
+        failed.append("creator lookup failed: `%s`, so apps not looked up before count as creator unknown"
+                      % s["error"][:120])
+    if s.get("lookup_errors"):
+        failed.append("creator lookup failed for %d billed apps, so they count as creator unknown" % s["lookup_errors"])
+    if s.get("volumes_error"):
+        failed.append("volume creator lookup failed: `%s`" % s["volumes_error"][:120])
+    incomplete = ["    - Incomplete: %s." % "; ".join(failed)] if failed else []
+    if unavailable:
+        return ["    - Yours: unavailable (creator lookup failed: `%s`)." % s["error"][:120]] + incomplete
     total = s.get("month_total_usd")
-    out = ["    - **This month: total %s, yours %s**%s. Basis: apps created or deployed by %s, i.e. any token of "
+    out = ["    - **This month: total %s, yours %s**%s. Basis: apps created and deployed only by %s, i.e. any token of "
            "%s: you and all your agents, on any machine.%s" % (
                util.money(total if total is not None else s["apps_usd"]), util.money(s["yours_usd"]),
                _pct(s["yours_usd"], s["apps_usd"]), who, "those Modal users" if len(users) > 1 else "that Modal user",
-               " Billing to %s." % util.iso(s["through"]) if s.get("through") else "")]
+               " Billing data runs to %s." % util.iso(s["through"]) if s.get("through") else "")]
     bits = ["yours %s (%d apps)" % (util.money(s["yours_usd"]), s["yours_apps"])]
     for name, usd, created, deployed in s.get("shared") or []:
         by = "created by %s" % (created or "?") + (", deployed by %s" % deployed if deployed and deployed != created else "")
@@ -148,7 +163,7 @@ def lines(account, s):
                    " " + util.money(s["volumes_usd"]) if s.get("volumes_usd") is not None else "",
                    "; you created %d of %d volumes" % (vol["yours"], vol["total"]) if vol else "",
                    ", such as the shared app above" if s.get("shared") else ""))
-    return out
+    return out + incomplete
 
 
 def plain(line):

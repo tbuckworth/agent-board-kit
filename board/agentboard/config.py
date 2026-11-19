@@ -3,14 +3,29 @@
 Identity (owner_name, owner_email, repos_root, orchestrator_dir) comes from the mailroom's config file,
 ~/.config/agent-mail/config.json, which the kit installer writes. The board only reads it.
 
-Board-only settings live in ~/.config/agent-board/config.json; every key is optional:
+Board-only settings live in ~/.config/agent-board/config.json; every key is optional, and everything that reaches
+one of the owner's own accounts is off until named:
 
-  gmail_credentials   path to an "authorized_user" OAuth file for the owner's own Gmail, for the optional
-                      "has the owner read the agent's mail" check (agentboard/gmailread.py). null = off.
+  gmail_credentials   path to an "authorized_user" OAuth file for the owner's own Gmail: the "has the owner read the
+                      agent's mail" check and the Mail tab's Sync with Gmail (agentboard/gmailstate.py; the sync needs
+                      the gmail.modify scope, a read-only login is refused there and the answer says so), and the Time
+                      page's "own email" source. null = off.
+  google_token        path to an "authorized_user" OAuth file for the owner's Google account with Calendar read access
+                      (and Drive metadata read, for the Time page's documents): the Time page's meetings and documents
+                      sources, and the meeting alerts when meeting_alerts is on. null = off.
+  meeting_alerts      true turns on the Mac's meeting alerts (agentboard/meetings.py), read with google_token.
+                      Default false: a google_token for the Time page alone alerts nothing.
+  tasks_repo          "OWNER/REPO" of the owner's to-do list, for the Time page's to-do source. Default: the "repo" of
+                      the to-do component's config (~/.config/todo-desk/config.json); neither = that source off.
+
+Per-feature files beside it, each optional: time.json (the Time page), meetings.json (the meeting alerts'
+calendars), allowance.json (the usage breakdown's prices).
 
 Environment overrides: AGENT_MAILROOM_DIR (the mailroom checkout, default: the kit's sibling `mailroom/`),
 AGENT_MAIL_CONFIG_DIR / AGENT_MAIL_STATE_DIR (as the mailroom itself honours them), AGENT_BOARD_CONFIG
-(the board's own config file), AGENT_BOARD_REPOS (the worktree scan root), AGENT_BOARD_GMAIL_CREDS.
+(the board's own config file), AGENT_BOARD_REPOS (the worktree scan root), AGENT_BOARD_GMAIL_CREDS,
+AGENT_BOARD_GOOGLE_TOKEN, AGENT_BOARD_MEETING_ALERTS ("yes"/"no"), TODO_DESK_CONFIG_DIR (the to-do component's config
+folder).
 """
 import json
 import os
@@ -22,10 +37,14 @@ MAIL_CONFIG_DIR = Path(os.environ.get("AGENT_MAIL_CONFIG_DIR") or HOME / ".confi
 MAIL_CONFIG = MAIL_CONFIG_DIR / "config.json"
 MAIL_STATE = Path(os.environ.get("AGENT_MAIL_STATE_DIR") or HOME / ".local/state/agent-mail")
 BOARD_CONFIG = Path(os.environ.get("AGENT_BOARD_CONFIG") or HOME / ".config/agent-board/config.json")
+TODO_CONFIG_DIR = Path(os.environ.get("TODO_DESK_CONFIG_DIR") or HOME / ".config/todo-desk")
 
 DEFAULT_REPOS_ROOT = "~/code"
 BOARD_DEFAULTS = {
     "gmail_credentials": None,
+    "google_token": None,
+    "meeting_alerts": False,
+    "tasks_repo": None,
 }
 
 
@@ -91,8 +110,37 @@ def orchestrator_dir(cfg=None):
     return Path(os.path.expanduser(str(d))) if d else repos_root(cfg) / "orchestrator"
 
 
-def gmail_credentials(cfg=None):
-    """The OAuth file for the optional Gmail read-check, or None when it is off."""
-    env = os.environ.get("AGENT_BOARD_GMAIL_CREDS")
-    p = env or (cfg if cfg is not None else board_config()).get("gmail_credentials")
+def _path_setting(key, env, cfg):
+    p = os.environ.get(env) or (cfg if cfg is not None else board_config()).get(key)
     return Path(os.path.expanduser(str(p))) if p else None
+
+
+def gmail_credentials(cfg=None):
+    """The OAuth file of the owner's own Gmail (read-check, Mail tab sync, the Time page's own email), or None when
+    that is off. AGENT_BOARD_GMAIL_CREDS overrides the board config."""
+    return _path_setting("gmail_credentials", "AGENT_BOARD_GMAIL_CREDS", cfg)
+
+
+def google_token(cfg=None):
+    """The OAuth file of the owner's Google login with Calendar (and Drive metadata) read access (meeting alerts, the
+    Time page's meetings and documents), or None when that is off. AGENT_BOARD_GOOGLE_TOKEN overrides the board
+    config."""
+    return _path_setting("google_token", "AGENT_BOARD_GOOGLE_TOKEN", cfg)
+
+
+def meeting_alerts(cfg=None):
+    """Whether the owner turned the meeting alerts on: AGENT_BOARD_MEETING_ALERTS ("yes", "true", "1" or "on"; anything
+    else is off) when set, else the board config's meeting_alerts (true only). They also need google_token."""
+    env = os.environ.get("AGENT_BOARD_MEETING_ALERTS")
+    if env is not None:
+        return env.strip().lower() in ("yes", "true", "1", "on")
+    return (cfg if cfg is not None else board_config()).get("meeting_alerts") is True
+
+
+def tasks_repo(cfg=None, todo_config=None):
+    """"OWNER/REPO" of the owner's to-do list (the Time page's to-do source): the board config's tasks_repo, else the
+    to-do component's "repo" (TODO_CONFIG_DIR/config.json), else None (that source off)."""
+    repo = (cfg if cfg is not None else board_config()).get("tasks_repo")
+    if not (isinstance(repo, str) and repo.strip()):
+        repo = _read(todo_config or TODO_CONFIG_DIR / "config.json").get("repo")
+    return repo.strip() if isinstance(repo, str) and repo.strip() else None

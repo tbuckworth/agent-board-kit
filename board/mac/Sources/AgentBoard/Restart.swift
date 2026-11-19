@@ -20,7 +20,10 @@ struct RestartStatus: Decodable {
     var status: String?
     var message: String?
     var restoredAt: Double?
-    var active: Bool { ["pending", "waiting", "updating", "rebooting", "restoring"].contains(status ?? "") }
+    /// The desktop's verdicts (restart.status()): a restart is under way; cancelling can still stop it. Both read as
+    /// false when absent.
+    var active: Bool?
+    var cancellable: Bool?
 }
 
 struct PlanWait: Decodable, Hashable { var what: String?; var command: String? }
@@ -48,12 +51,16 @@ struct RestartPlan: Decodable {
     var status: RestartStatus?
 
     enum CodingKeys: String, CodingKey { case updates, agents, warnings, status }
+    /// A part that does not decode (the updates, an agent, the status, the warnings themselves) is left out and named
+    /// among the warnings.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        updates = try? c.decodeIfPresent(DesktopUpdates.self, forKey: .updates)
-        agents = c.lossyArray(PlanAgent.self, forKey: .agents)
-        warnings = (try? c.decodeIfPresent([String].self, forKey: .warnings)) ?? []
-        status = try? c.decodeIfPresent(RestartStatus.self, forKey: .status)
+        var dropped: [String] = []
+        updates = c.lossyValue(DesktopUpdates.self, forKey: .updates, failures: &dropped)
+        agents = c.lossyArray(PlanAgent.self, forKey: .agents, failures: &dropped)
+        status = c.lossyValue(RestartStatus.self, forKey: .status, failures: &dropped)
+        let given = c.lossyValue([String].self, forKey: .warnings, failures: &dropped) ?? []
+        warnings = given + dropped.map { "Not understood: " + $0 }
     }
 }
 
@@ -79,7 +86,7 @@ struct DesktopChip: View {
 
     var body: some View {
         let st = model.snapshot?.restart
-        Button { model.showRestart = true } label: {
+        Button { model.sheet = .restart } label: {
             HStack(spacing: 4) {
                 if st?.active == true {
                     ProgressView().controlSize(.mini)
@@ -125,7 +132,7 @@ struct RestartSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Restart the desktop").font(.headline)
-            if let st = status, st.active {
+            if let st = status, st.active == true {
                 activeView(st)
             } else if let p = plan {
                 if let e = error {                       // a failed run, with the plan still on screen
@@ -139,13 +146,13 @@ struct RestartSheet: View {
                 ProgressView("Checking updates and every agent…").controlSize(.small)
             }
             HStack {
-                if let st = status, ["pending", "waiting"].contains(st.status ?? "") {
+                if status?.cancellable == true {
                     Button("Cancel the restart") {
                         Actions.run(["action": "restart_cancel"]) { r in model.show(r.ok ? "Restart cancelled." : r.message) }
                     }
                 }
                 Spacer()
-                Button("Close") { model.showRestart = false }.keyboardShortcut(.cancelAction)
+                Button("Close") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 if status?.active != true, let p = plan {
                     Button("Restart") { confirm(update: false, p) }.disabled(running)
                     Button("Update & Restart") { confirm(update: true, p) }.disabled(running).keyboardShortcut(.defaultAction)
@@ -238,12 +245,8 @@ struct RestartSheet: View {
 
     func load() {
         if let p = preloaded { plan = p; return }
-        Actions.runJSON(["action": "restart_plan"]) { obj, err in
-            guard let raw = obj?["plan"], let data = try? JSONSerialization.data(withJSONObject: raw) else {
-                error = (obj?["error"] as? String) ?? err ?? "could not read the plan"
-                return
-            }
-            do { plan = try JSON.decoder.decode(RestartPlan.self, from: data) } catch { self.error = "plan not understood: \(error)" }
+        Actions.fetch(["action": "restart_plan"], key: "plan", as: RestartPlan.self) { p, why in
+            if let p = p { plan = p } else { error = why }
         }
     }
 

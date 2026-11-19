@@ -44,7 +44,9 @@ Use any Google account you like for the project (the agents' account is simplest
    chmod 600 ~/.config/agent-mail/credentials.json
    ```
 
-This file identifies your private app; it is not a login. Still, keep it private.
+This file identifies your private app; it is not a login. Still, keep it private. To keep it
+elsewhere, set `oauth_client_file` in `~/.config/agent-mail/config.json` (or pass
+`agent-mail-auth --client-secrets PATH`).
 
 ## Step 4: give consent (after installing)
 
@@ -68,6 +70,8 @@ Consent needs the `agent-mail-auth` command, which the installer adds. It is a s
   read) and `mailroom/held` (left unread for you to look at: unknown sender, no session found, failed
   DKIM).
 - Sends as `AGENT_FROM_NAME (<session name>)` with a per-session tag in the subject and Reply-To.
+- Keeps a copy of every agent mail on the Linux machine before sending it (the board's Mail tab reads
+  it), and mails you once for each new group chat, so you can post by replying.
 
 You can open the agents' mailbox in a browser at any time to see what was sent and held;
 `agent-mail inbox --held` and `agent-mail show N` show the same from the shell.

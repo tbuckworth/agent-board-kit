@@ -1,9 +1,9 @@
-"""Keep the agents' CLIs current: `codex update` and `claude update`, run by agent-cli-update.timer every 6 hours.
+"""Keep the agents' CLIs current: `codex update` and `claude update` (agent-cli-update, run by agent-cli-update.timer).
 
-Both CLIs also update themselves, but late: Codex can know of a new release for many hours before it installs it,
-and all that time every interactive Codex start opens on its "Update available" menu. Both install a new version
-beside the old one and switch a symlink, so running agents keep their binary and new launches get the new one.
-`codex update` reuses a release it already has, so a run with nothing new costs one metadata request.
+Both CLIs also update themselves, but late, and until Codex installs a release it knows of, every interactive
+Codex start opens on its "Update available" menu. Both install a new version beside the old one and switch a
+symlink, so updating while agents run is safe. `codex update` reuses a release it already has, so a run with
+nothing new costs one metadata request.
 
 A CLI that is not installed (Codex is optional in the kit) is logged and skipped, not counted as a failure; a run
 fails when an installed CLI's update fails, or when neither is installed.
@@ -11,11 +11,10 @@ fails when an installed CLI's update fails, or when neither is installed.
 import os
 import re
 import subprocess
-import time
 
 from . import sources
 
-LOG = sources.HOME / ".local/state/agent-board/cli-update.log"
+LOG = sources.BOARD_STATE / "cli-update.log"
 CLIS = (("codex", ["update"]), ("claude", ["update"]))
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 
@@ -55,14 +54,10 @@ def run_all(run=subprocess.run, find=sources.find_bin, log=None):
     """Update every installed CLI, append a line each to the log; True when every installed one succeeded and at
     least one is installed."""
     log = log or LOG
-    log.parent.mkdir(parents=True, exist_ok=True)
     results = []
     for name, args in CLIS:
         line, good = update_one(name, args, run, find)
         results.append(good)
-        line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), line)
-        print(line, flush=True)
-        with open(log, "a") as fh:
-            fh.write(line + "\n")
+        print(sources.append_log(log, line), flush=True)
     tried = [r for r in results if r is not None]
     return bool(tried) and all(tried)

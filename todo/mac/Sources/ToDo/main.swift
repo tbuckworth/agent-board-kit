@@ -5,6 +5,8 @@ import SwiftUI
 // ToDo --render DATA.json OUT.png [W H] [--light] [--list NAME] [--select N] [--edit N] [--assign N]
 //                                          [--agents] [--search WORDS] [--zoom Z] [--running]
 //                                          (--running: the Assign sheet on "A running agent", with sample agents)
+//                                          [--route triage] [--seed N] [--snoozed]: the Triage page, its card drawn
+//                                          with a fixed seed (default 1); --snoozed adds the archive hint
 //                                          draw the real views offscreen from a todo-desk snapshot or the app's
 //                                          cache, into a PNG, and exit (screenshots without screen recording)
 // ToDo --probe                             connect exactly as the app does, print what arrives, and exit

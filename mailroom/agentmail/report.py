@@ -65,14 +65,11 @@ def gather(since_seconds=86400, now=None):
         })
     rows.sort(key=lambda r: (not r["live"], -(r["last_activity"] or 0)))
 
-    held = None
-    try:
-        from .config import DB_PATH
-        if DB_PATH.exists():
-            from .store import Store
-            held = Store(DB_PATH).counts().get("held", 0)
-    except Exception:
-        held = None
+    held = None   # no mailroom on this machine
+    from .config import DB_PATH
+    if DB_PATH.exists():
+        from .store import Store
+        held = Store(DB_PATH).counts().get("held", 0)
 
     unattributed = [e for e in by_sid.get("", []) if e.get("event") == "note"]
     return {
@@ -81,14 +78,23 @@ def gather(since_seconds=86400, now=None):
         "live": sum(1 for r in rows if r["live"]),
         "waiting": sum(1 for r in rows if r["status"].startswith("waiting")),
         "quota_events": sum(r["quota"] for r in rows),
+        "hook_errors": statuslog.hook_errors(since),
     }
+
+
+def _changed(r):
+    """A row's count of changed files: the number, "?" in a repo where git status failed, "" outside a repo."""
+    if r["dirty"] is not None:
+        return str(r["dirty"])
+    return "?" if r["branch"] else ""
 
 
 def render_text(rep):
     now = rep["generated"]
     out = ["Agents on %s · %s · window %s" % (rep["host"], _fmt_ts(now), _fmt_age(now - rep["since_seconds"], now)),
-           "live %d · waiting on you %d · held mail %s · quota events %d" % (
-               rep["live"], rep["waiting"], rep["held_mail"] if rep["held_mail"] is not None else "?", rep["quota_events"]),
+           "live %d · waiting on you %d · held mail %s · quota events %d · hook errors %d" % (
+               rep["live"], rep["waiting"], rep["held_mail"] if rep["held_mail"] is not None else "?", rep["quota_events"],
+               rep["hook_errors"]),
            ""]
     for r in rep["rows"]:
         head = "%-6s %-34s %-10s %s" % (r["cli"], (r["name"] or r["id"][:8])[:34], r["status"][:10],
@@ -97,6 +103,8 @@ def render_text(rep):
         bits = []
         if r["dirty"]:
             bits.append("%d changed" % r["dirty"])
+        elif _changed(r) == "?":
+            bits.append("changes unknown")
         if r["last_commit"]:
             bits.append("last commit: " + r["last_commit"])
         bits.append("turns %d" % r["turns"])
@@ -116,9 +124,9 @@ def render_markdown(rep):
     now = rep["generated"]
     out = ["# Agents on %s" % rep["host"],
            "",
-           "_%s · live %d · waiting on you %d · held mail %s · quota events %d_" % (
+           "_%s · live %d · waiting on you %d · held mail %s · quota events %d · hook errors %d_" % (
                _fmt_ts(now), rep["live"], rep["waiting"],
-               rep["held_mail"] if rep["held_mail"] is not None else "?", rep["quota_events"]),
+               rep["held_mail"] if rep["held_mail"] is not None else "?", rep["quota_events"], rep["hook_errors"]),
            "",
            "| CLI | Session | Status | Repo @ branch | Changed | Turns | Idle | Last commit |",
            "|---|---|---|---|---:|---:|---|---|"]
@@ -126,7 +134,7 @@ def render_markdown(rep):
         out.append("| %s | %s | %s | %s | %s | %d | %s | %s |" % (
             r["cli"], r["name"] or r["id"][:8], r["status"],
             ("%s @ %s" % (r["repo"], r["branch"])) if r["branch"] else r["cwd"],
-            r["dirty"] if r["dirty"] is not None else "", r["turns"],
+            _changed(r), r["turns"],
             _fmt_age(r["last_idle"], now) if r["last_idle"] else "-", r["last_commit"].replace("|", "/")))
     notes = [(r, n) for r in rep["rows"] for n in r["notes"]]
     if notes:
@@ -143,9 +151,9 @@ def render_html(rep, narrative=None):
     css_th = "text-align:left;padding:6px 10px;border-bottom:2px solid #18212c;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#5e6975"
     parts = ['<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#18212c;max-width:900px">',
              '<h2 style="margin:0 0 4px;font-size:22px">Agents on %s</h2>' % e(rep["host"]),
-             '<p style="margin:0 0 16px;color:#5e6975;font-size:13px">%s &middot; live <b>%d</b> &middot; waiting on you <b>%d</b> &middot; held mail <b>%s</b> &middot; quota events <b>%d</b></p>' % (
+             '<p style="margin:0 0 16px;color:#5e6975;font-size:13px">%s &middot; live <b>%d</b> &middot; waiting on you <b>%d</b> &middot; held mail <b>%s</b> &middot; quota events <b>%d</b> &middot; hook errors <b>%d</b></p>' % (
                  e(_fmt_ts(now)), rep["live"], rep["waiting"],
-                 rep["held_mail"] if rep["held_mail"] is not None else "?", rep["quota_events"])]
+                 rep["held_mail"] if rep["held_mail"] is not None else "?", rep["quota_events"], rep["hook_errors"])]
     if narrative:
         parts.append('<div style="padding:10px 14px;border-left:3px solid #2953a6;background:#f4f6f9;margin:0 0 16px;font-size:15px">%s</div>' % narrative)
     parts.append('<table style="border-collapse:collapse;width:100%%"><thead><tr>%s</tr></thead><tbody>' % "".join(
@@ -157,7 +165,7 @@ def render_html(rep, narrative=None):
             "<b>%s</b>%s" % (e(r["name"] or r["id"][:8]), ('<br><span style="color:#5e6975;font-size:12px">%s</span>' % e(r["title"][:60])) if r.get("title") and not r["name"] else ""),
             '<span style="color:%s">%s</span>' % (colour, e(r["status"])),
             e(("%s @ %s" % (r["repo"], r["branch"])) if r["branch"] else r["cwd"]),
-            '<span style="font-variant-numeric:tabular-nums">%s</span>' % (r["dirty"] if r["dirty"] is not None else ""),
+            '<span style="font-variant-numeric:tabular-nums">%s</span>' % _changed(r),
             '<span style="font-variant-numeric:tabular-nums">%d</span>' % r["turns"],
             e(_fmt_age(r["last_idle"], now) if r["last_idle"] else "-"),
             '<span style="font-family:Menlo,Consolas,monospace;font-size:12px">%s</span>' % e(r["last_commit"]),

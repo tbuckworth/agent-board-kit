@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Change an agent's CLI / Claude login, or just its model and effort, through the
-/// mailroom's agent-switch. An idle agent switches at once; a busy one only after "Interrupt and switch".
+/// Change an agent's CLI / Claude login, or just its model and effort, through the mailroom's agent-switch. An idle
+/// agent switches at once; a busy one only after "Interrupt and switch".
 struct SwitchSheet: View {
     let session: SwitchSession
     @ObservedObject var model: BoardModel
@@ -40,7 +40,7 @@ struct SwitchSheet: View {
             }
             HStack {
                 Spacer()
-                Button("Cancel") { model.switching = nil }.keyboardShortcut(.cancelAction)
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(interrupting ? "Interrupt and switch" : "Switch") { apply() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!canApply)
@@ -165,19 +165,10 @@ struct SwitchSheet: View {
             target = o.targets.first { $0.current ?? false }?.target ?? ""
             return
         }
-        Actions.runJSON(["action": "switch_options", "id": agent.id]) { obj, err in
-            guard let obj = obj, (obj["ok"] as? Bool) == true, let raw = obj["options"],
-                  let data = try? JSONSerialization.data(withJSONObject: raw) else {
-                error = (obj?["error"] as? String) ?? err ?? "could not read the options"
-                return
-            }
-            do {
-                let o = try JSON.decoder.decode(SwitchOptions.self, from: data)
-                options = o
-                target = o.targets.first { $0.current ?? false }?.target ?? ""
-            } catch {
-                self.error = "options not understood: \(error)"
-            }
+        Actions.fetch(["action": "switch_options", "id": agent.id], key: "options", as: SwitchOptions.self) { o, why in
+            guard let o = o else { error = why; return }
+            options = o
+            target = o.targets.first { $0.current ?? false }?.target ?? ""
         }
     }
 
@@ -197,7 +188,7 @@ struct SwitchSheet: View {
             }
             let detail = (obj["output"] as? String) ?? (obj["error"] as? String) ?? ""
             if (obj["ok"] as? Bool) == true {
-                model.switching = nil
+                model.sheet = nil
                 model.show("Switched \(agent.display)" + (detail.isEmpty ? "." : ": \(detail)"))
                 model.refreshAll()
             } else {
@@ -206,11 +197,4 @@ struct SwitchSheet: View {
             }
         }
     }
-}
-
-
-/// Decode the desktop's answer to switch_options (shared by the sheet and the probe).
-func decodeSwitchOptions(_ obj: [String: Any]?) -> SwitchOptions? {
-    guard let raw = obj?["options"], let data = try? JSONSerialization.data(withJSONObject: raw) else { return nil }
-    return try? JSON.decoder.decode(SwitchOptions.self, from: data)
 }

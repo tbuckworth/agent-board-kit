@@ -33,8 +33,6 @@ enum AgentState: String, CaseIterable, Identifiable {
 
     var color: Color { Color(hex: hex) }
     var nsColor: NSColor { NSColor(hex: hex) }
-    /// States that need the owner's attention float to the menu bar.
-    var urgent: Bool { self == .waiting || self == .blocked }
 }
 
 /// Board zoom (⌘+ / ⌘- / ⌘0): every font and tile dimension is multiplied by it.
@@ -91,6 +89,14 @@ enum Fmt {
         return v >= 100 || i == 0 ? String(format: "%.0f%@", v, units[i]) : String(format: "%.1f%@", v, units[i])
     }
 
+    /// 45000.4 -> "45,000"
+    static func count(_ v: Double) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.maximumFractionDigits = 0
+        return f.string(from: NSNumber(value: v)) ?? String(format: "%.0f", v)
+    }
+
     static func clock(_ ts: Double) -> String {
         let f = DateFormatter()
         let date = Date(timeIntervalSince1970: ts)
@@ -130,6 +136,22 @@ func shellQuote(_ s: String) -> String {
     let safe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./=:@%+-")
     if !s.isEmpty && s.unicodeScalars.allSatisfy({ safe.contains($0) }) { return s }
     return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+/// How much is left of a plan window (UsageWindow.left) or of Codex credits: the colour its meter takes, and, at
+/// nearlyOut, a notification (RedRules).
+enum UsageLevel {
+    case nearlyOut, low, plenty
+
+    init(left: Double) { self = left <= 10 ? .nearlyOut : (left <= 25 ? .low : .plenty) }
+
+    var color: Color {
+        switch self {
+        case .nearlyOut: return AgentState.blocked.color
+        case .low: return Palette.attention
+        case .plenty: return Palette.ok
+        }
+    }
 }
 
 func meterTint(_ fraction: Double) -> Color {

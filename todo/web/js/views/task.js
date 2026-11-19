@@ -9,17 +9,17 @@ import { claudeCard } from '../components/claude-card.js';
 import { ratingMarkers, waitingChip } from '../components/task-row.js';
 import { ratingControls } from '../components/rating-controls.js';
 import { showToast } from '../components/toast.js';
-import { confirm, showModal } from '../components/modal.js';
+import { confirm } from '../components/modal.js';
 import * as api from '../api.js';
 import * as db from '../db.js';
 import {
-  buildPushBody, buildLabels, parseIssue, agentRequestBody, formatDue, localDateString,
+  buildPushBody, buildLabels, parseIssue, formatDue, localDateString,
   AGENT_REQUESTED_LABEL, AGENT_ASSIGNED_LABEL,
 } from '../parser.js';
 import { normaliseTag, addDays, waitingState } from '../tags.js';
+import * as actions from '../actions.js';
 import { setTags, setWaiting } from '../actions.js';
-import { agentPicker } from '../components/agent-picker.js';
-import { requestedToast } from '../components/assign-dialog.js';
+import { showAssignDialog } from '../components/assign-dialog.js';
 import { latestAgentStatus } from '../agents.js';
 
 const AGENT_KIND_WORDS = {
@@ -65,12 +65,12 @@ export function renderTask(container, { number }) {
       isCompleted
         ? el('button', {
             className: 'btn btn-ghost',
-            onClick: () => toggleComplete(currentTask),
+            onClick: () => toggleTask(),
             title: 'Reopen',
           }, icon('refresh', 16), 'Reopen')
         : el('button', {
             className: 'btn btn-ghost',
-            onClick: () => toggleComplete(currentTask),
+            onClick: () => toggleTask(),
             title: 'Complete',
           }, icon('checkCircle', 16), 'Complete'),
       assignButton(currentTask),
@@ -349,29 +349,14 @@ export function renderTask(container, { number }) {
     );
   }
 
-  // Saves one rating change at once. Builds on the latest task, so quick successive changes all land.
+  // Saves one rating change at once, on top of the labels GitHub has now
   async function saveRating(changed) {
-    const before = getIssueByNumber(number);
-    if (!before) return;
-    const next = { ...before, ...changed };
-    // As on new tasks, a rated task that is not urgent says so
-    if (next.importance && !next.urgency) next.urgency = 'low';
-    const labels = buildLabels(next);
-    setState({
-      issues: getState().issues.map(i => i.number === number ? { ...next, labels } : i),
-    });
-
     try {
-      const raw = await api.updateIssue(number, { labels });
-      const parsed = parseIssue(raw);
-      setState({ issues: getState().issues.map(i => i.number === number ? parsed : i) });
-      await db.issues.put(parsed);
-      render();
+      await actions.saveRating(number, changed);
     } catch (err) {
-      setState({ issues: getState().issues.map(i => i.number === number ? before : i) });
-      render();
       showToast(`Error: ${err.message}`);
     }
+    render();
   }
 
   // Assign to agent: the desktop dispatches requests every couple of minutes
@@ -393,72 +378,10 @@ export function renderTask(container, { number }) {
       className: 'btn btn-ghost',
       disabled: closed || requested,
       title,
-      onClick: () => showAssignDialog(currentTask, assigned),
-    }, icon('sparkles', 16), label);
-  }
-
-  function showAssignDialog(currentTask, again) {
-    const instructions = el('textarea', {
-      className: 'input textarea',
-      id: 'assign-instructions',
-      placeholder: 'What should the agent do? (optional)',
-    });
-
-    const hint = el('p', { className: 'form-hint', style: { marginTop: '0', marginBottom: 'var(--space-3)' } });
-    const picker = agentPicker('assign', () => { hint.textContent = picker.describe(); });
-    hint.textContent = picker.describe();
-
-    const assignBtn = el('button', {
-      className: 'btn btn-primary',
       onClick: async () => {
-        const problem = picker.check();
-        if (problem) { showToast(problem); return; }
-        assignBtn.disabled = true;
-        const ok = await requestAgent(currentTask, instructions.value, picker.target());
-        if (ok) modal.close();
-        else assignBtn.disabled = false;
+        if (await showAssignDialog(currentTask, { again: assigned, idPrefix: 'assign' })) render();
       },
-    }, again ? 'Assign again' : 'Assign');
-
-    const modal = showModal({
-      title: again ? 'Assign again' : 'Assign to agent',
-      body: [
-        picker.element,
-        hint,
-        el('div', { className: 'form-group' },
-          el('label', { className: 'form-label', htmlFor: 'assign-instructions' }, 'Instructions'),
-          instructions,
-        ),
-      ],
-      footer: [
-        el('button', { className: 'btn btn-secondary', onClick: () => modal.close() }, 'Cancel'),
-        assignBtn,
-      ],
-    });
-
-    instructions.focus();
-  }
-
-  // Comment first, then label: the desktop only acts on the label, and reads the newest request comment
-  async function requestAgent(currentTask, instructions, target = null) {
-    if (navigator.onLine === false) {
-      showToast('Assigning needs the network');
-      return false;
-    }
-    try {
-      const issueId = currentTask.nodeId || await api.getIssueNodeId(number);
-      await api.addComment(issueId, agentRequestBody(instructions, target?.id || null));
-      const raw = await api.addLabels(issueId, [AGENT_REQUESTED_LABEL]);
-      const parsed = parseIssue(raw);
-      setState({ issues: getState().issues.map(i => i.number === number ? parsed : i) });
-      await db.issues.put(parsed);
-      render();
-      showToast(requestedToast(target));
-      return true;
-    } catch (err) {
-      showToast(`Error: ${err.message}`);
-      return false;
-    }
+    }, icon('sparkles', 16), label);
   }
 
   function renderChecklist(currentTask) {
@@ -701,41 +624,18 @@ export function renderTask(container, { number }) {
     }, groupName);
   }
 
-  async function toggleComplete(currentTask) {
-    const wasOpen = currentTask.state === 'OPEN';
-    const { issues } = getState();
-    setState({
-      issues: issues.map(i =>
-        i.number === number ? { ...i, state: wasOpen ? 'CLOSED' : 'OPEN' } : i
-      ),
-    });
+  async function toggleTask() {
+    const { wasOpen, pending, undo } = actions.toggleWithUndo(number);
     render();
-
     showToast(wasOpen ? 'Task completed' : 'Task reopened', {
-      action: () => {
-        setState({
-          issues: getState().issues.map(i =>
-            i.number === number ? { ...i, state: wasOpen ? 'OPEN' : 'CLOSED' } : i
-          ),
-        });
-        render();
-      },
+      action: () => undo().catch(err => showToast(`Error: ${err.message}`)).finally(render),
     });
-
     try {
-      if (wasOpen) await api.closeIssue(number);
-      else await api.reopenIssue(number);
-      const updated = getState().issues.find(i => i.number === number);
-      if (updated) await db.issues.put(updated);
+      await pending;
     } catch (err) {
-      setState({
-        issues: getState().issues.map(i =>
-          i.number === number ? { ...i, state: wasOpen ? 'OPEN' : 'CLOSED' } : i
-        ),
-      });
-      render();
       showToast(`Error: ${err.message}`);
     }
+    render();
   }
 
   async function deleteTask(currentTask) {
@@ -748,12 +648,7 @@ export function renderTask(container, { number }) {
     if (!confirmed) return;
 
     try {
-      // Close and remove list label
-      const labelsWithoutList = currentTask.labels.filter(l => !l.startsWith('list:'));
-      await api.updateIssue(number, { state: 'CLOSED', labels: labelsWithoutList });
-      const { issues } = getState();
-      setState({ issues: issues.filter(i => i.number !== number) });
-      await db.issues.delete(number);
+      await actions.deleteTask(currentTask.number);
       showToast('Task deleted');
       navigate('#/');
     } catch (err) {

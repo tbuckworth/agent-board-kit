@@ -1,0 +1,7 @@
+[Unit]
+Description=agent-mail-backup: copy the mailroom's message store and database to config backup.targets
+
+[Service]
+Type=oneshot
+ExecStart={{PYTHON}} {{KIT_DIR}}/mailroom/bin/agent-mail backup
+Environment=PYTHONUNBUFFERED=1

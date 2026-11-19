@@ -84,8 +84,13 @@ enum Fmt {
 
     static func day(_ iso: String?) -> String {
         guard let d = date(iso) else { return "" }
+        return shortDay(d, now: Date())
+    }
+
+    /// "23 Oct", with the year when it isn't `now`'s year.
+    static func shortDay(_ d: Date, now: Date) -> String {
         let f = DateFormatter()
-        f.dateFormat = Calendar.current.isDate(d, equalTo: Date(), toGranularity: .year) ? "d MMM" : "d MMM yyyy"
+        f.dateFormat = Calendar.current.isDate(d, equalTo: now, toGranularity: .year) ? "d MMM" : "d MMM yyyy"
         return f.string(from: d)
     }
 
@@ -94,6 +99,12 @@ enum Fmt {
         let f = DateFormatter()
         f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : "d MMM HH:mm"
         return f.string(from: d)
+    }
+
+    static func formatDayCount(_ days: Int) -> String {
+        if days == 7 { return "1 week" }
+        if days % 7 == 0 { return "\(days / 7) weeks" }
+        return days == 1 ? "1 day" : "\(days) days"
     }
 }
 

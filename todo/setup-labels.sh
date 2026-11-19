@@ -58,9 +58,9 @@ LABELS=(
   "importance:low|FBCA04|Importance: low"
   "urgency:high|E99695|Urgent (also: due within 14 days)"
   "urgency:low|FEF2C0|Not urgent"
-  "priority:high|EDEDED|Legacy priority (the Mac app's editor still sets it; the web app replaces it with importance)"
-  "priority:medium|EDEDED|Legacy priority"
-  "priority:low|EDEDED|Legacy priority"
+  "priority:high|EDEDED|Retired priority (importance and urgency replaced it; an edit in either app removes it)"
+  "priority:medium|EDEDED|Retired priority"
+  "priority:low|EDEDED|Retired priority"
   # who made it
   "source:app|BFD4F2|Created in a to-do app"
   "source:claude|BFD4F2|Created by an agent"

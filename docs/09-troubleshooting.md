@@ -33,8 +33,21 @@ it. Send from the provider directly. `require_dkim: false` turns the check off: 
 forge your `From:` can instruct your agents. Not recommended.
 
 **A reply went to the orchestrator instead of the agent.** It was a new thread or the subject's
-`[#tag]` was removed. Reply in the agent's own thread. The orchestrator relays it if the
-instruction is clear.
+`[#tag]` was removed, or the agent has closed (the orchestrator then offers a new one). Reply in the
+agent's own thread. The orchestrator relays it if the instruction is clear.
+
+**`agent-mail backup` refuses: "backup.targets is empty".** Set `MAIL_BACKUP_DIRS` in `kit.env` and
+run `./install.sh --start`. A target whose parent folder is missing (a disk not mounted) fails that
+run; `agent-mail status` shows each target's last copy.
+
+**The Mail tab shows older mail as text only, or not at all.** Mail sent before the message store
+existed is fetched once with `agent-mail mailbox backfill`.
+
+**A group post never reached an agent.** `agent-group show GROUP` gives each member's alert setting
+(`named` agents wake only for posts that name them). Quiet posts are announced at the agent's next
+prompt by the `UserPromptSubmit` hook: `kit doctor` checks it is installed, and a session started
+before it was must be restarted. Each delivery is logged in
+`~/.local/state/agent-mail/groups/deliveries.jsonl`.
 
 ## Agents
 
@@ -45,6 +58,18 @@ Install them with their standard installers or symlink them into `~/.local/bin`.
 **A Codex session never shows a queued message.** Update Codex (0.149+ for `codex queue`). If it
 still does not render, start the shared daemon (`codex app-server daemon start`) and relaunch the
 session. A Codex rate-limit dialog also blocks queued messages until dismissed.
+
+**A Codex agent started by the kit runs without its hooks.** Codex asked "Hooks need review" and the
+unattended start answered "Continue without trusting". Trust the hooks once in a Codex session you
+start yourself (`/hooks`), then resume the agent.
+
+**`agent-spawn` refuses Codex in a worktree.** The worktree has a `.codex/hooks.json` that the repo's
+main checkout lacks, so Codex would run different hooks there. Commit it to main first, or start the
+agent on Claude.
+
+**Spawned agents stop at once with a model error.** `spawn_claude_model` (or `claude_fallback_models`)
+names a model your plan does not have. Set it to `null` (Claude Code's default) or another model in `~/.config/agent-mail/config.json`
+([04-claude-and-codex.md](04-claude-and-codex.md)).
 
 **An agent was killed with no message.** Its memory cap (`agent_memory_max`, default 32G) was hit.
 `journalctl --user -u 'agent-*.scope'` shows the OOM kill. Relaunch with
@@ -83,6 +108,11 @@ your key, and that `~/.local/bin/agent-board` exists on the Linux machine.
 **The to-do web app says "Bad credentials" or 404.** The fine-grained token must have access to the
 tasks repo with Issues read/write and Contents read/write. Re-create it and paste it in Settings.
 
+**No Chats button, the Mail tab says there is no mailbox, Sync with Gmail fails, no meeting alerts, a
+Time source is marked failed, or usage shows in dollars.** Each has an entry in the board's own
+[Troubleshooting](../board/README.md#troubleshooting). Usage shows in dollars until the board has a few
+days of its own usage readings.
+
 ## Getting more detail
 
 | What | Where |
@@ -92,4 +122,8 @@ tasks repo with Issues read/write and Contents read/write. Re-create it and past
 | status events | `~/.local/state/agent-status/events.jsonl` (`agent-status log`) |
 | orchestrator runs | `~/.local/state/agent-mail/orchestrator-runs.jsonl` |
 | board actions | `~/.local/state/agent-board/actions.jsonl` |
+| what you sent from the board | `~/.local/state/agent-board/sent.jsonl` (`agent-board sent`) |
+| Time page, usage breakdown | `~/.local/state/agent-board/time.log`, `allowance.log`, `usage-samples.jsonl` |
+| agent mail kept for the Mail tab | `~/.local/state/agent-mail/messages/` |
+| group chats | `~/.local/state/agent-mail/groups/` (`deliveries.jsonl`: each post's delivery) |
 | to-do helper | `~/.local/state/todo-desk/` |

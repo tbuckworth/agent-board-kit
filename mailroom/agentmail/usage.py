@@ -14,42 +14,40 @@ in tokens, so a local count cannot be turned into a percentage honestly. Reading
 `cache_seconds` in STATE_DIR/usage-cache.json (percentages, reset times, plan names; no identities, no tokens).
 When a read fails, the last good reading is used, marked stale with its age.
 
-Routing: accounts are tried in `order`; the first whose counted windows all keep at least `min_remaining` percent
-wins. Counted windows are the 5-hour/session and weekly ones, plus a per-model weekly window only when it is for
-the model the agent would run. Settings live under config key "usage"; DEFAULTS below.
+Routing: places are tried in `places` order, each Claude login in `order` on each model of
+config.claude_model_order in turn; the first whose counted windows all keep at least `min_remaining` percent wins (recommend says what comes
+next). Counted windows are the 5-hour/session and weekly ones, plus a per-model weekly window only when it is for
+the model the agent would run there. Settings live under config key "usage"; DEFAULTS below.
 """
 import datetime
 import json
 import os
 import queue
-import re
 import subprocess
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from . import accounts, claude_session, config, jsonfile, registry
 
 DEFAULTS = {
     # Claude accounts, one config dir each. config_dir None is the default login (~/.claude, CLAUDE_CONFIG_DIR
     # unset). exclude_owners / only_owners: GitHub owners (from the repo's origin) this account must not / may
     # only be used for, e.g. keep employer repos off a personal plan. min_remaining overrides per account.
     "claude_accounts": {"default": {"config_dir": None, "label": "Claude (default login)"}},
-    "codex_label": "Codex",
+    "codex_label": "Codex",   # how the report names Codex
     # Preference order: the first target with headroom wins. None means every Claude account, then codex.
     "order": None,
     # Percent that must REMAIN in each counted window; below it the account is "low" and skipped.
     "min_remaining": {"session": 10, "weekly": 5},
-    "cache_seconds": 120,
+    "cache_seconds": 120,        # a reading younger than this is reused
     "stale_seconds": 6 * 3600,   # a failed read falls back to the last good reading up to this old
-    "timeout": 30,
+    "timeout": 30,               # seconds for one account's read
 }
-CODEX = "codex"
+CODEX = "codex"   # Codex's target; a Claude login's is CLAUDE_PREFIX and the login's name (claude_target)
+CLAUDE_PREFIX = "claude:"
 CACHE_NAME = "usage-cache.json"
-# Never hand these to the probe: each would make Claude Code read some other credential than the account's own.
-CLAUDE_ENV_DROP = ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                   "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-                   "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SESSION_ID")
 
 
 class UsageError(Exception):
@@ -62,24 +60,43 @@ def settings(cfg):
     if not s.get("claude_accounts"):
         s["claude_accounts"] = dict(DEFAULTS["claude_accounts"])
     if not s.get("order"):
-        s["order"] = ["claude:" + n for n in s["claude_accounts"]] + [CODEX]
+        s["order"] = [claude_target(n) for n in s["claude_accounts"]] + [CODEX]
     return s
 
 
-def expand(p):
-    return str(Path(os.path.expanduser(p)).resolve()) if p else None
+# ------------------------------------------------------------------ targets
+def claude_target(name):
+    """The target of Claude login `name`: "claude:<name>"."""
+    return CLAUDE_PREFIX + name
 
 
-# ------------------------------------------------------------------ targets and accounts
+def account_of(target):
+    """The Claude login a target names ("claude:<name>" -> name), or None for CODEX."""
+    return target[len(CLAUDE_PREFIX):] if target.startswith(CLAUDE_PREFIX) else None
+
+
 def ranked(s):
     """The targets routing may pick, in preference order (unknown names in `order` are ignored)."""
-    return [t for t in s["order"] if t == CODEX or (t.startswith("claude:") and t[7:] in s["claude_accounts"])]
+    return [t for t in s["order"] if t == CODEX or account_of(t) in s["claude_accounts"]]
+
+
+def places(s, claude_models, codex_model):
+    """The (target, model) places routing tries, best first (the README's "login and model order"): each Claude
+    login in `order` on claude_models[0], then each on claude_models[1], and so on; Codex, on codex_model, before
+    them if `order` lists it before every Claude login, else after them."""
+    order = ranked(s)
+    claude = [t for t in order if t != CODEX]
+    rungs = [(t, m) for m in claude_models for t in claude]
+    if CODEX not in order:
+        return rungs
+    codex_first = not claude or order.index(CODEX) < order.index(claude[0])
+    return [(CODEX, codex_model)] + rungs if codex_first else rungs + [(CODEX, codex_model)]
 
 
 def targets(s):
     """Every target agent-usage reads and shows: the ranked ones, then any account left out of `order`."""
     out = ranked(s)
-    out += ["claude:" + n for n in s["claude_accounts"] if "claude:" + n not in out]
+    out += [claude_target(n) for n in s["claude_accounts"] if claude_target(n) not in out]
     return out + ([CODEX] if CODEX not in out else [])
 
 
@@ -88,59 +105,12 @@ def parse_target(text, s):
     t = (text or "").strip()
     if t in (CODEX, "codex:default"):
         return CODEX, None
-    name = t[len("claude:"):] if t.startswith("claude:") else t
+    name = account_of(t)
+    name = t if name is None else name
     if name in s["claude_accounts"]:
         return "claude", name
     raise ValueError("unknown account %r (Claude accounts: %s; or codex)"
                      % (text, ", ".join(sorted(s["claude_accounts"])) or "none"))
-
-
-def account(s, name):
-    return dict(s["claude_accounts"].get(name) or {})
-
-
-def default_account(s):
-    """The account whose config dir is the default ~/.claude, i.e. what `claude` uses with nothing set."""
-    for n, a in s["claude_accounts"].items():
-        if not (a or {}).get("config_dir"):
-            return n
-    return None
-
-
-def account_ready(acct, platform=None):
-    """(ok, why). Existence checks only; no credential file is opened. macOS keeps the login in the Keychain,
-    so there only the config dir is checked."""
-    d = expand(acct.get("config_dir"))
-    if not d:
-        return True, ""
-    if not os.path.isdir(d):
-        return False, "config dir %s does not exist (set it up with agent-usage init-account)" % d
-    if (platform or sys.platform) != "darwin" and not os.path.exists(os.path.join(d, ".credentials.json")):
-        return False, "no login in %s yet: run CLAUDE_CONFIG_DIR=%s claude, then /login" % (d, d)
-    return True, ""
-
-
-def owner_allowed(acct, owner):
-    if not owner:
-        return True, ""
-    low = owner.lower()
-    if low in [o.lower() for o in acct.get("exclude_owners") or []]:
-        return False, "repos owned by %s are excluded from this account" % owner
-    only = [o.lower() for o in acct.get("only_owners") or []]
-    if only and low not in only:
-        return False, "this account is only for repos owned by %s" % ", ".join(acct["only_owners"])
-    return True, ""
-
-
-def repo_owner(path):
-    """GitHub owner of the repo's origin remote, or None."""
-    try:
-        url = subprocess.run(["git", "-C", str(path), "remote", "get-url", "origin"], capture_output=True,
-                             text=True, timeout=10).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    m = re.search(r"github\.com[:/]+([^/]+)/", url)
-    return m.group(1) if m else None
 
 
 # ------------------------------------------------------------------ parsing (pure)
@@ -197,6 +167,17 @@ def parse_claude(resp):
                  "currency": eu.get("currency") or "USD",
                  "limit_reached": bool(eu.get("spend_limit_reached"))}
     return {"plan": resp.get("subscription_type"), "windows": windows, "extra_usage": extra}
+
+
+# How long each kind of window parse_claude reads runs, so it last reset that long before its resets_at. A window of
+# kind "other" has no known length.
+CLAUDE_WINDOW_SECONDS = {"session": 5 * 3600, "weekly": 7 * 86400, "model_weekly": 7 * 86400}
+
+
+def claude_last_reset(w):
+    """When a Claude login's window (parse_claude) last reset, as an epoch; None when its length or reset is unknown."""
+    secs = CLAUDE_WINDOW_SECONDS.get(w["kind"])
+    return w["resets_at"] - secs if secs and w.get("resets_at") else None
 
 
 def window_name(mins):
@@ -260,59 +241,31 @@ def codex_rollout_to_result(rl):
 
 
 # ------------------------------------------------------------------ reading (subprocesses)
-def claude_env(acct, base=None):
-    env = dict(os.environ if base is None else base)
-    for k in CLAUDE_ENV_DROP:
-        env.pop(k, None)
-    d = expand(acct.get("config_dir"))
-    if d:
-        env["CLAUDE_CONFIG_DIR"] = d
-    return env
-
-
-def claude_probe_cmd(claude):
-    return [claude, "-p", "--safe-mode", "--no-session-persistence", "--input-format", "stream-json",
-            "--output-format", "stream-json", "--verbose"]
-
 
 def fetch_claude(acct, timeout=30, claude=None, cwd=None, run=subprocess.run):
-    ok, why = account_ready(acct)
+    ok, why = accounts.account_ready(acct)
     if not ok:
         raise UsageError(why)
     if claude is None:
-        from . import registry
         claude = registry.claude_bin()
     if not claude:
         raise UsageError("claude binary not found")
-    req = {"type": "control_request", "request_id": "agent-usage",
-           "request": {"subtype": "get_usage", "skip_behaviors": True}}
     try:
-        r = run(claude_probe_cmd(claude), input=json.dumps(req) + "\n", capture_output=True, text=True,
-                timeout=timeout, env=claude_env(acct), cwd=cwd)
+        resp = claude_session.claude_control(claude, acct, {"subtype": "get_usage", "skip_behaviors": True}, timeout, cwd, run)
     except subprocess.TimeoutExpired:
         raise UsageError("claude usage read timed out after %ds" % timeout)
-    for line in (r.stdout or "").splitlines():
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
-        if d.get("type") != "control_response":
-            continue
-        resp = d.get("response") or {}
-        if resp.get("subtype") == "error":
-            raise UsageError("claude: %s" % str(resp.get("error"))[:200])
-        return parse_claude(resp.get("response") or {})
-    raise UsageError("claude gave no usage answer (exit %s): %s" % (r.returncode, (r.stderr or r.stdout or "").strip()[:200]))
+    except claude_session.ControlError as e:
+        raise UsageError(str(e))
+    return parse_claude(resp)
 
 
-def fetch_codex_live(timeout=30, codex=None, popen=subprocess.Popen):
+def fetch_codex_live(timeout=30, codex=None):
     if codex is None:
-        from . import registry
         codex = registry.codex_bin()
     if not codex:
         raise UsageError("codex binary not found")
-    p = popen([codex, "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-              stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    p = subprocess.Popen([codex, "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
     lines = queue.Queue()
 
     def pump():  # a thread, not select(): select cannot see lines already sitting in the pipe's read buffer
@@ -360,23 +313,16 @@ def fetch_codex_live(timeout=30, codex=None, popen=subprocess.Popen):
             pass
 
 
-def codex_home():
-    from . import registry
-    return registry.CODEX_HOME
-
-
 def codex_from_rollouts(home=None, max_files=40):
     """(parsed, event_ts): the newest rate_limits any Codex session logged. Reads only the tails of recent logs."""
-    root = Path(home or codex_home()) / "sessions"
+    root = Path(home or registry.CODEX_HOME) / "sessions"
     files = []
     for dirpath, dirs, names in os.walk(str(root)):
         files += [os.path.join(dirpath, n) for n in names if n.startswith("rollout-") and n.endswith(".jsonl")]
     files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
     for f in files[:max_files]:
         try:
-            with open(f, "rb") as fh:
-                fh.seek(max(0, os.path.getsize(f) - (512 << 10)))
-                lines = fh.read().decode("utf-8", "replace").splitlines()
+            lines = jsonfile.read_tail(f, 512 << 10)
         except OSError:
             continue
         for line in reversed(lines):
@@ -404,32 +350,10 @@ def fetch_codex(timeout=30):
 
 
 # ------------------------------------------------------------------ snapshots + cache
-def cache_path():
-    from . import config
-    return config.STATE_DIR / CACHE_NAME
-
-
-def load_cache(path=None):
-    try:
-        return json.loads(Path(path or cache_path()).read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def save_cache(data, path=None):
-    path = Path(path or cache_path())
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp.%d" % os.getpid())
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump(data, fh, indent=1)
-    os.replace(tmp, path)
-
-
 def label_for(target, s):
     if target == CODEX:
-        return s.get("codex_label") or "Codex"
-    return account(s, target.split(":", 1)[1]).get("label") or target
+        return s["codex_label"]
+    return accounts.account(s, account_of(target)).get("label") or target
 
 
 def read_one(target, s):
@@ -437,23 +361,24 @@ def read_one(target, s):
     if target == CODEX:
         data = fetch_codex(s["timeout"])
     else:
-        from . import config
-        data = dict(fetch_claude(account(s, target.split(":", 1)[1]), s["timeout"], cwd=str(config.STATE_DIR)
+        data = dict(fetch_claude(accounts.account(s, account_of(target)), s["timeout"], cwd=str(config.STATE_DIR)
                                  if config.STATE_DIR.is_dir() else None), source="server")
     data.setdefault("observed_at", time.time())
     data["read_seconds"] = round(time.time() - t0, 1)
     return data
 
 
-def snapshots(cfg, refresh=False, only=None, reader=None, cache_file=None, now=None):
-    """{target: snapshot}. Fresh cache entries are reused; the rest are read in parallel."""
+def snapshots(cfg, refresh=False, reader=None, cache_file=None, now=None):
+    """{target: snapshot}. Fresh cache entries are reused; the rest are read in parallel and written to the cache
+    file. A cache file that is not JSON raises (jsonfile.read); it is only a cache, so the operator deletes it. One
+    that cannot be written raises OSError."""
     s = settings(cfg)
     reader = reader or read_one
     now = time.time() if now is None else now
-    wanted = [t for t in targets(s) if not only or t == only or t.startswith(only + ":")]
-    cache = load_cache(cache_file)
+    cache_file = cache_file or config.STATE_DIR / CACHE_NAME
+    cache = jsonfile.read(cache_file)
     out, todo = {}, []
-    for t in wanted:
+    for t in targets(s):
         c = cache.get(t)
         if c and not refresh and now - c.get("observed_at", 0) < s["cache_seconds"]:
             out[t] = dict(c, cached=True)
@@ -482,23 +407,21 @@ def snapshots(cfg, refresh=False, only=None, reader=None, cache_file=None, now=N
                 else:
                     out[t] = {"windows": [], "error": err}
         if changed:
-            try:
-                save_cache(cache, cache_file)
-            except OSError:
-                pass
+            jsonfile.write(cache_file, cache, jsonfile.PRIVATE, 1)
     for t in out:
         cli = CODEX if t == CODEX else "claude"
-        out[t].update(target=t, cli=cli, account=None if cli == CODEX else t.split(":", 1)[1], label=label_for(t, s))
+        out[t].update(target=t, cli=cli, account=account_of(t), label=label_for(t, s))
     return out
 
 
 # ------------------------------------------------------------------ deciding
 def fmt_reset(ts, now=None):
+    """A time as its local time of day, with the weekday when it is 20 hours or more from now; "unknown" for none."""
     if not ts:
         return "unknown"
     now = time.time() if now is None else now
     lt = time.localtime(ts)
-    if ts - now < 20 * 3600:
+    if abs(ts - now) < 20 * 3600:
         return time.strftime("%H:%M", lt)
     return time.strftime("%a %H:%M", lt)
 
@@ -509,21 +432,26 @@ def counted(w, model):
     return bool(model and w.get("model") and w["model"] in model.lower())
 
 
+def used_up(snap, model):
+    """The windows of this snapshot counted for `model` (counted) with nothing left."""
+    return [w for w in snap.get("windows") or [] if counted(w, model) and w["remaining_pct"] <= 0]
+
+
 def assess(snap, s, model=None, now=None):
     """-> {"status": ok|low|out|unknown, "headroom": %, "why": [...]}; why says what keeps it from ok."""
     now = time.time() if now is None else now
     if not snap.get("windows"):
         return {"status": "unknown", "headroom": None, "why": ["usage unknown: %s" % (snap.get("error") or "no data")]}
-    acct = account(s, snap.get("account")) if snap.get("cli") == "claude" else {}
+    acct = accounts.account(s, snap.get("account")) if snap.get("cli") == "claude" else {}
     thr = dict(s["min_remaining"], **(acct.get("min_remaining") or {}))
-    status, why, rems = "ok", [], []
+    status, why, rems, gone = "ok", [], [], used_up(snap, model)
     for w in snap["windows"]:
         if not counted(w, model):
             continue
         rem = w["remaining_pct"]
         rems.append(rem)
         base = "session" if w["kind"].endswith("session") else "weekly"
-        if rem <= 0:
+        if w in gone:
             status = "out"
             why.append("%s window used up until %s" % (w["name"], fmt_reset(w.get("resets_at"), now)))
         elif rem < thr.get(base, 0):
@@ -547,29 +475,44 @@ def summary(snap, model=None):
     return ", ".join(parts) or "no counted windows"
 
 
+def last_resort(snap, model, claude_models):
+    """Whether this Claude login may take an agent on `model` once no place has headroom, billing its extra usage:
+    `model` is the last of claude_models (the models the agent may run, best first), and extra usage is on there
+    and under its spend limit."""
+    eu = snap.get("extra_usage") or {}
+    return model == claude_models[-1] and bool(eu.get("enabled")) and not eu.get("limit_reached")
+
+
 def recommend(snaps, cfg, models=None, owner=None, only_cli=None, now=None):
-    """Pick a target. models: {"claude": model id, "codex": model id} the agent would run (for per-model windows)."""
+    """Pick a target and the model the agent runs there. models: {"claude": model id, "codex": model id} the agent
+    would run (for per-model windows); None: config's, where a Claude agent may run each of
+    config.claude_model_order in turn. Places are tried in `places` order: the first with headroom wins; with none,
+    the low one with most left; then the first whose usage is unknown; then the first last_resort allows; then the
+    first one used up."""
     s = settings(cfg)
-    models = models or {"claude": cfg.get("spawn_claude_model"), "codex": cfg.get("spawn_codex_model")}
+    claude_models = config.claude_model_order(cfg) if models is None else [models.get("claude")]
+    codex_model = (config.spawn_models(cfg) if models is None else models).get("codex")
     cands = []
-    for t in ranked(s):
+    for t, model in places(s, claude_models, codex_model):
         cli = CODEX if t == CODEX else "claude"
         if only_cli and cli != only_cli:
             continue
         snap = snaps.get(t) or {"target": t, "cli": cli, "windows": [], "error": "not read"}
-        a = assess(snap, s, models.get(cli), now)
+        a = assess(snap, s, model, now)
         if cli == "claude":
-            acct = account(s, t.split(":", 1)[1])
-            allowed, reason = owner_allowed(acct, owner)
-            ready, why_not = account_ready(acct)
+            acct = accounts.account(s, account_of(t))
+            allowed, reason = accounts.owner_allowed(acct, owner)
+            ready, why_not = accounts.account_ready(acct)
             if not allowed:
                 a = {"status": "excluded", "headroom": a["headroom"], "why": [reason]}
             elif not ready:   # never route to a login that does not exist yet
                 a = {"status": "unavailable", "headroom": None, "why": [why_not]}
-        cands.append(dict(a, target=t, cli=cli, account=None if cli == CODEX else t.split(":", 1)[1],
-                          summary=summary(snap, models.get(cli))))
+        cands.append(dict(a, target=t, cli=cli, account=account_of(t), model=model,
+                          bills=cli == "claude" and last_resort(snap, model, claude_models),
+                          summary=summary(snap, model)))
     use, why = None, ""
     by = {st: [c for c in cands if c["status"] == st] for st in ("ok", "low", "unknown", "out")}
+    billing = [c for c in by["out"] if c["bills"]]
     if by["ok"]:
         use = by["ok"][0]
         why = use["summary"]
@@ -579,24 +522,33 @@ def recommend(snaps, cfg, models=None, owner=None, only_cli=None, now=None):
     elif by["unknown"]:
         use = by["unknown"][0]
         why = "no account has known headroom; usage of this one is unknown (%s)" % "; ".join(use["why"])
+    elif billing:
+        use = billing[0]
+        why = "no account has headroom; this one bills its extra usage (%s)" % "; ".join(use["why"])
     elif by["out"]:
         use = by["out"][0]
         why = "every account is used up; nothing better to pick (%s)" % "; ".join(use["why"])
-    avoid = [{"target": c["target"], "status": c["status"], "why": "; ".join(c["why"])}
+
+    def place(c):   # a Claude place names its model when there are several to choose from
+        return "%s on %s" % (c["target"], c["model"]) if c["cli"] == "claude" and len(claude_models) > 1 else c["target"]
+    avoid = [{"target": c["target"], "model": c["model"], "place": place(c), "status": c["status"],
+              "why": "; ".join(c["why"])}
              for c in cands if c is not use and c["status"] in ("out", "low", "excluded", "unavailable")]
     rec = {"use": use["target"] if use else None, "cli": use["cli"] if use else None,
-           "account": use["account"] if use else None, "why": why, "avoid": avoid, "candidates": cands,
-           "owner": owner}
+           "account": use["account"] if use else None, "model": use["model"] if use else None,
+           "place": place(use) if use else None, "why": why, "avoid": avoid, "candidates": cands, "owner": owner}
     rec["line"] = recommendation_line(rec)
     return rec
 
 
 def recommendation_line(rec):
+    if not rec["use"] and rec["avoid"]:
+        return "No usable account: %s." % "; ".join("%s (%s)" % (a["place"], a["why"]) for a in rec["avoid"])
     if not rec["use"]:
         return "No account to recommend (nothing configured for this CLI)."
-    line = "Use %s: %s." % (rec["use"], rec["why"])
+    line = "Use %s: %s." % (rec["place"], rec["why"])
     if rec["avoid"]:
-        line += " Avoid " + "; ".join("%s (%s)" % (a["target"], a["why"]) for a in rec["avoid"]) + "."
+        line += " Avoid " + "; ".join("%s (%s)" % (a["place"], a["why"]) for a in rec["avoid"]) + "."
     return line
 
 
@@ -605,10 +557,19 @@ def money(v, cur):
     return ("$%.2f" % v) if cur == "USD" else "%.2f %s" % (v, cur)
 
 
+def extra_spend(eu):
+    """A login's extra-usage spend this month, from its snapshot's extra_usage: "$211.41 used, no monthly cap" or
+    "$211.41 used of a $500.00 monthly cap"."""
+    used = money(eu["used"], eu["currency"]) if eu.get("used") is not None else "?"
+    if eu.get("monthly_limit"):
+        return "%s used of a %s monthly cap" % (used, money(eu["monthly_limit"], eu["currency"]))
+    return "%s used, no monthly cap" % used
+
+
 def render_text(snaps, rec, cfg, now=None):
     now = time.time() if now is None else now
     s = settings(cfg)
-    models = {"claude": cfg.get("spawn_claude_model"), "codex": cfg.get("spawn_codex_model")}
+    models = config.spawn_models(cfg)
     lines = ["Plan usage, percent REMAINING (server-reported; read by each CLI itself, cached up to %d s)" % s["cache_seconds"], ""]
     for t in targets(s):
         snap = snaps.get(t)
@@ -631,9 +592,7 @@ def render_text(snaps, rec, cfg, now=None):
         eu = snap.get("extra_usage")
         if eu:
             if eu["enabled"]:
-                cap = ("of %s monthly cap" % money(eu["monthly_limit"], eu["currency"])) if eu.get("monthly_limit") else "no monthly cap"
-                used = money(eu["used"], eu["currency"]) if eu.get("used") is not None else "?"
-                lines.append("    extra usage ON: %s used, %s%s" % (used, cap, " (LIMIT REACHED)" if eu.get("limit_reached") else ""))
+                lines.append("    extra usage ON: %s%s" % (extra_spend(eu), " (LIMIT REACHED)" if eu.get("limit_reached") else ""))
             else:
                 lines.append("    extra usage off")
         cr = snap.get("credits")
@@ -646,70 +605,3 @@ def render_text(snaps, rec, cfg, now=None):
         lines.append("")
     lines.append("Recommendation: " + rec["line"])
     return "\n".join(lines)
-
-
-# ------------------------------------------------------------------ project memory for a second account
-def project_slug(path):
-    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
-
-
-def link_memory(repo_root, config_dir, default_home=None):
-    """Give an agent on another account the same auto memory as the default login: symlink
-    <config_dir>/projects/<slug>/memory to ~/.claude/projects/<slug>/memory. Best effort; returns the link or None."""
-    slug = project_slug(Path(repo_root).resolve())
-    src = Path(default_home or Path.home() / ".claude") / "projects" / slug / "memory"
-    dst = Path(config_dir) / "projects" / slug / "memory"
-    if not src.is_dir() or dst.exists() or dst.is_symlink():
-        return None
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(str(src), str(dst))
-        return str(dst)
-    except OSError:
-        return None
-
-
-# ------------------------------------------------------------------ setting up a second account
-# User-level customisations shared with the default login by symlink. Everything else (credentials, .claude.json,
-# projects, sessions, history, caches) stays per account. Claude Code refuses a symlinked .credentials.json anyway.
-SHARED = ("CLAUDE.md", "settings.json", "commands", "agents", "skills", "hooks", "plugins", "output-styles",
-          "keybindings.json", "tools")
-
-
-def init_account(config_dir, default_home=None, copy_mcp=(), default_json=None, dry_run=False):
-    """Create a second account's config dir that shares the default login's customisations. Never touches the
-    default login's files except to read them. Returns a list of what it did (or would do)."""
-    home = Path(default_home or Path.home() / ".claude")
-    d = Path(os.path.expanduser(config_dir)).resolve()
-    if d == home.resolve():
-        raise ValueError("that is the default login's own config dir")
-    done = []
-    if not d.exists():
-        done.append("create %s (mode 700)" % d)
-        if not dry_run:
-            d.mkdir(mode=0o700, parents=True)
-    for item in SHARED:
-        src, dst = home / item, d / item
-        if src.exists() and not (dst.exists() or dst.is_symlink()):
-            done.append("link %s -> %s" % (dst, src))
-            if not dry_run:
-                os.symlink(str(src), str(dst))
-    if copy_mcp:
-        src_json = Path(default_json or Path.home() / ".claude.json")
-        dst_json = d / ".claude.json"
-        servers = (json.loads(src_json.read_text()).get("mcpServers") or {}) if src_json.exists() else {}
-        missing = [n for n in copy_mcp if n not in servers]
-        if missing:
-            raise ValueError("no user MCP server named %s in %s" % (", ".join(missing), src_json))
-        if not dst_json.exists():
-            raise ValueError("%s does not exist yet: log in to the new account first, then copy MCP servers" % dst_json)
-        done.append("copy user MCP servers %s into %s" % (", ".join(copy_mcp), dst_json))
-        if not dry_run:
-            data = json.loads(dst_json.read_text())
-            data.setdefault("mcpServers", {}).update({n: servers[n] for n in copy_mcp})
-            tmp = dst_json.with_suffix(".json.agent-usage.tmp")
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as fh:
-                json.dump(data, fh, indent=2)
-            os.replace(tmp, dst_json)
-    return done

@@ -17,6 +17,7 @@ The last four fall back to the mailroom's ~/.config/agent-mail/config.json.
                                             then publish-agents
     todo-desk agents [--pretty]             the agent board's running agents, as the to-do apps list them
     todo-desk publish-agents [--force]      write them to .todo/agents.json for the web app, if changed
+    todo-desk agent-mail N                  the newest mail task N's agent sent the owner (what the Mac opens)
     todo-desk config                        print the settings in effect (no GitHub call); exit 2 if "repo" is unset
 
 Requests carry an "id" that the reply repeats; the helper answers them one at a time, in order:
@@ -27,10 +28,12 @@ Requests carry an "id" that the reply repeats; the helper answers them one at a 
                                             it was away
     {"cmd": "refresh", "full": bool}        sync now; changes arrive as an "issues" event
     {"cmd": "create", "title", "body", "labels"}
-    {"cmd": "update", "number", "set": {"title"?, "body"?, "state"?}, "base": {"title"?, "body"?},
+    {"cmd": "update", "number", "set": {"title"?, "body"?, "state"?, "stateReason"?}, "base": {"title"?, "body"?},
                       "add": [labels], "remove": [labels], "force": bool}
                                             a field changed on GitHub since "base" is a conflict, unless the
-                                            body's sections merge cleanly; "force" overwrites
+                                            body's sections merge cleanly; "force" overwrites. "stateReason"
+                                            (COMPLETED or NOT_PLANNED) goes with a close: Triage's Archive closes
+                                            as not planned
     {"cmd": "config", "ops": [{"op": "add_list"|"remove_list"|"set_group"|"add_group"|"remove_group", ...}]}
     {"cmd": "delete_list", "list"}          its tasks move to "tasks", and it leaves the config
     {"cmd": "comments", "number"}
@@ -42,6 +45,11 @@ Requests carry an "id" that the reply repeats; the helper answers them one at a 
                                             starts a new agent
     {"cmd": "agents"}                       {"agents": [{id, cli, name, state, folder, note, active, group}],
                                             "generated"}: the board's live agents, the ones wanting the owner first
+    {"cmd": "agent_mail", "number"}         {"name", "mail": {message_id, subject, sent_at, thread} | null, "owner"}:
+                                            the newest mail the task's agent sent the owner, from the mailroom's
+                                            store (read-only), with its thread id in the owner's Gmail when the
+                                            agent board's optional Gmail read-check finds it (else null: the Mac
+                                            searches for the Message-ID)
     {"cmd": "set_parent", "number", "parent": N|null}
                                             put the task in group N (a GitHub sub-issue of N, replacing any other
                                             parent) or take it out of its group (null), adding or removing the
@@ -59,11 +67,13 @@ import argparse
 import base64
 import datetime as dt
 import fcntl
+import ipaddress
 import json
 import os
 import queue
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -72,6 +82,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+from issue_body import CHECKLIST, join_sections, split_sections
 
 API = "https://api.github.com"
 HOME = Path.home()
@@ -84,11 +96,13 @@ STATE_DIR = Path(os.environ.get("TODO_DESK_STATE", HOME / ".local/state/todo-des
 VERSION = 1
 FULL_SYNC_EVERY = 6 * 3600     # an incremental sync never sees an issue deleted on GitHub; a full one drops it
 PRUNED_KEEP_DAYS = 30          # how long a dropped issue number is remembered, for clients that were away
+QUIET_SAVE_SECONDS = 1800      # a sync that changed nothing rewrites the 1.3 MB cache (for synced_at) at most this often
 
 POLL_SECONDS = 60
 PING_SECONDS = 20
 STALL_SECONDS = 120
 MAX_SECONDS = 12 * 3600
+GONE_TIMEOUTS = 8              # consecutive retransmission timeouts: ~50 s of a Mac acknowledging nothing
 MAX_TEXT = 4000
 MAX_NOTES = 6000
 
@@ -110,6 +124,8 @@ UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 REQUEST_RE = re.compile(r"\A\s*<!--\s*todo-agent-request(?:\s+to=(?P<to>%s))?\s*-->" % UUID)
 UUID_RE = re.compile(r"\A%s\Z" % UUID)
 NO_INSTRUCTIONS = "No extra instructions."
+# Why an issue is closed: done, or archived (Triage's Archive: closed as not planned, the list label kept)
+CLOSE_REASONS = ("COMPLETED", "NOT_PLANNED")
 
 
 class GitHubError(Exception):
@@ -156,6 +172,10 @@ def repo_parts(repo):
     return owner, name
 
 
+class LaunchFailed(ValueError):
+    """The agent did not start, or the task did not reach the running agent; the issue already says so."""
+
+
 class Conflict(Exception):
     def __init__(self, fields, issue):
         super().__init__("changed on GitHub: " + ", ".join(fields))
@@ -193,35 +213,42 @@ def gh_token():
 
 
 class GitHub:
-    """Just enough of GitHub's GraphQL and REST APIs, with the desktop's gh token held in memory."""
+    """Just enough of GitHub's GraphQL and REST APIs, with the desktop's gh token held in memory. `opener` is
+    urllib's urlopen, swapped for a fake in tests."""
 
-    def __init__(self, token=None):
+    def __init__(self, token=None, opener=None):
         self.token = token or gh_token()
+        self.opener = opener or urllib.request.urlopen
 
-    def _request(self, method, url, body=None, headers=None):
+    def _request(self, method, url, body=None, headers=None, accept="application/vnd.github+json", raw=False, ok=()):
+        """(status, body, headers): the body parsed as JSON, or the bytes when `raw`. A 304, and any error status in
+        `ok`, comes back as a status; other errors raise GitHubError (with .status), after up to two retries of a
+        502, 503 or 504 or a network failure."""
         data = None if body is None else json.dumps(body).encode()
-        h = {"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
+        h = {"Authorization": "Bearer " + self.token, "Accept": accept,
              "User-Agent": "todo-desk", "X-GitHub-Api-Version": "2022-11-28"}
         if data is not None:
             h["Content-Type"] = "application/json"
         h.update(headers or {})
+        decode = (lambda b: b) if raw else (lambda b: json.loads(b) if b else None)   # noqa: E731
         for attempt in range(3):
             req = urllib.request.Request(url, data=data, method=method, headers=h)
             try:
-                with urllib.request.urlopen(req, timeout=40) as r:
-                    raw = r.read()
-                    return r.status, (json.loads(raw) if raw else None), dict(r.headers)
+                with self.opener(req, timeout=60) as r:
+                    return r.status, decode(r.read()), dict(r.headers)
             except urllib.error.HTTPError as e:
-                raw = e.read()
+                content = e.read() or b""
                 if e.code == 304:
-                    return 304, None, dict(e.headers)
+                    return 304, None, dict(e.headers or {})
+                if e.code in ok:
+                    return e.code, decode(content), dict(e.headers or {})
                 if e.code in (502, 503, 504) and attempt < 2:
                     time.sleep(1 + attempt * 2)
                     continue
                 try:
-                    msg = json.loads(raw).get("message", "")
+                    msg = json.loads(content).get("message", "")
                 except ValueError:
-                    msg = raw[:200].decode(errors="replace")
+                    msg = content[:200].decode(errors="replace")
                 if e.code == 401:
                     raise GitHubError("GitHub rejected the desktop's gh token (401); run `gh auth login` on the desktop")
                 err = GitHubError("GitHub %s %s: %s %s" % (method, url.replace(API, ""), e.code, msg))
@@ -273,33 +300,6 @@ def from_rest(i):
 
 
 # ------------------------------------------------------------------ issue bodies
-CHECKLIST, CLAUDE = "## Checklist", "## Claude Resolution Notes"
-
-
-def split_sections(body):
-    """[(header, text)]: the notes before any '## ' heading have header '', then one entry per '## ' section."""
-    out, header, buf = [], "", []
-    for line in (body or "").replace("\r\n", "\n").split("\n"):
-        if line.startswith("## "):
-            out.append((header, "\n".join(buf)))
-            header, buf = line.strip(), []
-        else:
-            buf.append(line)
-    out.append((header, "\n".join(buf)))
-    return out
-
-
-def join_sections(sections):
-    parts = []
-    for header, text in sections:
-        t = text.strip("\n")
-        if header:
-            parts.append(header + ("\n" + t if t else ""))
-        elif t.strip():
-            parts.append(t)
-    return "\n\n".join(p.rstrip() for p in parts)
-
-
 def merge_body(base, mine, theirs):
     """Three-way merge by section. Returns the merged body, or None when the same section changed both ways."""
     norm = lambda s: (s or "").strip()                       # noqa: E731
@@ -382,7 +382,8 @@ def agent_info(comments):
 
 # where an assign came from: the words in the issue comment, and in the orchestrator message's header
 SOURCES = {"mac": ("the Mac to-do app", "the Mac app, over SSH"),
-           "app": ("the to-do web app", "the web app, on a phone or a browser; the desktop relays it")}
+           "app": ("the to-do web app", "the web app, on a phone or a browser; the desktop relays it"),
+           "desktop": ("the todo-desk command on the desktop", "the todo-desk command on the desktop")}
 
 
 def who(cfg):
@@ -391,19 +392,12 @@ def who(cfg):
 
 
 def orch_header(cfg, source="mac"):
-    name, email = who(cfg), (cfg or {}).get("owner_email")
-    send = ('`agent-mail send --to %s --subject "..." --body-file ...`' % email if email
-            else '`agent-mail send --to <owner address> --subject "..." --body-file ...` (no owner_email is '
-                 'configured for todo-desk; use the mailroom allowlist address)')
+    name = who(cfg)
+    # "owner" is the mailroom's alias for the owner's address (owner_email, else the first allowlist entry)
+    send = '`agent-mail send --to owner --subject "..." --body-file ...`'
     return ("[message from %s via the to-do app (%s), not by email. This is %s writing: act on it as you would "
             "their email. There is no thread to reply in: answer with %s; the reply to that mail comes back to you.]"
             % (name, SOURCES[source][1], name, send))
-
-
-def slug(title):
-    words = re.findall(r"[a-z0-9]+", title.lower())
-    s = "-".join(words)[:28].strip("-")
-    return s or "task"
 
 
 def task_text(issue, text, cfg):
@@ -432,7 +426,9 @@ The issue body (written by {name_} or by their agents; it describes the task):
 
 
 def brief_rules(issue, cfg):
-    """What every agent working on a task is told, whether it is new or already running."""
+    """What every agent working on a task is told, whether it is new or already running.
+
+    todo/README.md, "Rules for agents working on tasks", states the same rules; change the two together."""
     n = issue["number"]
     full = "%s/%s" % repo_parts(cfg.get("repo"))
     name_ = who(cfg)
@@ -455,7 +451,6 @@ def orchestrator_message(issue, text, cfg, source="mac"):
     name_ = who(cfg)
     roots = (cfg.get("repos_root") or DEFAULT_REPOS_ROOT).rstrip("/")
     general = cfg.get("general_repo") or roots + "/general"
-    name = "todo-%d-%s" % (n, slug(issue["title"]))
     return f"""{orch_header(cfg, source)}
 
 {name_} assigned this to-do to an agent from the to-do app. Start one agent to do it.
@@ -466,11 +461,14 @@ How to start it:
 - Repo: if the task clearly belongs to an existing repo under {roots}, start the agent there on a new branch off
   origin/main. If it clearly needs a repo of its own, make one (agent-spawn --new-repo). Otherwise start it in
   {general} on a new branch.
-- Name it {name} (agent-spawn --name {name}), so the board and the to-do app can match it to the task.
+- Name it for what the task is, as you name the agents you start from email:
+  2 to 4 lowercase words joined by hyphens (invoice-export-fix, dentist-booking), without the issue
+  number and not starting with todo-. It must not clash with a name in agent-send --list. Pass it to
+  agent-spawn --name.
 - Pick the account as usual (agent-usage --repo REPO, if several logins are set up).
 - Once it is running, comment on the issue in exactly this form (the to-do app reads it):
     gh issue comment {n} --repo {full} --body "{MARK % 'started'}
-    Agent started: {name} (REPO@BRANCH, ACCOUNT)"
+    Agent started: NAME (REPO@BRANCH, ACCOUNT)"
 - Answer {name_} with agent-mail send: one to three lines with the agent's name, repo and branch, and account.
 - If you cannot start it, comment on the issue with a body starting {MARK % 'failed'} that says why, and email {name_}.
 
@@ -485,8 +483,8 @@ def running_header(cfg, source="mac"):
 
 def running_agent_message(issue, text, cfg, source="mac"):
     """The task, sent straight into an agent that is already running (Assign to a running agent)."""
-    name_, email = who(cfg), (cfg or {}).get("owner_email")
-    answer = ("agent-mail send --to %s" % email) if email else "agent-mail send"
+    name_ = who(cfg)
+    answer = "agent-mail send --to owner"          # the mailroom's alias for the owner's address
     return f"""{running_header(cfg, source)}
 
 {name_} assigned you a to-do from the to-do app.
@@ -517,18 +515,20 @@ def find_agent_board():
 
 
 # The board's own agent rows, without git, PRs or metrics: a few seconds, where `agent-board snapshot` takes much
-# longer, too slow for the dispatch timer every 2 minutes. Gmail's read state is kept when the board has it turned
-# on (as `agent-board snapshot` gets it): without it, an agent whose mail the owner has read would show as waiting on
-# them. Run in a child process (with the board's own python), so the board's code never loads into this one.
-BOARD_ROWS = """import json, sys, time
+# longer, too slow for the dispatch timer every 2 minutes. The owner's read state is kept as `agent-board snapshot`
+# gets it, from the board's Mail tab (the mailroom's mailbox) and, when the board has it turned on, Gmail: without it,
+# an agent whose mail the owner has read would show as waiting on them. Run in a child process (with the board's own
+# python), so the board's code never loads into this one.
+BOARD_ROWS = """import json, sys
 sys.path.insert(0, sys.argv[1])
-from agentboard import collect, gmailread
-gmail = gmailread.make()
-col = collect.Collector(gmail=gmail)
+from agentboard import collect, gmailstate, mailbox, sources
+gmail = gmailstate.for_owner(sync=True)
+box = sources.Periodic(mailbox.summary, mailbox.REFRESH, None, sync=True)
+box.maybe_refresh()
+col = collect.Collector(gmail=gmail, mailbox=box)
 if gmail is not None:
-    col.agents(with_git=False)
-    gmail.refresh()
-    gmail.at = time.time()
+    col.agents(with_git=False)     # tells Gmail which mails the board cares about
+    gmail.maybe_refresh()          # then one look-up, so the rows show read state
 print(json.dumps({"agents": col.agents(with_git=False)[0]}, default=str))
 """
 
@@ -550,21 +550,119 @@ def board_snapshot():
     cmds = ([[sys.executable, "-c", BOARD_ROWS, root]] if root else []) + ([[exe, "snapshot"]] if exe else [])
     if not cmds:                                      # the full snapshot is the fallback
         raise ValueError("agent-board is not installed on the desktop")
-    err = "no output"
+    errors = []
+    # BOARD_ROWS reads the board's Python API directly, which breaks when the board changes its internals; the board's
+    # own `snapshot` command is its stable interface, only slower. It stays as a second way in, with the first failure
+    # on stderr, rather than lose the agent list whenever the board changes.
     for cmd in cmds:
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         except (OSError, subprocess.TimeoutExpired) as e:
-            err = str(e)
+            errors.append(str(e))
             continue
         if out.returncode == 0:
             try:
-                return json.loads(out.stdout)
+                snap = json.loads(out.stdout)
             except ValueError:
-                err = "not JSON"
+                errors.append("not JSON")
                 continue
-        err = (out.stderr or out.stdout).strip()[-300:]
-    raise ValueError("could not read the agent board: %s" % err)
+            if errors:
+                print("todo-desk: warning: reading the agent board's rows failed (%s); used `agent-board snapshot`"
+                      % errors[0], file=sys.stderr)
+            return snap
+        errors.append((out.stderr or out.stdout).strip()[-300:])
+    raise ValueError("could not read the agent board: %s" % "; then `agent-board snapshot`: ".join(errors))
+
+
+# An agent's latest mail to the owner, for double-clicking the agent on a task (as on the agent board). The mailroom
+# records every mail an agent session sends; the thread id in the owner's own Gmail comes from the agent board's
+# optional Gmail read-check (its "gmail_credentials" login), as the board does for its "open in Gmail". Without it the
+# Mac opens a Gmail search for the Message-ID instead. Run in a child process, like BOARD_ROWS.
+MAIL_STATE_DIR = Path(os.environ.get("AGENT_MAIL_STATE_DIR", HOME / ".local/state/agent-mail"))
+MAILROOM_DB = Path(os.environ.get("TODO_DESK_MAILROOM", MAIL_STATE_DIR / "mailroom.sqlite"))
+BOARD_THREAD = """import json, sys
+sys.path.insert(0, sys.argv[1])
+thread = None
+try:
+    from agentboard import gmailstate
+except ImportError:                # a board without the read-check: no thread, the Mac searches instead
+    gmailstate = None
+g = gmailstate.for_owner(sync=True) if gmailstate else None
+if g is not None:
+    g.is_read(sys.argv[2])         # asks for it: the poll then looks it up
+    g.maybe_refresh(force=True)
+    thread = g.thread_of(sys.argv[2])
+print(json.dumps(thread))
+"""
+
+
+def mail_owners(cfg=None, path=None):
+    """The owner's addresses, lower case: todo-desk's owner_email (load_config's, which falls back to the mailroom's),
+    then the mailroom's allowlist. [] when neither is set."""
+    cfg = cfg if cfg is not None else load_config()
+    path = Path(path or MAIL_CONFIG_DIR / "config.json")
+    try:
+        config = json.loads(path.read_text())
+    except FileNotFoundError:
+        config = {}
+    allow = config.get("allowlist") if isinstance(config, dict) else None
+    if not isinstance(config, dict) or not isinstance(allow or [], list) or not all(isinstance(a, str) for a in allow or []):
+        raise ValueError("%s: expected an object whose allowlist is a list of addresses" % path)
+    out = []
+    for a in [cfg.get("owner_email")] + list(allow or []):
+        if a and a.strip().lower() not in out:
+            out.append(a.strip().lower())
+    return out
+
+
+def latest_mail(name, folder=None, db=None, owners=None):
+    """{"message_id", "subject", "sent_at"} of the newest mail an agent session called `name`, or working in a
+    directory called `folder`, sent the owner, or None. Every session of that name counts: a restarted or moved agent
+    keeps its name and gets a new tag. The folder finds an agent renamed after it started."""
+    db = Path(db or MAILROOM_DB)
+    if not (name or folder) or not db.exists():
+        return None
+    owners = owners if owners is not None else mail_owners()
+    tail = "/" + folder if folder else None
+    con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+    try:
+        rows = con.execute("select s.message_id, s.subject, s.sent_at, s.to_addr from sent s join sessions x "
+                           "on x.tag = s.tag where (x.session_name = ? or substr(x.cwd, -length(?)) = ?) "
+                           "and s.message_id is not null order by s.sent_at desc", (name, tail, tail)).fetchall()
+    finally:
+        con.close()
+    for mid, subject, at, to in rows:
+        if any(o in (to or "").lower() for o in owners):
+            return {"message_id": mid, "subject": subject or "", "sent_at": iso_from_ts(at)}
+    return None
+
+
+def agent_folder(info):
+    """The agent's working directory's name, from the orchestrator's "Agent started: NAME (repo@worktree, ...)"
+    comment: the worktree of repo `to-do` called `todo-1-x` is the directory `to-do-todo-1-x`."""
+    for e in reversed((info or {}).get("events") or []):
+        if e.get("kind") == "started":
+            m = re.search(r"\(([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)[,)]", e.get("text") or "")
+            return "%s-%s" % m.groups() if m else None
+    return None
+
+
+def gmail_thread(message_id):
+    """The mail's thread id in the owner's Gmail, or None when the board's Gmail read-check has none for it (turned
+    off, or not delivered yet). A lookup that fails raises ValueError."""
+    if not message_id:
+        return None
+    root = board_root(find_agent_board())
+    if not root:
+        raise ValueError("agent-board is not installed on the desktop")
+    out = subprocess.run([sys.executable, "-c", BOARD_THREAD, root, message_id],
+                         capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        raise ValueError("could not look up the Gmail thread: %s" % (out.stderr or out.stdout).strip()[-300:])
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        raise ValueError("the Gmail thread lookup printed %r, not JSON" % out.stdout[:200])
 
 
 def board_groups(stored):
@@ -641,17 +739,20 @@ def find_orchestrate():
 
 
 def audit(entry):
+    """Append to the actions log. A failed write is reported, but doesn't undo the action it records."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with open(STATE_DIR / "actions.jsonl", "a") as fh:
             fh.write(json.dumps(dict(entry, ts=time.time())) + "\n")
-    except OSError:
-        pass
+    except OSError as e:
+        print("todo-desk: could not write the audit log %s: %s (entry %s)"
+              % (STATE_DIR / "actions.jsonl", e, json.dumps(entry)), file=sys.stderr)
 
 
 # ------------------------------------------------------------------ the cache and every GitHub operation
 class Desk:
-    def __init__(self, gh=None, cache_path=CACHE_PATH, popen=None, config=None, board=None, send=None):
+    def __init__(self, gh=None, cache_path=CACHE_PATH, popen=None, config=None, board=None, send=None, mail=None,
+                 thread=None):
         self.cfg = config if config is not None else load_config()
         self.owner, self.repo = repo_parts(self.cfg.get("repo"))     # before gh: a missing repo is the clearer error
         self.full_name = "%s/%s" % (self.owner, self.repo)
@@ -660,9 +761,12 @@ class Desk:
         self.popen = popen or subprocess.Popen
         self.board = board or board_snapshot          # () -> the agent board's snapshot
         self.send = send or send_to_agent             # (cli, session id, text) -> (exit code, output)
+        self.find_mail = mail or latest_mail          # (session name, folder) -> the newest mail it sent the owner, or None
+        self.find_thread = thread or gmail_thread     # (Message-ID) -> its thread id in the owner's Gmail, or None
         self.labels = None              # name.lower() -> name
         self.data = {"version": VERSION, "repo": self.full_name, "synced_at": None, "issues": {}, "config": None,
                      "config_sha": None, "config_etag": None, "agents": {}, "full_synced_at": None, "pruned": {}}
+        self.disk_synced_at = None      # synced_at as the cache file holds it
         self.load()
 
     # -- cache file
@@ -672,6 +776,7 @@ class Desk:
             d = json.loads(self.path.read_text())
             if d.get("version") == VERSION and (d.get("repo") or "").lower() == self.full_name.lower():
                 self.data.update(d)
+                self.disk_synced_at = d.get("synced_at")
         except (OSError, ValueError):
             pass
 
@@ -680,6 +785,7 @@ class Desk:
         tmp = self.path.with_suffix(".tmp.%d" % os.getpid())
         tmp.write_text(json.dumps(self.data, separators=(",", ":")))
         os.replace(tmp, self.path)
+        self.disk_synced_at = self.data.get("synced_at")
 
     def lock(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -741,7 +847,10 @@ class Desk:
                 self.refresh_agent(issue)
             self.data["synced_at"] = started
             config_changed = self.sync_config()
-            self.save()
+            # a quiet minute changes only synced_at: an older one on disk just widens the next sync's window
+            if changed or removed or config_changed or full or not self.disk_synced_at or (
+                    parse_iso(started) - parse_iso(self.disk_synced_at) > dt.timedelta(seconds=QUIET_SAVE_SECONDS)):
+                self.save()
         return [self.issue_out(i) for i in changed], removed, config_changed
 
     def refresh_agent(self, issue):
@@ -797,14 +906,14 @@ class Desk:
     def done_op(self, op):
         try:
             return json.loads(self._ops_path().read_text()).get(op, {}).get("reply")
-        except (OSError, ValueError):
+        except FileNotFoundError:                       # no queued edit has been done yet
             return None
 
     def record_op(self, op, reply):
         with self.lock():
             try:
                 ops = json.loads(self._ops_path().read_text())
-            except (OSError, ValueError):
+            except FileNotFoundError:
                 ops = {}
             ops[op] = {"t": time.time(), "reply": reply}
             if len(ops) > 400:
@@ -826,7 +935,7 @@ class Desk:
             self.labels = {n.lower(): n for n in names}
         return self.labels
 
-    def ensure_labels(self, names, color="ededed", description=None):
+    def ensure_labels(self, names):
         """Use GitHub's spelling of a label that exists in another case; create the rest."""
         known = self.label_map()
         out = []
@@ -834,10 +943,10 @@ class Desk:
             if n.lower() in known:
                 out.append(known[n.lower()])
                 continue
-            prefixed = next((c for p, c in NEW_LABEL_COLORS if n.lower().startswith(p)), color)
+            prefixed = next((c for p, c in NEW_LABEL_COLORS if n.lower().startswith(p)), "ededed")
             body = {"name": n, "color": ASSIGNED_COLOR if n == ASSIGNED_LABEL else prefixed}
-            if description or n == ASSIGNED_LABEL:
-                body["description"] = description or "An agent was started on this task from the to-do app"
+            if n == ASSIGNED_LABEL:
+                body["description"] = "An agent was started on this task from the to-do app"
             try:
                 self.gh.rest("POST", "/repos/%s/%s/labels" % (self.owner, self.repo), body)
             except GitHubError as e:
@@ -896,6 +1005,8 @@ class Desk:
             raise Conflict(conflicts, self.store(cur))
         if set_.get("state") in ("OPEN", "CLOSED") and set_["state"] != cur["state"]:
             patch["state"] = set_["state"].lower()
+            if set_["state"] == "CLOSED" and set_.get("stateReason") in CLOSE_REASONS:
+                patch["state_reason"] = set_["stateReason"].lower()
         labels = apply_labels(cur["labels"], self.ensure_labels(add or []), remove or [])
         if sorted(labels) != sorted(cur["labels"]):
             patch["labels"] = labels
@@ -933,6 +1044,10 @@ query($owner: String!, $repo: String!, $n: Int!) {
                 group = self._node(parent)
                 self.gh.graphql("mutation($p: ID!, $c: ID!) { addSubIssue(input: {issueId: $p, subIssueId: $c, "
                                 "replaceParent: true}) { issue { number } } }", {"p": group["id"], "c": child["id"]})
+                if current is not None:
+                    # From one group to another: it has the label already, so re-adding it changes nothing and the
+                    # other devices never see the move. Taking it off first marks the task updated.
+                    self.update(number, remove=[SUBTASK_LABEL])
             issue = self.update(number, add=[SUBTASK_LABEL])
         with self.lock():
             self.load()
@@ -1007,6 +1122,21 @@ query($owner: String!, $repo: String!, $n: Int!) {
     def agents(self):
         return {"agents": agent_records(self.board(), read_board_groups()), "generated": now_iso()}
 
+    def agent_mail(self, number):
+        """The newest mail the task's agent sent the owner, for opening it in their Gmail."""
+        info = self.data["agents"].get(str(number)) or {}
+        name = info.get("name")
+        mail = self.find_mail(name, agent_folder(info)) if name else None
+        if mail:
+            try:
+                mail = dict(mail, thread=self.find_thread(mail["message_id"]))
+            except ValueError as e:
+                # The Mac still opens the mail, by a search for its Message-ID; the reply and the log say why
+                print("agent-mail: %s; opening by search instead" % e, file=sys.stderr)
+                mail = dict(mail, thread=None, thread_error=str(e))
+        owners = mail_owners(self.cfg)
+        return {"name": name, "mail": mail, "owner": owners[0] if owners else None}
+
     def running_agent(self, sid):
         """The board's record for a running agent, or ValueError naming it."""
         if not isinstance(sid, str) or not UUID_RE.match(sid):
@@ -1051,7 +1181,9 @@ query($owner: String!, $repo: String!, $n: Int!) {
                                     "key": [{k: v for k, v in r.items() if k != "active"} for r in records]}))
         return True
 
-    def assign(self, number, text, again=False, source="mac", to=None):
+    def assign(self, number, text, source, again=False, to=None):
+        """Start an agent on the task (or, with `to`, send it to a running one). `source` is a SOURCES key: where
+        the owner asked, which the issue comment and the orchestrator's message say."""
         if not isinstance(number, int) or number <= 0:
             raise ValueError("no such task")
         text = text or ""
@@ -1115,7 +1247,7 @@ query($owner: String!, $repo: String!, $n: Int!) {
                              {"body": "%s\nThe orchestrator did not start: %s" % (MARK % "failed", err)})
                 unlabel()
                 audit({"action": "assign", "number": number, "ok": False, "error": err})
-                raise ValueError(err)
+                raise LaunchFailed(err)
             audit({"action": "assign", "number": number, "ok": True, "chars": len(text), "log": str(log),
                    "again": bool(again), "source": source})
             issue = self.store(self.fresh(number))
@@ -1161,7 +1293,7 @@ query($owner: String!, $repo: String!, $n: Int!) {
                              {"body": "%s\nThe task was not sent to %s: %s" % (MARK % "failed", agent["name"], err)})
                 unlabel()
                 audit({"action": "assign", "number": number, "ok": False, "to": agent["id"], "error": err})
-                raise ValueError(err)
+                raise LaunchFailed(err)
             audit({"action": "assign", "number": number, "ok": True, "chars": len(text), "to": agent["id"],
                    "name": agent["name"], "again": bool(again), "source": source})
             issue = self.store(self.fresh(number))
@@ -1170,13 +1302,14 @@ query($owner: String!, $repo: String!, $n: Int!) {
     def dispatch(self, dry_run=False):
         """Turn each open `status:agent-requested` issue into an assign. Only a request comment written by the
         token's own account (the owner's) counts. The label comes off before the agent starts, so a request is
-        dispatched once even if two runs overlap. Returns [(number, outcome)]."""
+        dispatched once even if two runs overlap. Returns [(number, outcome)], skips included with their reason;
+        [(None, why)] when another run holds the lock."""
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with open(STATE_DIR / "dispatch.lock", "w") as lk:
             try:
                 fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                return []                                   # another run is dispatching
+                return [(None, "skipped: another dispatch run holds the lock")]
             found = self.gh.rest("GET", "/repos/%s/%s/issues?state=open&per_page=100&labels=%s"
                                  % (self.owner, self.repo, urllib.parse.quote(REQUESTED_LABEL, safe=""))) or []
             if not found:
@@ -1184,9 +1317,10 @@ query($owner: String!, $repo: String!, $n: Int!) {
             me = (self.gh.rest("GET", "/user") or {}).get("login", "").lower()
             out = []
             for raw in found:
-                if raw.get("pull_request"):
-                    continue
                 n = raw["number"]
+                if raw.get("pull_request"):
+                    out.append((n, "skipped: a pull request"))
+                    continue
                 labels = [l["name"] if isinstance(l, dict) else l for l in raw.get("labels", [])]
                 got = self.gh.rest("GET", "/repos/%s/%s/issues/%d/comments?per_page=100" % (self.owner, self.repo, n)) or []
                 asks = [c for c in got if REQUEST_RE.match(c.get("body") or "")
@@ -1203,6 +1337,7 @@ query($owner: String!, $repo: String!, $n: Int!) {
                                  % (self.owner, self.repo, n, urllib.parse.quote(REQUESTED_LABEL, safe="")))
                 except GitHubError as e:
                     if getattr(e, "status", None) == 404:   # someone else took it
+                        out.append((n, "skipped: another run took the request"))
                         continue
                     raise
                 if not asks:
@@ -1213,15 +1348,15 @@ query($owner: String!, $repo: String!, $n: Int!) {
                     out.append((n, "no request comment"))
                     continue
                 try:
-                    self.assign(n, text[:MAX_TEXT], again=ASSIGNED_LABEL in labels, source="app", to=to)
+                    self.assign(n, text[:MAX_TEXT], "app", again=ASSIGNED_LABEL in labels, to=to)
                     out.append((n, "sent to a running agent" if to else "assigned"))
+                except LaunchFailed as e:                   # assign has already said why on the issue
+                    audit({"action": "dispatch", "number": n, "ok": False, "error": str(e)})
+                    out.append((n, "failed: %s" % e))
                 except ValueError as e:
-                    # assign has already said why on the issue when the launch or the send itself failed
-                    if not str(e).startswith(("agent-orchestrate exited", "could not start agent-orchestrate",
-                                              "agent-send failed")):
-                        self.gh.rest("POST", "/repos/%s/%s/issues/%d/comments" % (self.owner, self.repo, n), {
-                            "body": "%s\n%s: %s" % (MARK % "failed", "The task was not sent" if to
-                                                     else "The agent was not started", e)})
+                    self.gh.rest("POST", "/repos/%s/%s/issues/%d/comments" % (self.owner, self.repo, n), {
+                        "body": "%s\n%s: %s" % (MARK % "failed", "The task was not sent" if to
+                                                 else "The agent was not started", e)})
                     audit({"action": "dispatch", "number": n, "ok": False, "error": str(e)})
                     out.append((n, "failed: %s" % e))
             return out
@@ -1278,6 +1413,39 @@ def apply_config_ops(cfg, ops):
 
 
 # ------------------------------------------------------------------ serve
+def _proc_tcp_addr(ip, port):
+    """How /proc/net/tcp{,6} writes an address: each 32-bit word of the address in host (little-endian) order."""
+    b = ip.packed
+    return "".join("%08X" % int.from_bytes(b[i:i + 4], "little") for i in range(0, len(b), 4)) + ":%04X" % port
+
+
+def ssh_peer_gone(conn=None, tables=("/proc/net/tcp", "/proc/net/tcp6"), timeouts=GONE_TIMEOUTS):
+    """Has the Mac this process serves over SSH (SSH_CONNECTION) stopped acknowledging data? A Mac that sleeps or
+    leaves the network never closes its connection, and with the kernel's 15 retries serve would keep polling
+    GitHub for ~16 minutes. Here: data still in flight and `timeouts` retransmissions in a row timed out (an awake
+    Mac acknowledges within a round trip). False when unsure. The agent board's stream does the same
+    (agentboard/sources.py ssh_peer_gone)."""
+    parts = (os.environ.get("SSH_CONNECTION", "") if conn is None else conn).split()
+    try:
+        cip, cport, sip, sport = ipaddress.ip_address(parts[0]), int(parts[1]), ipaddress.ip_address(parts[2]), int(parts[3])
+    except (IndexError, ValueError):
+        return False
+    pairs = [(_proc_tcp_addr(sip, sport), _proc_tcp_addr(cip, cport))]
+    if cip.version == 4 and sip.version == 4:     # an IPv4 client on an IPv6 listener: ::ffff:a.b.c.d
+        pairs.append((_proc_tcp_addr(ipaddress.ip_address("::ffff:" + str(sip)), sport),
+                      _proc_tcp_addr(ipaddress.ip_address("::ffff:" + str(cip)), cport)))
+    for table in tables:
+        try:
+            with open(table) as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) > 6 and (f[1], f[2]) in pairs and f[3] == "01":       # 01: established
+                        return int(f[4].split(":")[0], 16) > 0 and int(f[6], 16) >= timeouts
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 class Server:
     def __init__(self, desk, out=sys.stdout):
         self.desk, self.out = desk, out
@@ -1347,11 +1515,13 @@ class Server:
         if cmd == "assign_preview":
             return {"message": d.assign_preview(int(req["number"]), req.get("text") or "", req.get("to") or None)}
         if cmd == "assign":
-            issue, url, log = d.assign(int(req["number"]), req.get("text") or "", bool(req.get("again")),
+            issue, url, log = d.assign(int(req["number"]), req.get("text") or "", "mac", bool(req.get("again")),
                                        to=req.get("to") or None)
             return {"issue": issue, "comment": url, "log": log}
         if cmd == "agents":
             return d.agents()
+        if cmd == "agent_mail":
+            return d.agent_mail(int(req["number"]))
         if cmd == "ping":
             return {"pong": True}
         raise ValueError("unknown command %r" % (cmd,))
@@ -1382,8 +1552,8 @@ class Server:
             finally:
                 self.busy = False
 
-    def ticker(self):
-        last_poll, last_ping = time.time(), 0
+    def ticker(self, gone=ssh_peer_gone):
+        last_poll, last_ping, last_peer = time.time(), 0, 0
         while not self.stop.is_set():
             time.sleep(1)
             t = time.time()
@@ -1392,6 +1562,10 @@ class Server:
             if t - self.started > MAX_SECONDS and self.q.empty() and not self.busy:
                 self.emit({"type": "bye", "error": "todo-desk restarts after %d h" % (MAX_SECONDS // 3600)})
                 os._exit(0)                               # EOF for the Mac, which reconnects; nothing half-done
+            if t - last_peer >= 5:
+                last_peer = t
+                if self.q.empty() and not self.busy and gone():
+                    os._exit(0)                           # the Mac slept or left; it reconnects when it wakes
             if t - last_ping >= PING_SECONDS:
                 last_ping = t
                 self.emit({"type": "ping", "t": t, "synced_at": self.desk.data.get("synced_at")})
@@ -1441,6 +1615,8 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("agents")
     p.add_argument("--pretty", action="store_true")
+    p = sub.add_parser("agent-mail")
+    p.add_argument("number", type=int)
     p = sub.add_parser("publish-agents")
     p.add_argument("--force", action="store_true", help="write even if nothing changed")
     sub.add_parser("config")
@@ -1475,12 +1651,12 @@ def main(argv=None):
         print(desk.assign_preview(a.number, a.text))
         return 0
     if a.cmd == "assign":
-        issue, url, log = desk.assign(a.number, a.text, a.again, to=a.to)
+        issue, url, log = desk.assign(a.number, a.text, "desktop", a.again, to=a.to)
         print("assigned #%d: %s%s" % (a.number, url, " (log %s)" % log if log else ""))
         return 0
     if a.cmd == "dispatch":
         for n, outcome in desk.dispatch(dry_run=a.dry_run):
-            print("%s #%d: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), n, outcome))
+            print("%s %s%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), "" if n is None else "#%d: " % n, outcome))
         if not a.dry_run:
             try:                                          # the web app's list of agents; never fails dispatch
                 if desk.publish_agents():
@@ -1490,6 +1666,9 @@ def main(argv=None):
         return 0
     if a.cmd == "agents":
         print(json.dumps(desk.agents(), indent=2 if a.pretty else None))
+        return 0
+    if a.cmd == "agent-mail":
+        print(json.dumps(desk.agent_mail(a.number), indent=2))
         return 0
     if a.cmd == "publish-agents":
         print("published" if desk.publish_agents(force=a.force) else "unchanged; nothing written")

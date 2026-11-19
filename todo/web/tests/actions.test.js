@@ -8,7 +8,7 @@ import { webcrypto } from 'node:crypto';
 
 import { setState, getIssueByNumber } from '../js/state.js';
 import * as api from '../js/api.js';
-import { archiveTask, saveRating, setFocus } from '../js/actions.js';
+import { archiveTask, saveRating, setFocus, toggleComplete, toggleWithUndo } from '../js/actions.js';
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
@@ -115,4 +115,61 @@ test('focus succeeds even though the cache write fails', async () => {
   const result = await setFocus(7, true);
   assert.deepEqual(result.labels, ['list:tasks', 'focus:week']);
   assert.deepEqual(getIssueByNumber(7).labels, ['list:tasks', 'focus:week']);
+});
+
+test('toggleComplete completes an open task and reopens a closed one', async () => {
+  calls.length = 0;
+  setState({ issues: [issue(['list:tasks'])] });
+  respond = (query) => {
+    if (query.includes('closeIssue')) return { closeIssue: { issue: rawIssue(['list:tasks'], { state: 'CLOSED', stateReason: 'COMPLETED' }) } };
+    if (query.includes('updateIssue')) return { updateIssue: { issue: rawIssue(['list:tasks'], { state: 'OPEN', stateReason: 'REOPENED' }) } };
+    return { repository: { id: 'R_1', issue: { id: 'I_7' }, labels: labelMap.repository.labels } };
+  };
+  const pending = toggleComplete(7);
+  assert.equal(getIssueByNumber(7).state, 'CLOSED'); // shown at once
+  await pending;
+  const close = calls.find(c => c.query.includes('closeIssue'));
+  assert.equal(close.variables.input.stateReason, 'COMPLETED');
+  await toggleComplete(7);
+  assert.equal(calls.find(c => c.query.includes('updateIssue')).variables.input.state, 'OPEN');
+  assert.equal(getIssueByNumber(7).state, 'OPEN');
+});
+
+test('a failed toggleComplete puts the task back', async () => {
+  setState({ issues: [issue(['list:tasks'])] });
+  respond = (query) => {
+    if (query.includes('issue(number: 7) { id }')) return { repository: { issue: { id: 'I_7' } } };
+    return new Error('boom');
+  };
+  await assert.rejects(toggleComplete(7), /boom/);
+  assert.equal(getIssueByNumber(7).state, 'OPEN');
+});
+
+test('toggleWithUndo: Undo puts back the state before the click, after the change reaches GitHub', async () => {
+  calls.length = 0;
+  setState({ issues: [issue(['list:tasks'])] });
+  respond = (query) => {
+    if (query.includes('closeIssue')) return { closeIssue: { issue: rawIssue(['list:tasks'], { state: 'CLOSED', stateReason: 'COMPLETED' }) } };
+    if (query.includes('updateIssue')) return { updateIssue: { issue: rawIssue(['list:tasks'], { state: 'OPEN', stateReason: 'REOPENED' }) } };
+    return { repository: { id: 'R_1', issue: { id: 'I_7' }, labels: labelMap.repository.labels } };
+  };
+  const { wasOpen, pending, undo } = toggleWithUndo(7);
+  assert.equal(wasOpen, true);
+  await undo();   // waits for the close, then reopens
+  await pending;
+  const order = calls.filter(c => /closeIssue|updateIssue/.test(c.query)).map(c => c.query.includes('closeIssue') ? 'close' : 'reopen');
+  assert.deepEqual(order, ['close', 'reopen']);
+  assert.equal(getIssueByNumber(7).state, 'OPEN');
+});
+
+test('toggleWithUndo: after a failed change, Undo does nothing', async () => {
+  calls.length = 0;
+  setState({ issues: [issue(['list:tasks'])] });
+  respond = (query) => query.includes('closeIssue') ? new Error('down')
+    : { repository: { id: 'R_1', issue: { id: 'I_7' }, labels: labelMap.repository.labels } };
+  const { pending, undo } = toggleWithUndo(7);
+  await assert.rejects(pending, /down/);
+  await undo();
+  assert.equal(calls.filter(c => c.query.includes('updateIssue')).length, 0);
+  assert.equal(getIssueByNumber(7).state, 'OPEN');
 });

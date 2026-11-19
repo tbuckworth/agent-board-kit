@@ -1,34 +1,60 @@
 #!/usr/bin/env python3
-"""agent-board: the desktop side of the Mac agent board. Read-only except `act`.
+"""agent-board: the desktop side of the Mac agent board.
 
     agent-board snapshot [--pretty]     one JSON snapshot of every agent, mail, metrics, usage
     agent-board stream [--interval 3]   JSON lines: a snapshot when anything changes (and every 30 s),
-                                        metrics every 5 s; reads {"cmd": ...} lines on stdin
+                                        metrics every 5 s; reads {"cmd": ...} lines on stdin, including
+                                        {"cmd":"act","rid":N,"req":{...}}: `act` run here, answered with
+                                        {"type":"act","rid":N,"out":...,"err":...} (no new SSH per click)
     agent-board act                     one validated action, JSON request on stdin (see agentboard/actions.py)
+    agent-board receive                 one file too big for a Mail-tab reply, on stdin after a JSON line {name, size};
+                                        prints {"ok", "path"} (agentboard/mailbox.py, receive)
+    agent-board sent [-n 20] [--json]   the messages the owner sent from the board, in full, newest last
+    agent-board done REF... [-m NOTE]   for an agent: mark board messages dealt with (their last line gives the REF)
+    agent-board time [--json]           recompute where the owner's time went, for the Time page (time.json)
 
 The Mac app keeps `ssh desktop agent-board stream` open; the process exits when the connection
-drops (EOF on stdin, a broken pipe, or a write stalled for 2 minutes) and after --max-seconds.
+drops (EOF on stdin, a broken pipe, a write stalled for 2 minutes, or a Mac that has acknowledged
+nothing for ~50 s because it slept or left the network) and after --max-seconds.
+
+What each writes: snapshot and stream can update the Codex credits state (codex-credits.json) and add a usage
+reading for the usage breakdown (usage-samples.jsonl, at most one per 30 minutes), and stream also ticks off, in
+sent-marks.jsonl, the done messages whose emails the owner has seen. act does what its action does and records it
+(actions.jsonl, and the owner's text in sent.jsonl). receive writes one file under mail-files/. done appends to
+sent-marks.jsonl. time writes time.json, its caches and time.log. sent only reads.
+
+Optional parts follow the board config (agentboard/config.py): the Gmail read-check and the Mail tab's Sync with
+Gmail need gmail_credentials, the meeting alerts google_token; without them those parts are off and silent.
 """
-import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
+import queue
 import select
 import signal
+import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentboard import actions, collect, gmailread, restart, sources  # noqa: E402
+from agentboard import (actions, allowance, chats, cli, collect, config, credits, gmailstate, mailbox,  # noqa: E402
+                        meetings, restart, sent, sources, subchats, timeuse)
 
 STALL_SECONDS = 120
+# characters of one action's JSON that `act` reads: the largest mail reply (the Mac's ScreenTime.partBytes keeps each
+# screen-time upload well under it)
+MAX_REQUEST = mailbox.MAX_REPLY_REQUEST
+ACT_SECONDS = 900          # one action run from the stream; the slowest (worktree cleanup) fetches for up to 90 s
+ACT_WORKERS = 4
 
 
-def make_gmail():
+def make_gmail(sync):
     """The owner's read/unread state for the agents' mail: optional, on only when the board config names the owner's
     Gmail OAuth file (gmail_credentials) and it exists. Else None, and the board shows "read-check off"."""
-    return gmailread.make()
+    return gmailstate.for_owner(sync=sync)
 
 
 def emit(obj):
@@ -43,27 +69,35 @@ def fingerprint(snap):
             "mail": snap["mail"], "usage": snap.get("usage"), "timeline": snap["timeline"][:5],
             "gmail": {k: v for k, v in (snap.get("gmail") or {}).items() if k != "checked_at"},
             "worktrees": snap.get("worktrees"), "desktop": {k: v for k, v in (snap.get("desktop") or {}).items() if k != "checked"},
-            "restart": {k: v for k, v in (snap.get("restart") or {}).items() if k != "updated"}}
+            "restart": {k: v for k, v in (snap.get("restart") or {}).items() if k != "updated"}, "sent": snap.get("sent"),
+            "meetings": snap.get("meetings"), "problems": snap.get("problems")}
     return hashlib.sha1(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def annotate_usage(accounts):
+    """The board's additions to each usage reading: each window's key (sources.mark_window_keys), the Codex credits
+    bar (credits.annotate) and the Claude logins signed in to the same account as another
+    (sources.mark_shared_logins); then the reading is kept for the usage breakdown's fit (allowance.sample, at most
+    one per 30 minutes)."""
+    sources.mark_window_keys(accounts)
+    credits.annotate(accounts)
+    sources.mark_shared_logins(accounts)
+    allowance.sample(accounts)
 
 
 def cmd_snapshot(a):
     metrics = sources.Metrics(gpu=False)
-    usage = sources.Usage()
-    usage.refresh()
-    gmail = make_gmail()
-    wts = collect.WorktreeScan()
-    wts.maybe_refresh(sync=True)
-    desktop = collect.DesktopInfo()
-    desktop.refresh()
-    desktop.at = time.time()
-    col = collect.Collector(metrics=metrics, usage=usage, git=sources.GitCache(budget=1000),
-                            prs=sources.PullRequests(sync=True), gmail=gmail, worktrees=wts,
-                            desktop=desktop, restored=restart.restored_activity)
+    gmail = make_gmail(sync=True)         # every cache reads in this thread: a one-shot snapshot waits for each
+    col = collect.Collector(metrics=metrics, usage=sources.Usage(annotate=annotate_usage, sync=True),
+                            git=sources.GitCache(budget=1000), prs=sources.PullRequests(sync=True), gmail=gmail,
+                            worktrees=collect.worktree_scan(sync=True), desktop=collect.desktop_info(sync=True),
+                            restored=restart.restored_activity, sent=sent, restart=restart,
+                            chats=sources.Periodic(subchats.summary, chats.REFRESH, None, sync=True),
+                            meetings=meetings.make(sync=True),
+                            mailbox=sources.Periodic(mailbox.summary, mailbox.REFRESH, None, sync=True))
     if gmail is not None:
         col.agents(with_git=False)        # tells Gmail which mails the board cares about
-        gmail.refresh()                   # then one synchronous look-up, so this snapshot shows read state
-        gmail.at = time.time()            # and snapshot() does not start a second, background one
+        gmail.maybe_refresh()             # then one look-up, so this snapshot shows read state
     snap = col.snapshot()
     metrics.cpu()
     time.sleep(0.2)
@@ -72,22 +106,81 @@ def cmd_snapshot(a):
     return 0
 
 
+class Inbox:
+    """The Mac's lines on stdin, read straight from the descriptor: a buffered readline after select can leave a
+    second line of the same packet unread until more data comes."""
+
+    MAX_LINE = 1 << 20                      # the Mac's Actions.streamLine: a longer request goes over SSH of its own
+
+    def __init__(self, fd=0):
+        self.fd, self.buf, self.skipping = fd, b"", False
+
+    def read(self):
+        """(complete lines now available, EOF?). A line over MAX_LINE is dropped whole, up to its newline;
+        the lines around it are kept."""
+        data = os.read(self.fd, 65536)
+        *lines, rest = (self.buf + data).split(b"\n")
+        if self.skipping and lines:              # the first piece ends the runaway line
+            lines, self.skipping = lines[1:], False
+        self.buf = rest
+        if len(self.buf) > self.MAX_LINE:
+            self.buf, self.skipping = b"", True
+        return [ln for ln in lines if ln.strip()], not data
+
+
+def run_act(req, timeout=ACT_SECONDS):
+    """One action exactly as `ssh desktop agent-board act` runs it, in its own process: (stdout, stderr). The JSON
+    is compact and keeps non-ASCII text as it is, so the request is no longer than the Mac's compact JSON made it
+    (escaped or spaced out, it could pass MAX_REQUEST)."""
+    try:
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "act"],
+                           input=json.dumps(req, ensure_ascii=False, separators=(",", ":")),
+                           capture_output=True, text=True, timeout=timeout)
+        return r.stdout, r.stderr[-4000:]
+    except subprocess.TimeoutExpired:
+        return "", "the action took over %d s and was stopped" % timeout
+    except OSError as e:
+        return "", "could not run the action: %s" % e
+
+
 def cmd_stream(a):
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     metrics = sources.Metrics(gpu=True)
-    usage = sources.Usage(interval=a.usage_interval)
-    col = collect.Collector(metrics=metrics, usage=usage, prs=sources.PullRequests(), gmail=make_gmail(),
-                            worktrees=collect.WorktreeScan(), desktop=collect.DesktopInfo(),
-                            restored=restart.restored_activity)
+    usage = sources.Usage(interval=a.usage_interval, annotate=annotate_usage)
+    col = collect.Collector(metrics=metrics, usage=usage, prs=sources.PullRequests(), gmail=make_gmail(sync=False),
+                            worktrees=collect.worktree_scan(sync=False), desktop=collect.desktop_info(sync=False),
+                            restored=restart.restored_activity, sent=sent, restart=restart,
+                            chats=sources.Periodic(subchats.summary, chats.REFRESH, None, sync=False),
+                            meetings=meetings.make(sync=False),
+                            mailbox=sources.Periodic(mailbox.summary, mailbox.REFRESH, None, sync=False))
     started = time.time()
     last_fp, last_snap, last_metrics = None, 0, 0
-    emit({"type": "hello", "v": 1, "host": os.uname().nodename, "pid": os.getpid(), "interval": a.interval})
+    emit({"type": "hello", "host": os.uname().nodename, "pid": os.getpid(), "interval": a.interval, "acts": 1})
     force = False
+    inbox = Inbox(sys.stdin.fileno())
+    answers = queue.Queue()                        # finished actions, emitted by this thread only (emit uses SIGALRM)
+    wake_r, wake_w = os.pipe()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=ACT_WORKERS)
+
+    def act(rid, req):
+        try:
+            out, err = run_act(req)
+        except Exception as e:                     # always answer: the Mac waits on this rid
+            out, err = "", "the action could not run: %s: %s" % (type(e).__name__, e)
+        answers.put({"type": "act", "rid": rid, "out": out, "err": err})
+        os.write(wake_w, b"x")
+
     try:
         while time.time() - started < a.max_seconds:
             now = time.time()
+            if sources.ssh_peer_gone():
+                return 0                           # the Mac slept or left: it reconnects when it wakes
             try:
                 snap = col.snapshot(now)
+                try:
+                    col.tick_seen(now)             # what the owner has seen is ticked off here, not in the snapshot
+                except Exception as e:             # the stream stays up; the snapshot lists the failure
+                    snap["problems"].append({"source": "sent ticks", "error": sources.error_text(e)})
                 fp = fingerprint(snap)
                 if force or fp != last_fp or now - last_snap >= 30:
                     snap["metrics"] = metrics.read(now)
@@ -98,53 +191,126 @@ def cmd_stream(a):
                     last_metrics = now
             except Exception as e:   # report and keep going; the app shows the error line
                 emit({"type": "error", "error": "%s: %s" % (type(e).__name__, e)})
-            ready, _, _ = select.select([sys.stdin], [], [], a.interval)
-            if ready:
-                line = sys.stdin.readline()
-                if not line:
-                    return 0                       # the Mac closed the connection
-                try:
-                    msg = json.loads(line)
-                except ValueError:
+            deadline, now_please = time.time() + a.interval, False
+            while not now_please:                  # wait out the interval, answering the Mac as it asks
+                ready, _, _ = select.select([inbox.fd, wake_r], [], [], max(0.0, deadline - time.time()))
+                if not ready:
+                    break
+                if wake_r in ready:
+                    os.read(wake_r, 512)
+                    while not answers.empty():
+                        emit(answers.get())
+                if inbox.fd not in ready:
                     continue
-                if msg.get("cmd") == "refresh_usage":
-                    usage.maybe_refresh(force=True)
-                    force = True
-                elif msg.get("cmd") == "refresh":            # ⌘R: everything fresh, usage from its own cache
-                    col.refresh()
-                    usage.kick()
-                    force = True
+                lines, eof = inbox.read()
+                for line in lines:
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("cmd") == "act" and isinstance(msg.get("rid"), int):
+                        pool.submit(act, msg["rid"], msg.get("req"))
+                    elif msg.get("cmd") == "refresh_usage":
+                        usage.maybe_refresh(force=True)
+                        force = now_please = True
+                    elif msg.get("cmd") == "refresh":        # ⌘R: everything fresh, usage from its own cache
+                        col.refresh()
+                        force = now_please = True
+                if eof:
+                    return 0                       # the Mac closed the connection
     finally:
+        pool.shutdown(wait=True, cancel_futures=True)      # an action already running finishes, as over SSH
         metrics.close()
     return 0
 
 
 def cmd_act(a):
     try:
-        req = json.loads(sys.stdin.read(65536) or "null")
+        req = json.loads(sys.stdin.read(MAX_REQUEST) or "null")
     except ValueError:
         req = None
-    col = collect.Collector()
-    rows, _, _ = col.agents(with_git=False)
-    if isinstance(req, dict) and req.get("action") in ("restart_plan", "restart_run", "restart_cancel"):
-        res = actions.restart_action(req)
-    elif isinstance(req, dict) and req.get("action") == "orchestrate":
-        res = actions.orchestrate(req)
-    elif isinstance(req, dict) and req.get("action") == "wt_landed_check":
-        res = actions.landed_check(rows, sources.list_worktrees())
-    elif isinstance(req, dict) and req.get("action") == "wt_landed_cleanup":
-        res = actions.landed_cleanup(req, rows, sources.list_worktrees())
-    elif isinstance(req, dict) and str(req.get("action", "")).startswith("wt_"):
-        res = actions.perform_wt(req, rows, sources.list_worktrees())
-    else:
-        res = actions.perform(req, rows)
+    res = actions.dispatch(req, agents=lambda: collect.Collector().agents(with_git=False)[0],
+                           worktrees=sources.list_worktrees)
     print(json.dumps(res))
     return 0 if res.get("ok") else 1
 
 
+def cmd_receive(a):
+    try:
+        res = dict(mailbox.receive(sys.stdin.buffer, time.time()), ok=True)
+    except (ValueError, OSError) as e:
+        res = {"ok": False, "error": str(e)}
+    print(json.dumps(res))
+    return 0 if res["ok"] else 1
+
+
+def cmd_sent(a):
+    cli.out(sent.messages(max(a.n, 0)), a.json, show_sent)
+    return 0
+
+
+def show_sent(rows):
+    if not rows:
+        print("nothing sent from the board yet (%s)" % sent.PATH)
+    hhmm = lambda t: time.strftime("%d %b %H:%M", time.localtime(t or 0))
+    for r in rows:
+        when = time.strftime("%a %d %b %Y %H:%M", time.localtime(r.get("ts") or 0))
+        fate = "  NOT DELIVERED: %s" % r.get("error", "") if not r.get("ok") else ""
+        print("%s  %s  %s -> %s  [%s]%s%s" % (when, r["ref"], r.get("kind"), r.get("to"), r["state"], fate,
+                                             "  (recovered)" if r.get("recovered") else ""))
+        print(textwrap.indent(r["text"], "    ", lambda ln: True))
+        if r.get("done"):
+            print("    -- done %s: %s" % (hhmm(r["done"].get("ts")), r["done"].get("note") or "(no note)"))
+        if r.get("tick", {}).get("by") == "mail" and r["checked"]:
+            print("    -- ticked off %s: %s" % (hhmm(r["tick"].get("ts")), r["tick"].get("note") or ""))
+        print()
+
+
+def cmd_done(a):
+    """An agent marks the owner's board messages dealt with; the owner sees them in bold until ticking them off."""
+    bad = [r for r in a.refs if not sent.REF_RE.match(r)]
+    if bad:
+        print("not a message ref: %s (four letters and digits, from the message's last line)" % ", ".join(bad),
+              file=sys.stderr)
+        return 2
+    by = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or None
+    marked, unknown = sent.mark(a.refs, "done", note=a.m, by=by)
+    for r in marked:
+        print("marked %s done; %s sees it on the board" % (r, config.owner_name()))
+    for r in unknown:
+        print("no board message %s on record" % r, file=sys.stderr)
+    return 0 if marked and not unknown else 1
+
+
+def cmd_time(a):
+    """Recompute the Time page's figures (time.json); agent-board-time.timer runs this. Exits 1 when a source
+    failed and was left out, so it shows in the timer's status; a source that is off (its login or setting is not
+    configured) or still waiting for its first upload from a device does not fail it."""
+    doc = timeuse.refresh(timeuse.config())
+    cli.out(doc, a.json, show_time)
+    for w in doc["warnings"]:
+        print("warning: " + w, file=sys.stderr)
+    for w in doc["waiting"]:
+        print("waiting: " + w, file=sys.stderr)
+    return 1 if doc["warnings"] else 0
+
+
+def show_time(doc):
+    per = {}
+    for d in doc["daily"]:
+        for r in d["rows"]:
+            per[r["group"]] = per.get(r["group"], 0) + r["minutes"]
+    sm = doc["summary"]
+    print("%s | activities %s | guessed %d items in %d model calls | %d documents from their last edit only" % (
+        ", ".join("%s %.1f h" % (g, m / 60) for g, m in sorted(per.items(), key=lambda kv: -kv[1])) or "no activity",
+        ", ".join("%s %d" % kv for kv in sorted(sm["activities"].items())), sm["guessed"]["asked"],
+        sm["guessed"]["batches"], sm["approximate documents"]))
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="agent-board", description=__doc__.split("\n\n")[0],
-                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap = cli.parser(__doc__, "agent-board")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("snapshot")
     p.add_argument("--pretty", action="store_true")
@@ -153,8 +319,18 @@ def main(argv=None):
     p.add_argument("--usage-interval", type=float, default=300.0)
     p.add_argument("--max-seconds", type=float, default=12 * 3600)
     sub.add_parser("act")
+    sub.add_parser("receive")
+    p = sub.add_parser("sent")
+    p.add_argument("-n", type=int, default=20, help="how many, newest last (0: all)")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("done", help="mark board messages dealt with")
+    p.add_argument("refs", nargs="+", metavar="REF")
+    p.add_argument("-m", metavar="NOTE", help="what you did, in one line")
+    p = sub.add_parser("time", help="recompute where the owner's time went (the Time page)")
+    p.add_argument("--json", action="store_true", help="print the figures as written to time.json")
     a = ap.parse_args(argv)
-    return {"snapshot": cmd_snapshot, "stream": cmd_stream, "act": cmd_act}[a.cmd](a)
+    return {"snapshot": cmd_snapshot, "stream": cmd_stream, "act": cmd_act, "receive": cmd_receive, "sent": cmd_sent,
+            "done": cmd_done, "time": cmd_time}[a.cmd](a)
 
 
 if __name__ == "__main__":
