@@ -12,13 +12,18 @@ own logs and state files, mailing the owner). Nothing here writes to another too
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
+import socketserver
 import sqlite3
+import stat
+import struct
 import subprocess
 import tempfile
 import threading
@@ -35,6 +40,13 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 STATUS_LOG = Path(os.environ.get("AGENT_STATUS_DIR", HOME / ".local/state/agent-status")) / "events.jsonl"
 MAIL_STATE = config.MAIL_STATE
 MAIL_DB = MAIL_STATE / "mailroom.sqlite"
+MAIL_MESSAGES = MAIL_STATE / "messages"    # the mailroom's message store: each agent mail as it was sent
+# The mailroom's record of the security alerts it kept for the Mail tab instead of sending them through Gmail (one JSON
+# line each, appended, never rewritten): the board passes the recent ones to the Mac app, which notifies of each new one
+SECURITY_ALERTS = MAIL_STATE / "security-alerts.jsonl"
+SECURITY_ALERT_DAYS = 7          # the alerts the snapshot carries: those of the last 7 days
+SECURITY_ALERT_CHARS = 300       # an alert's subject, at most, as the snapshot carries it
+REPLY_TAG = re.compile(r"\s*\[#[a-z0-9]{6,12}\]")   # the reply tag the mailroom puts in a subject (its routing.TAG_RE)
 MAIL_CONFIG = config.MAIL_CONFIG
 USAGE_CACHE = MAIL_STATE / "usage-cache.json"
 BIN_DIRS = [HOME / ".local/bin", Path("/usr/local/bin"), Path("/usr/bin")]
@@ -68,6 +80,67 @@ def run(cmd, timeout=60, env=None, input=None, cwd=None):
         return 127, "", str(e)
 
 
+def run_json_lines(argv, text, on_event, *, timeout, stderr=subprocess.STDOUT, cwd=None, env=None,
+                   popen=subprocess.Popen, leave=False, ended=None):
+    """Run `argv` with `text` on its stdin, handing each JSON object it prints on a line of its own to on_event, which
+    returns True to stop reading, or raises, which stops the process there: (its exit code, its other output, whether it
+    ran over `timeout` seconds and was killed). `stderr` is where its stderr goes (merged into that output by default).
+    With `leave`, a process on_event stopped is left to end by itself and the code is 0: a thread reads and drops what
+    more it prints and waits for it, killing it at `timeout`, and this process does not exit before it. `ended`, when
+    given, is called once the process has exited, a left one's included, or could not start. `popen` is
+    subprocess.Popen or a test's stand-in."""
+    try:
+        proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, text=True, cwd=cwd, env=env)
+    except BaseException:
+        if ended:
+            ended()
+        raise
+    late = threading.Event()
+    timer = threading.Timer(timeout, lambda: (late.set(), proc.kill()))
+    timer.start()
+    other, left = [], False
+    try:
+        proc.stdin.write(text)
+        proc.stdin.close()
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                other.append(line)                  # not JSON: its stderr, when that is merged in
+                continue
+            if isinstance(event, dict) and on_event(event):
+                left = leave
+                break
+        if left:
+            threading.Thread(target=_end, args=(proc, timer, ended)).start()
+            return 0, "".join(other), False
+        code = proc.wait()
+    finally:
+        if not left:
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+            if ended:
+                ended()
+    return code, "".join(other), late.is_set()
+
+
+def _end(proc, timer, ended=None):
+    """A process left to end (run_json_lines's `leave`): what more it prints is read and dropped, then its exit is
+    waited for, and `ended` called."""
+    try:
+        for _ in proc.stdout:
+            pass
+        proc.wait()
+    finally:
+        timer.cancel()
+        proc.stdout.close()
+        if ended:
+            ended()
+
+
 def run_merged(cmd, stdin=None, timeout=60):
     """`run` with stdout and stderr joined and stripped: (exit code, text)."""
     code, out, err = run(cmd, timeout=timeout, input=stdin)
@@ -76,7 +149,12 @@ def run_merged(cmd, stdin=None, timeout=60):
 
 class CommandError(Exception):
     """A command the board runs for the owner (the mailroom's agent-group or agent-mail) is not installed, failed, or
-    printed something that is not JSON; the message says which, for the Mac to show."""
+    printed something that is not JSON; the message says which, for the Mac to show. `code` is the exit code of a
+    command that ran and failed, else None."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def call(name, args, run, stdin=None, parse=True):
@@ -88,7 +166,7 @@ def call(name, args, run, stdin=None, parse=True):
         raise CommandError("%s is not installed" % name)
     code, out, err = run([exe] + list(args), timeout=60, input=stdin)
     if code != 0:
-        raise CommandError((err or out).strip()[-500:] or "%s exited %d" % (name, code))
+        raise CommandError((err or out).strip()[-500:] or "%s exited %d" % (name, code), code)
     if not parse:
         return out.strip()
     try:
@@ -112,6 +190,50 @@ def detached_argv(unit, command, env, properties):
     session or timer that asked, with the login PATH plus `env` ({name: value}) and the unit `properties`."""
     return (["systemd-run", "--user", "--collect", "--unit", unit, "--setenv=PATH=%s" % LOGIN_PATH]
             + ["--setenv=%s=%s" % kv for kv in env.items()] + ["--property=%s" % p for p in properties] + list(command))
+
+
+def peer_uid(conn):
+    """The uid of the process at the other end of Unix-socket connection `conn` (SO_PEERCRED: as it was at connect)."""
+    _pid, uid, _gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    return uid
+
+
+class UnixServer(socketserver.ThreadingUnixStreamServer):
+    """A threaded server on the Unix socket at `path`, made 0600, that takes a connection only from a process running
+    as one of the uids `uids()` gives, telling refused(uid) of any other (to log it); its socket goes when it closes. A
+    stale socket there (a server that died left it) is replaced; one another server answers on, or anything but a
+    socket, is not: RuntimeError, `what` naming this server. The phone page's server (mailweb.PageServer) is one."""
+    daemon_threads = True
+
+    def __init__(self, path, handler, uids, what, refused):
+        path = Path(path)
+        if path.exists() or path.is_symlink():
+            if not stat.S_ISSOCK(path.lstat().st_mode):
+                raise RuntimeError("%s is there and is not a socket; %s will not replace it" % (path, what))
+            with socket.socket(socket.AF_UNIX) as s:
+                try:
+                    s.connect(str(path))
+                except ConnectionRefusedError:
+                    path.unlink()                         # nobody answers on it: the last run's
+                else:
+                    raise RuntimeError("another daemon answers on %s; %s will not replace it" % (path, what))
+        self.uids, self.refused = uids, refused
+        old = os.umask(0o177)                             # made 0600 from the start
+        try:
+            super().__init__(str(path), handler)
+        finally:
+            os.umask(old)
+
+    def verify_request(self, request, client_address):
+        uid = peer_uid(request)
+        if uid in self.uids():
+            return True
+        self.refused(uid)
+        return False
+
+    def server_close(self):
+        super().server_close()
+        Path(self.server_address).unlink(missing_ok=True)
 
 
 def ro_sqlite(path):
@@ -487,6 +609,13 @@ def claude_routing(path=None):
     return order, dict(ROUTING_MIN_REMAINING, **(u.get("min_remaining") or {}))
 
 
+def login_home(acct):
+    """The folder of a Claude login, from its entry in the mailroom's usage.claude_accounts: its config_dir with ~
+    expanded, or the default login's, ~/.claude, when it names none."""
+    return Path(os.path.expanduser(acct["config_dir"])) if isinstance(acct, dict) and acct.get("config_dir") \
+        else DEFAULT_CLAUDE_HOME
+
+
 def claude_logins(path=None):
     """[(account name, config dir)] for every Claude login in the mailroom's usage config; the default
     login (config_dir null) is always ~/.claude, even when this process runs under another login's
@@ -494,13 +623,26 @@ def claude_logins(path=None):
     accts = claude_accounts(path)
     out, seen = [], set()
     for name, a in accts.items():
-        d = Path(os.path.expanduser(a.get("config_dir"))) if isinstance(a, dict) and a.get("config_dir") else DEFAULT_CLAUDE_HOME
+        d = login_home(a)
         if d.resolve() not in seen:
             seen.add(d.resolve())
             out.append((name, d))
     if DEFAULT_CLAUDE_HOME.resolve() not in seen:
         out.insert(0, ("default", DEFAULT_CLAUDE_HOME))
     return out
+
+
+def manual_logins(path=None):
+    """[{"name", "label"}] for each Claude login in the mailroom's usage.claude_accounts that the mailroom counts as
+    manual (its accounts.manual), in config order: one used only when the owner names it (agent-spawn --account NAME),
+    never by routing, such as a per-token login through OpenRouter. The label is the config's, else the name. [] without a
+    mailroom, or one older than manual logins. Raises ValueError for a damaged config (mail_config), and what loading
+    the mailroom raises (optional_mailroom)."""
+    accounts = optional_mailroom("accounts")
+    if accounts is None or not hasattr(accounts, "manual"):
+        return []
+    return [{"name": n, "label": a["label"] if isinstance(a.get("label"), str) and a["label"].strip() else n}
+            for n, a in claude_accounts(path).items() if isinstance(a, dict) and accounts.manual(a)]
 
 
 def login_labels(path=None):
@@ -541,8 +683,14 @@ def mark_shared_logins(accounts, logins=None):
         acct = next((a for a in accounts if a.get("target") == target), None)
         if who in seen and acct is not None:
             acct["same_account_as"] = list(seen[who])
-            acct["login_dir"] = "~/" + str(Path(home).relative_to(HOME)) if Path(home).is_relative_to(HOME) else str(home)
+            acct["login_dir"] = tilde(home)
         seen.setdefault(who, []).append(target)
+
+
+def tilde(path):
+    """A path as people write it: "~/..." under the home folder, else as it is."""
+    p = Path(path)
+    return "~/" + str(p.relative_to(HOME)) if p.is_relative_to(HOME) else str(p)
 
 
 def append_log(path, msg):
@@ -604,6 +752,37 @@ def read_jsonl(path):
                 continue
             raise ValueError("%s line %d is not JSON" % (path, i + 1)) from None
     return out
+
+
+def security_alerts(now=None, path=None):
+    """The mailroom's security alerts of the last SECURITY_ALERT_DAYS days (SECURITY_ALERTS, or `path`), oldest first:
+    [{"at": unix seconds, "kind", "subject", "thread_id"}], and how many of the file's lines are not alerts (not JSON,
+    or an object without those fields), which are passed over. No file: ([], 0). The last line, when it has no newline
+    yet, is not counted: the mailroom may be writing it. Raises OSError when the file cannot be read."""
+    now = time.time() if now is None else now
+    try:
+        text = Path(path or SECURITY_ALERTS).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return [], 0
+    lines = text.split("\n")
+    out, bad = [], 0
+    for i, ln in enumerate(lines):
+        if not ln.strip():
+            continue
+        try:
+            a = json.loads(ln)
+        except ValueError:
+            a = None
+        at = a.get("at") if isinstance(a, dict) else None
+        if not (isinstance(at, (int, float)) and not isinstance(at, bool) and at == at
+                and all(isinstance(a.get(k), str) for k in ("kind", "subject", "thread_id"))):
+            bad += i < len(lines) - 1
+            continue
+        if at >= now - SECURITY_ALERT_DAYS * 86400:
+            out.append({"at": float(at), "kind": a["kind"], "subject": a["subject"][:SECURITY_ALERT_CHARS],
+                        "thread_id": a["thread_id"]})
+    out.sort(key=lambda a: a["at"])
+    return out, bad
 
 
 def read_json(path, default=None):
@@ -678,6 +857,17 @@ def read_appended(paths, since, cache_path, log):
     return out
 
 
+def message_text(content, sep=" "):
+    """The text of a Claude or Codex transcript message's content: a string, or its text blocks (Claude's text, Codex's
+    input_text and output_text) joined by `sep`."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return sep.join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") in ("text", "input_text", "output_text"))
+    return ""
+
+
 def iso_ts(s):
     """Epoch seconds from an ISO 8601 time, including the "Z" that Claude, Codex and Google end theirs with (Python
     before 3.11 does not read it). Raises ValueError on anything else."""
@@ -697,6 +887,18 @@ def load_config(defaults, path):
     if not isinstance(given, dict):
         raise ValueError("%s must hold a JSON object" % path)
     return dict(defaults, **given)
+
+
+def load_settings(defaults_file, path):
+    """The settings in the JSON file `defaults_file` (beside the module that reads them), overridden key by key by the
+    JSON object at `path` (load_config), which may name no setting the defaults lack: a mistyped one is an error, never
+    ignored. Raises ValueError (and read_json's errors)."""
+    defaults = json.loads(Path(defaults_file).read_text())
+    cfg = load_config(defaults, path)
+    unknown = sorted(set(cfg) - set(defaults))
+    if unknown:
+        raise ValueError("%s: no such setting %s" % (path, ", ".join(unknown)))
+    return cfg
 
 
 def write_json(path, obj, mode=None):
@@ -907,6 +1109,11 @@ def tmux_list_panes():
     return rows
 
 
+def tmux_name(reg_tmux):
+    """Claude registers tmux as "session:@window.%pane"; the session name is what attach needs."""
+    return (reg_tmux or "").split(":", 1)[0]
+
+
 def tmux_sessions(rows=None):
     """{session name: set of its panes' current directories}; rows: tmux_list_panes()'s, read now when None."""
     out = {}
@@ -996,6 +1203,17 @@ def norm_id(message_id):
     return (message_id or "").strip().strip("<>").strip().lower()
 
 
+# The domain of the Message-IDs the mailroom makes itself, its LOCAL_DOMAIN (agentmail/routing.py in agent-mailroom):
+# those of the agent mail it keeps for the Mail tab alone (its README, "Mail to the owner off Gmail") and of the
+# owner's replies written in the tab. Gmail holds no mail with such an id.
+MAILROOM_DOMAIN = "agent-mailroom.local"
+
+
+def tab_only(message_id):
+    """Whether the mail with this Message-ID is in the Mail tab alone, never in Gmail (MAILROOM_DOMAIN)."""
+    return norm_id(message_id).endswith("@" + MAILROOM_DOMAIN)
+
+
 def owner_addresses(path=None):
     """The owner's addresses (mailroom config owner_email, then allowlist), lower case; [] when unconfigured."""
     return config.owner_addresses(mail_config(path))
@@ -1017,9 +1235,12 @@ def mail_host(path=None):
     return mail_config(path).get("host_id") or "desktop"
 
 
-def mail_owner(subject, body):
-    """Email the owner from the agents' account, unrouted (a detached job has no session for the reply to reach).
-    (sent?, what went wrong)."""
+def mail_owner(subject, body, *, alert):
+    """Email the owner (mailroom config owner_email) from the agents' account, unrouted (a detached job has no session
+    for the reply to reach). alert: None for an ordinary notice, which the mailroom may keep for the Mail tab alone;
+    else the notice's kind (`agent-mail send --unrouted --alert KIND`), from which the mailroom decides whether it goes
+    through the owner's Gmail as well. A mailroom older than --alert refuses the send (exit 2), so an alert never goes
+    out as an ordinary notice. (sent?, what went wrong)."""
     exe = find_bin("agent-mail")
     if not exe:
         return False, "agent-mail is not installed"
@@ -1028,16 +1249,18 @@ def mail_owner(subject, body):
         return False, "no owner address in the mailroom config (owner_email)"
     env = {k: v for k, v in os.environ.items() if not k.startswith("SSH_")}
     env["PATH"] = LOGIN_PATH
-    code, out, err = run([exe, "send", "--unrouted", "--to", to, "--subject", subject], timeout=120, env=env,
-                         input=body if body.endswith("\n") else body + "\n")
+    kind = ["--alert", alert] if alert is not None else []
+    code, out, err = run([exe, "send", "--unrouted"] + kind + ["--to", to, "--subject", subject], timeout=120,
+                         env=env, input=body if body.endswith("\n") else body + "\n")
     return code == 0, "" if code == 0 else "agent-mail exit %d: %s" % (code, (err or out).strip()[-300:])
 
 
 class MailStore:
-    """Read-only view of the mailroom's routing map. Never opened for writing."""
+    """Read-only view of the mailroom's routing map, and of its message store (`messages`). Never opened for writing."""
 
-    def __init__(self, path=MAIL_DB, owners=None, host_id=None):
+    def __init__(self, path=MAIL_DB, owners=None, host_id=None, messages=MAIL_MESSAGES):
         self.path = Path(path)
+        self.messages = Path(messages)
         self.owners = owners
         # this machine's identity in mail routing (mailroom config host_id); sessions hosted elsewhere are skipped
         self.host_id = host_id or mail_host()
@@ -1111,6 +1334,69 @@ class MailStore:
             out["error"] = str(e)
         out["held"].sort(key=lambda h: -h["ts"])
         return out
+
+    def thread_sessions(self, thread_ids):
+        """{thread id: [{"cli", "id"}, ...]} for those of thread_ids that hold agent mail of sessions on this machine:
+        the board's agents, keyed as read() keys them, in the order of their first mail in the thread. The Mail tab
+        lists a thread's agents by name (the mailroom's session_label); these name the same senders exactly. Raises
+        FileNotFoundError when there is no store at self.path: the mailbox is read from it, so the board is reading
+        the wrong path; and sqlite3.Error when the store cannot be read."""
+        con = self._db()
+        if con is None:
+            raise FileNotFoundError("no database at %s" % self.path)
+        ids = sorted(set(thread_ids))
+        out = {}
+        for i in range(0, len(ids), 500):       # under SQLite's limit on bound values; a thread's rows stay together
+            chunk = ids[i:i + 500]
+            for r in con.execute(
+                    "select t.thread_id, s.cli, s.session_id from sent t join sessions s on s.tag = t.tag "
+                    "where s.origin_host = ? and t.thread_id in (%s) order by t.id" % ",".join("?" * len(chunk)),
+                    [self.host_id] + chunk):
+                got = out.setdefault(r["thread_id"], [])
+                if not any(g["cli"] == r["cli"] and g["id"] == r["session_id"] for g in got):
+                    got.append({"cli": r["cli"], "id": r["session_id"]})
+        return out
+
+    def sent_sessions(self, sent_ids):
+        """{sent id: session id} for those of sent_ids (agent mail, the store's sent rows) that sessions on this
+        machine sent: the board's agents. Raises FileNotFoundError when there is no store at self.path, and
+        sqlite3.Error when it cannot be read."""
+        con = self._db()
+        if con is None:
+            raise FileNotFoundError("no database at %s" % self.path)
+        ids = sorted(set(sent_ids))
+        out = {}
+        for i in range(0, len(ids), 500):       # under SQLite's limit on bound values
+            chunk = ids[i:i + 500]
+            for r in con.execute("select t.id, s.session_id from sent t join sessions s on s.tag = t.tag "
+                                 "where s.origin_host = ? and t.id in (%s)" % ",".join("?" * len(chunk)),
+                                 [self.host_id] + chunk):
+                out[r["id"]] = r["session_id"]
+        return out
+
+    def sent_message(self, sent_id):
+        """Agent mail `sent_id` (a sent row's id) as the mailroom sent it: (its thread id, its subject, its MIME bytes),
+        the bytes from the message store, the file named by the sha256 the row keeps (`eml`) as the mailroom files it
+        (`<first 2 hex>/<sha256>.eml` under self.messages; its agentmail/messages.py). Raises ValueError when the store
+        has no such mail, kept no copy of it (mail sent before the message store and not backfilled) or its copy does
+        not hash to its name; OSError when the copy or the store cannot be read (FileNotFoundError: there is no store
+        at self.path, or no copy where its row says); sqlite3.Error when the store cannot be queried."""
+        con = self._db()
+        if con is None:
+            raise FileNotFoundError("no database at %s" % self.path)
+        row = con.execute("select thread_id, subject, eml from sent where id = ?", (sent_id,)).fetchone()
+        if row is None:
+            raise ValueError("the mailroom has no agent mail s%d" % sent_id)
+        sha = row["eml"]
+        if not sha:
+            raise ValueError("the mailroom kept no copy of agent mail s%d: it was sent before the mailroom kept copies, "
+                             "and not copied from Gmail since" % sent_id)
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise ValueError("agent mail s%d names its copy %r, which is not a sha256" % (sent_id, sha))
+        raw = (self.messages / sha[:2] / (sha + ".eml")).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != sha:
+            raise ValueError("the mailroom's copy of agent mail s%d is damaged: it does not hash to its name" % sent_id)
+        return row["thread_id"], row["subject"] or "", raw
 
 
 def _addressed_to(to_addr, owners):
@@ -1613,19 +1899,27 @@ class Usage:
         self.timer.invalidate()
 
 
-def claude_home_of(sid):
-    """(account, config dir) of the login holding the NEWEST copy of this session's transcript, or (None, None).
-    After a login move both logins have a copy and the old one stops at the move, so first-found is wrong."""
+def newest_transcript(sid, homes=None):
+    """(account, config dir, path) of the NEWEST copy of this session's transcript across the Claude logins (`homes`:
+    [(account, config dir)], claude_logins() by default), or (None, None, None). After a login move both logins have
+    a copy and the old one stops at the move, so first-found is wrong."""
     best = None
-    for account, home in claude_logins():
+    for account, home in homes if homes is not None else claude_logins():
         for path in Path(home).glob("projects/*/%s.jsonl" % sid):
             try:
                 mtime = path.stat().st_mtime
             except OSError:
                 continue
             if best is None or mtime > best[0]:
-                best = (mtime, account, Path(home))
-    return (best[1], best[2]) if best else (None, None)
+                best = (mtime, account, Path(home), path)
+    return best[1:] if best else (None, None, None)
+
+
+def claude_home_of(sid):
+    """(account, config dir) of the login holding the newest copy of this session's transcript (newest_transcript),
+    or (None, None)."""
+    account, home, _ = newest_transcript(sid)
+    return account, home
 
 
 def transcript_tail(path, nbytes):
@@ -1633,6 +1927,13 @@ def transcript_tail(path, nbytes):
     with open(path, "rb") as fh:
         fh.seek(max(0, os.path.getsize(path) - nbytes))
         return fh.read().decode("utf-8", "replace").splitlines()
+
+
+def reply_model(entry):
+    """The model of a transcript entry that is a real reply (Claude Code's own "<synthetic>" ones are not), or None."""
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    model = msg.get("model") if isinstance(msg, dict) else None
+    return model if isinstance(model, str) and model and not model.startswith("<") else None
 
 
 def last_claude_model(home, sid):
@@ -1645,10 +1946,10 @@ def last_claude_model(home, sid):
         for line in reversed(lines):
             if '"model"' in line and '"assistant"' in line:
                 try:
-                    m = (json.loads(line).get("message") or {}).get("model")
+                    m = reply_model(json.loads(line))
                 except ValueError:
                     continue
-                if m and not m.startswith("<"):
+                if m:
                     return m
     return None
 
@@ -1676,12 +1977,132 @@ def last_turn_failed(sid):
     return None
 
 
-def codex_settings(tid):
-    con = CodexReader()._db()
+def codex_thread(tid, home=CODEX_HOME):
+    """Codex thread tid's row in home's threads table: {model, reasoning_effort, rollout_path}, or {} when there is no
+    such thread (or no table). Raises sqlite3.Error when the table cannot be read."""
+    con = CodexReader(home)._db()
     if con is None:
-        return None, None
-    r = con.execute("select model, reasoning_effort from threads where id = ?", (tid,)).fetchone()
-    return (r["model"], r["reasoning_effort"]) if r else (None, None)
+        return {}
+    try:
+        r = con.execute("select model, reasoning_effort, rollout_path from threads where id = ?", (tid,)).fetchone()
+    finally:
+        con.close()
+    return dict(r) if r else {}
+
+
+def codex_settings(tid):
+    """(model, effort) Codex thread tid records (codex_thread), each None when it records none."""
+    t = codex_thread(tid)
+    return t.get("model"), t.get("reasoning_effort")
+
+
+# ------------------------------------------------------------------ what an agent and the owner last said
+RELAYED_PREFIX = "Another Claude session sent a message:\n"   # how a Claude transcript holds what agent-send gave it
+RELAYED_END = "\n\nThis came from another Claude session"
+NOT_WRITTEN = ("<task-notification>", "<command-name>", "<command-message>", "<local-command-", "<system-reminder>",
+               "Caveat:", "This session is being continued", "[Request interrupted", "<environment_context>",
+               "# AGENTS.md instructions", "<user_instructions>", "<permissions instructions>", "<skills_instructions>",
+               "<turn_aborted>", "<subagent_notification>")     # what an agent is given that nobody wrote to it
+LATEST_BYTES = (1 << 21, 1 << 24)    # a transcript's tail latest_messages reads: 2 MB, then 16 MB if that held too few
+
+
+def _entry_ts(d):
+    try:
+        return iso_ts(d["timestamp"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _add_message(out, ts, who, text, key=None):
+    """Put one message on `out`: [ts, who, text, key]; a reply split over several entries (one message id `key`)
+    joins up, and a message given twice in a row (queued, then delivered) counts once."""
+    text = text.strip()
+    if not text or (who == "to" and text.startswith(NOT_WRITTEN)):
+        return
+    if out and key and out[-1][3] == key:
+        out[-1][2] += "\n" + text
+    elif not (out and out[-1][1] == who and out[-1][2] == text):
+        out.append([ts, who, text, key])
+
+
+def claude_messages(lines):
+    """[[ts, who, text, key]] of a Claude transcript's lines, in order: who "agent" for its replies' text, "to" for what
+    it was given (what was typed, mail and agent-send messages, mid-turn ones too). Not tool calls or results, thinking,
+    task notifications, commands, side chains or its own meta prompts. A line that is not JSON (one a tail cut) is
+    passed over."""
+    out = []
+    for line in lines:
+        if '"user"' not in line and '"assistant"' not in line and '"queued_command"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("isSidechain"):
+            continue
+        msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+        if d.get("type") == "assistant":
+            _add_message(out, _entry_ts(d), "agent", message_text(msg.get("content"), "\n"), msg.get("id"))
+        elif d.get("type") == "user":
+            content = msg.get("content")
+            if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                                 for b in content):
+                continue
+            text = message_text(content, "\n")
+            if d.get("isMeta"):
+                if not text.startswith(RELAYED_PREFIX):
+                    continue
+                text = text[len(RELAYED_PREFIX):].split(RELAYED_END)[0]
+            _add_message(out, _entry_ts(d), "to", text)
+        elif d.get("type") == "attachment":
+            a = d.get("attachment") if isinstance(d.get("attachment"), dict) else {}
+            if a.get("type") == "queued_command" and a.get("commandMode") != "task-notification":
+                _add_message(out, _entry_ts(d), "to", message_text(a.get("prompt"), "\n"))
+    return out
+
+
+def codex_messages(lines):
+    """As claude_messages, for a Codex rollout: its messages from and to the user (not the developer's), but the
+    context Codex gives the model itself (its environment, AGENTS.md, skills)."""
+    out = []
+    for line in lines:
+        if '"message"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        p = d.get("payload") if isinstance(d, dict) and d.get("type") == "response_item" else None
+        if isinstance(p, dict) and p.get("type") == "message" and p.get("role") in ("user", "assistant"):
+            _add_message(out, _entry_ts(d), "agent" if p["role"] == "assistant" else "to",
+                         message_text(p.get("content"), "\n"), p.get("id"))
+    return out
+
+
+def conversation(agent, homes=None):
+    """(path, parse) of a live agent's conversation ({"cli", "id", "config_dir"?}, as voicedesk.agents gives it): a
+    Claude agent's newest transcript across the logins (`homes`: claude_logins() by default) and claude_messages, or a
+    Codex agent's rollout (its threads entry names it) and codex_messages. Raises LookupError when it has none yet, and
+    sqlite3.Error when Codex's threads cannot be read."""
+    if agent.get("cli") == "codex":
+        rollout = codex_thread(agent["id"], agent.get("config_dir") or CODEX_HOME).get("rollout_path")
+        path, parse = (Path(rollout) if rollout else None), codex_messages
+    else:
+        path, parse = newest_transcript(agent["id"], homes)[2], claude_messages
+    if path is None or not path.exists():
+        raise LookupError("it has no conversation to read yet")
+    return path, parse
+
+
+def latest_messages(agent, n, homes=None):
+    """The last `n` messages of a live agent's conversation (conversation), read from its tail (LATEST_BYTES). Raises
+    LookupError, sqlite3.Error (conversation) and OSError."""
+    path, parse = conversation(agent, homes)
+    for size in LATEST_BYTES:
+        msgs = parse(transcript_tail(path, size))
+        if len(msgs) >= n or path.stat().st_size <= size:
+            break
+    return msgs[-n:]
 
 
 def is_live(agent):

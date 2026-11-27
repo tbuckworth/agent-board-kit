@@ -19,7 +19,7 @@ import re
 import time
 from pathlib import Path
 
-from . import accounts, headless, usage
+from . import accounts, headless, imagefile, usage
 from .compose import MARKED, NOTE, cut_items, flatten, text_to_html
 from .config import STATE_DIR
 
@@ -100,10 +100,12 @@ def _image_marker(attrs):
 def render(text, html_body=None):
     """What the reviewer reads: the HTML part Gmail shows (agent-mail renders one from the text when the
     agent gave none), flattened to text (compose.flatten) with headings, list items, link targets other than
-    mailto:, [IMAGE ...] markers, [TABLE] blocks whose cells each start " | ", and [CODE] blocks, each a fenced
-    block's lines one to a line, without their leading spaces, which the Mail tab gives a Copy button."""
+    mailto: (but for a link whose words are its target, as agent-mail makes of a bare address, which is read once),
+    [IMAGE ...] markers, [TABLE] blocks whose cells each start " | ", and [CODE] blocks, each a fenced block's lines
+    one to a line, without their leading spaces, which the Mail tab gives a Copy button."""
     return flatten(html_body or text_to_html(text), image=_image_marker,
-                   link=lambda href: " <%s>" % href[:200] if href and not href.startswith("mailto:") else "",
+                   link=lambda href, words: " <%s>" % href[:200] if href and href != words
+                   and not href.startswith("mailto:") else "",
                    mark_blocks=True, keep_pre=True, rule="")
 
 
@@ -114,9 +116,15 @@ def words(text):
 _PATH = re.compile(r"(?<![\w<])(?:~/|/media/|/home/|/tmp/|/mnt/|/ephemeral/)[\w./-]+")
 
 
+# The narrowest image that looks sharp in agent mail: a mail's column shows an image about 600 px across (compose's 42em
+# body), on screens of 2 or 3 pixels to each px, so one under twice that is drawn blown up, and looks grainy.
+MIN_IMAGE_WIDTH = 1200
+
+
 def lint(text, html_body=None, images=(), *, owner_name):
     """Model-free problems that are wrong whatever the email is about: each one holds the mail (round 1). owner_name
-    (config owner_name) is the reader the texts name."""
+    (config owner_name) is the reader the texts name. images are checked (outbound.check_image). An image under
+    MIN_IMAGE_WIDTH is one, but a GIF (mostly a screen recording, too big to send at that width)."""
     out = []
     raw = html_body or ""
     if re.search(r"""(?i)<img[^>]+src=["']data:""", raw):
@@ -125,6 +133,12 @@ def lint(text, html_body=None, images=(), *, owner_name):
     if re.search(r"""(?i)<img[^>]+src=["'](?:file:|/|~)""", raw):
         out.append("An image points at a file on this machine, which %s cannot see. Embed it with "
                    "--image NAME=PATH and <img src=\"cid:NAME\">." % owner_name)
+    for name, data in images:              # each checked by outbound.check_image, so its header gives its size
+        width = imagefile.size(data)[0]
+        if width < MIN_IMAGE_WIDTH and imagefile.subtype(data) != "gif":          # a GIF, a screen recording
+            out.append("Image %s is %d px wide, so it looks grainy on %s's screens, which show it about 600 px across "
+                       "at 2 or 3 screen pixels each. Make it at least %d px wide: matplotlib's savefig(dpi=200) or "
+                       "more, a screenshot at 2x." % (name, width, owner_name, MIN_IMAGE_WIDTH))
     cids = set(re.findall(r"""(?i)src=["']cid:([^"'>\s]+)""", raw))
     missing = sorted(cids - {n for n, _ in images})
     if missing:
@@ -287,6 +301,7 @@ def ask_model(cfg, subject, shown, notes=(), reader=None, answers=None):
 
 
 NOT_SENT = "agent-mail: NOT SENT"
+# agent-board's agentboard/mailforward.py strips this from forwarded mail: change both together.
 EXPIRED_NOTE = ("[Sent unchanged by the mailroom: the pre-send review asked the agent for changes and it did not "
                 "revise or withdraw this mail within %d minutes.]")
 
@@ -327,11 +342,14 @@ def audience(cfg, *recipients):
                      % (", ".join(sorted(addrs)), owner))
 
 
-def gate(cfg, st, tag, recipients, subject, text, html_body=None, images=(), no_review=None, draft=None, answers=None):
+def gate(cfg, st, tag, recipients, subject, text, html_body=None, images=(), no_review=None, draft=None, answers=None,
+         fast=False):
     """Decide whether this mail goes out now. Returns (review_id or None, stop, tips): `stop` is the NOT SENT
     message for the agent (print it, exit 3, send nothing); `tips` are polish notes to print after sending.
     `answers` is the text of the message this mail replies to (None: not a reply); the reviewer of mail to the owner is
-    shown it, the reviewer of other mail is not. Every decision is a row in `reviews`."""
+    shown it, the reviewer of other mail is not. fast: the mail is a reply in a thread where fast mode is on for its
+    session (agentmail/fastmode.py), which skips every check but the one for credentials. Every decision is a row in
+    `reviews`."""
     s = settings(cfg)
     aud, reader = audience(cfg, *recipients)
     if not s["enabled"] or not tag or aud is None or (aud != "owner" and not s["outside"]):
@@ -349,6 +367,8 @@ def gate(cfg, st, tag, recipients, subject, text, html_body=None, images=(), no_
                               reviewer_error=None), None
     shown = render(text, html_body)
     n = words(shown)
+    if fast:
+        return st.record_review(tag, round_, "skipped", subject, kind="fast", words=n, audience=aud), None, None
     notes = lint(text, html_body, images, owner_name=cfg["owner_name"])
     if aud == "owner" and not html_body and n >= s["min_words"]:
         notes += layout(text)

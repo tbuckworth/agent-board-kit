@@ -67,6 +67,13 @@ enum Renderer {
         }
     }
 
+    /// The Chats sheet from saved chats, one chat and its posts (ChatsPreload), for a screenshot.
+    static func renderChats(_ path: String, to out: String, dark: Bool) -> Int32 {
+        renderSheet(path, as: ChatsPreload.self, to: out, size: CGSize(width: 1000, height: 660), dark: dark) { p, model in
+            ChatsSheet(model: model, selected: nil, preloaded: p)
+        }
+    }
+
     /// The usage breakdown sheet from a saved usage_split answer's "split", for a screenshot.
     static func renderUsage(_ path: String, to out: String, dark: Bool) -> Int32 {
         renderSheet(path, as: UsageSplit.self, to: out, size: CGSize(width: 680, height: 700), dark: dark) { s, model in
@@ -90,8 +97,117 @@ enum Renderer {
         return wrote(out, png(view, size: CGSize(width: 1440, height: 900), dark: dark, to: out))
     }
 
+    /// The ask box on the desk with a sample exchange (one answer in, with what the desk sent for the owner under it,
+    /// and the next being answered, what the desk is doing said and its first sentence spoken by the desktop's voice;
+    /// stand-ins answer for the desktop and the speaker), beside one with no agent found behind the window, on the desk
+    /// still, and one asking an agent's copy, whose answer this Mac's own voice read, the desktop's voice not answering.
+    static func renderAsk(to out: String, dark: Bool) -> Int32 {
+        func agent(_ n: Int, _ name: String, _ status: String, _ folder: String) -> AskAgent {
+            AskAgent(id: String(repeating: String(n), count: 8) + "-0000-4000-8000-000000000000", name: name,
+                     status: status, folder: folder)
+        }
+        let loader = agent(1, "loader-fix", "busy", "agent-board-loader")
+        let agents = [loader, agent(2, "sweep-runner", "idle", "experiments"), agent(3, "docs-tidy", "idle", "admin"),
+                      agent(4, "eval-sweep", "busy", "evals"), agent(5, "web-fix", "waiting", "website")]
+        var asked = 0
+        let found = AskBox(look: AskLook(agent: loader, said: "You're looking at Google Chrome: Re: Loader cache: two "
+                                         + "choices before I merge. Behind it: loader-fix (matched by its mail tag "
+                                         + "[#ab12cd34]).", agents: agents),
+                           send: { _, onPart, done in
+                               asked += 1
+                               if asked == 1 {
+                                   done(["ok": true, "text": "Done: I told loader-fix to keep the cache on disk and "
+                                         + "merge once the eviction test passes.", "timings": ["end": 2.3], "parts": 1,
+                                         "sends": [["agent": "loader-fix", "text": "Keep the cache on disk, and merge "
+                                                    + "once the eviction test passes.", "ok": true, "ref": "k3f9"]]],
+                                        nil)
+                               } else {
+                                   onPart?(AskTest.part(0, "Asking sweep-runner."))
+                                   onPart?(["status": "Asking sweep-runner…"])
+                               }
+                           }, speaker: AskTest.Speaker(), timers: false)
+        for q in ["Tell loader-fix to keep the cache on disk, and to merge once the eviction test passes.",
+                  "And how far along is sweep-runner's sweep?"] {
+            found.text = q
+            found.submit()
+        }
+        let none = AskBox(look: AskLook(agent: nil, said: "You're looking at Finder: Downloads. No agent found behind it.",
+                                        agents: agents),
+                          send: { _, _, _ in }, speaker: AskTest.Speaker(), timers: false)
+        let down = "the desktop's voice (agent-speech) is not answering on ~/.local/state/agent-board/voice-desk/"
+            + "speech.sock: Connection refused"
+        let mac = AskBox(look: AskLook(agent: agents[1], said: "You're looking at kitty: sweep-runner. Behind it: "
+                                       + "sweep-runner (matched by its tmux session sweep-runner, the one last typed "
+                                       + "in).",
+                                       agents: agents),
+                         send: { _, onPart, done in
+                             onPart?(AskTest.part(0, "The sweep is half done, twelve of twenty-four runs.",
+                                                  error: down))
+                             done(["ok": true, "agent": "sweep-runner", "seconds": 6.1, "parts": 1,
+                                   "answer": "The sweep is half done, twelve of twenty-four runs."], nil)
+                         }, speaker: AskTest.Speaker(), timers: false)
+        mac.choose(.agent(agents[1]))
+        mac.text = "How far along is the sweep?"
+        mac.submit()
+        let boxes = [found, none, mac]
+        let view = HStack(alignment: .top, spacing: 20) {
+            ForEach(boxes.indices, id: \.self) { i in
+                AskBoxView(box: boxes[i], close: {})
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color(nsColor: .windowBackgroundColor)))
+            }
+        }
+        .padding(20)
+        .background(Color.gray)
+        return wrote(out, png(view, size: nil, dark: dark, to: out))
+    }
+
+    /// The top bar with Chrome's keyring on the desktop locked (KeyringSample), above four unlock sheets: a password
+    /// typed, then the answers to a wrong one, to login's alone (partial) and to the right one (stand-ins answer for
+    /// the desktop), for a screenshot.
+    static func renderKeyring(to out: String, dark: Bool) -> Int32 {
+        let snap: Snapshot
+        do { snap = try KeyringSample.locked(bootId: "render") } catch {
+            return fail("the render's snapshot is not understood: \(describeDecodeError(error))")
+        }
+        let model = BoardModel(layout: Layout(), persist: false)
+        model.apply(snap)
+        model.link = .live
+        func answering(_ line: String) -> KeyringUnlock { KeyringUnlock(send: { _ in (Data(line.utf8), "") }) }
+        let cols = #""collections": {"default": {"path": "/c/Default_5fkeyring", "label": "Default keyring"}, "#
+            + #""login": {"path": "/c/login", "label": "Login"}}"#
+        let typed = answering("")
+        typed.password = "a password"
+        let wrong = answering(#"{"result": "wrong", "locked": true, "tried": {"default": "wrong"}, "# + cols + "}")
+        let partial = answering(#"{"result": "partial", "locked": true, "tried": {"default": "wrong", "#
+                                + #""login": "unlocked"}, "# + cols + "}")
+        let right = answering(#"{"result": "unlocked", "locked": false}"#)
+        let answered = [wrong, partial, right]
+        for u in answered {
+            u.password = "a password"
+            u.submit()
+        }
+        let end = Date().addingTimeInterval(5)
+        while answered.contains(where: { $0.said == nil }) && Date() < end {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        let sheets = [typed] + answered
+        let view = VStack(alignment: .leading, spacing: 16) {
+            TopBar(model: model).frame(width: 1420)
+            HStack(alignment: .top, spacing: 16) {
+                ForEach(sheets.indices, id: \.self) { i in
+                    KeyringSheet(model: model, unlock: sheets[i])
+                        .background(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.4)))
+                }
+            }
+        }
+        .padding(16)
+        .background(Color(nsColor: .windowBackgroundColor))
+        return wrote(out, png(view, size: nil, dark: dark, to: out))
+    }
+
     /// A sheet drawn offscreen into a PNG at `out`: the file at `path` decoded as T and handed to `sheet` with a board
-    /// that saves nothing (the shared body of --render-switch, --render-restart, --render-time and --render-usage). 0, or 1 with the
+    /// that saves nothing (the shared body of --render-switch, --render-restart, --render-time, --render-usage and
+    /// --render-chats). 0, or 1 with the
     /// reason on stderr.
     static func renderSheet<T: Decodable, V: View>(_ path: String, as type: T.Type, to out: String, size: CGSize?, dark: Bool,
                                                    sheet: (T, BoardModel) -> V) -> Int32 {
@@ -126,18 +242,15 @@ enum Renderer {
         return (win, host)
     }
 
-    /// What `host` draws, as a PNG at `out`, with `over` drawn on top: pictures that another process draws (WebKit's),
-    /// each in its rectangle in window coordinates. 0, or 1 with the reason on stderr.
-    static func write(_ host: NSView, to out: String, over: [(NSImage, NSRect)] = []) -> Int32 {
+    /// What `host` draws, as a PNG at `out`. 0, or 1 with the reason on stderr.
+    static func write(_ host: NSView, to out: String) -> Int32 {
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return fail("cannot draw the view") }
         host.cacheDisplay(in: host.bounds, to: rep)
-        if !over.isEmpty {
-            guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return fail("cannot draw over the view") }
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = context
-            for (image, rect) in over { image.draw(in: rect) }
-            NSGraphicsContext.restoreGraphicsState()
-        }
+        return write(rep, to: out)
+    }
+
+    /// `rep` as a PNG at `out`. 0, or 1 with the reason on stderr.
+    static func write(_ rep: NSBitmapImageRep, to out: String) -> Int32 {
         guard let data = rep.representation(using: .png, properties: [:]) else { return fail("cannot encode the PNG") }
         do {
             try data.write(to: URL(fileURLWithPath: out))
@@ -150,12 +263,20 @@ enum Renderer {
     /// The Mail tab over a saved mail_list answer, with the threads of saved mail_show answers opened one after
     /// another and then the first again, once the tab has listed them and started its web view (MailWeb.warm): the
     /// real views and model (reading ahead and keeping threads as the app does), with the files answering for the
-    /// desktop (each mail_show by its thread, every mark "ok"). Either kind of
-    /// file may be the board action's answer or `agent-mail mailbox`'s own output, which has no "ok". It prints how
-    /// long each thread took from being opened to its document in WebKit's page (its first message there), and draws
+    /// desktop (MailStandIn). It prints how long each thread took from being opened to its document in WebKit's page
+    /// (its first message there), how many of its widgets were drawn and of its draft's comments highlighted, and draws
     /// the tab as it ends; WebKit draws the document in its own process, so it is captured with takeSnapshot and drawn
-    /// over the rest.
-    static func renderMail(list listPath: String, shows showPaths: [String], to out: String, dark: Bool) -> Int32 {
+    /// over the rest (picture). `snapshot`: a saved
+    /// snapshot whose agents (and their states) the board has, for the threads' busy dots; without one the board has
+    /// no agents. `drafts`: a saved drafts.json, copied into the render's own drafts folder, so the threads have those
+    /// replies (their answers shown on the cards, their comments highlighted); without one there are none.
+    /// `archive`: the open thread is then archived, as e does, so the Undo bar shows, with no thread open (the tab says
+    /// so where the thread was). `popout`: the last thread given is then popped out into a
+    /// window of its own (MailWindows, off screen), drawn with its title bar beside the tab; it prints how long that
+    /// thread took to reach the window's page, in the window's new web view.
+    static func renderMail(list listPath: String, shows showPaths: [String], to out: String, dark: Bool,
+                           snapshot snapshotPath: String? = nil, drafts draftsPath: String? = nil,
+                           archive: Bool = false, popout: Bool = false) -> Int32 {
         func answer(_ path: String) -> [String: Any]? {
             guard let d = FileManager.default.contents(atPath: path),
                   var obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return nil }
@@ -176,22 +297,33 @@ enum Renderer {
             saved[s.thread.id] = a
         }
         guard let firstShow = shows.first else { return fail("--render-mail needs a mail_show answer") }
-        let marked: [String: Any] = ["ok": true, "threads": [Any]()]
-        let mail = MailModel(call: { request, done in
-            let action = request["action"] as? String ?? ""
-            let thread = request["thread"] as? String
-            let reply: [String: Any]? = action == "mail_show" ? thread.flatMap { saved[$0] }
-                : action == "mail_list" ? listAnswer : action == "mail_mark" ? marked : nil
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    done(reply, reply == nil ? "--render-mail has no answer for \(action) \(thread ?? "")" : nil)
-                }
+        let draftsFolder = MailDrafts.scratchFolder()       // the render's own; saved drafts given are copied into it
+        if let path = draftsPath {
+            do {
+                try FileManager.default.createDirectory(at: draftsFolder, withIntermediateDirectories: true)
+                try FileManager.default.copyItem(at: URL(fileURLWithPath: path),
+                                                 to: draftsFolder.appendingPathComponent("drafts.json"))
+            } catch {
+                return fail("the saved drafts were not copied: \(error.localizedDescription)")
             }
-        }, upload: { _, done in MainActor.assumeIsolated { done(nil, "--render-mail copies nothing to the desktop") } },
-           ahead: MailModel.appAhead, cacheBytes: MailModel.appCacheBytes, draftsFolder: MailDrafts.scratchFolder())
-        let summary: [String: Any] = ["generated": Date().timeIntervalSince1970, "agents": [Any](), "timeline": [Any](),
-                                      "mail": ["held": [Any](), "held_count": 0],
-                                      "mailbox": ["unread": list.counts?.unread ?? 0, "inbox": list.counts?.inbox ?? 0]]
+        }
+        let desktop = MailStandIn(list: listAnswer, shows: saved, name: "--render-mail")
+        let mail = MailModel(call: desktop.call, upload: { _, done in
+            MainActor.assumeIsolated { done(nil, "--render-mail copies nothing to the desktop") }
+        }, ahead: MailModel.appAhead, cacheBytes: MailModel.appCacheBytes, draftsFolder: draftsFolder)
+        if let why = mail.drafts.loadProblem { return fail("the saved drafts were not read: \(why)") }
+        var summary: [String: Any] = ["generated": Date().timeIntervalSince1970, "agents": [Any](), "timeline": [Any](),
+                                      "mail": ["held": [Any](), "held_count": 0]]
+        if let path = snapshotPath {
+            guard let d = FileManager.default.contents(atPath: path),
+                  let saved = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
+                return fail("cannot read a JSON object from \(path)")
+            }
+            summary = saved
+        }
+        if summary["mailbox"] == nil {
+            summary["mailbox"] = ["unread": list.counts?.unread ?? 0, "inbox": list.counts?.inbox ?? 0]
+        }
         let snap: Snapshot
         do {
             snap = try JSON.decoder.decode(Snapshot.self, from: JSONSerialization.data(withJSONObject: summary))
@@ -209,21 +341,27 @@ enum Renderer {
         return withExtendedLifetime(win) {
             guard wait(5, step: 0.05, until: { mail.threads != nil }) else { return fail("the Mail tab did not list the saved threads") }
             guard wait(15, step: 0.05, until: { MailWeb.loader.ready }) else { return fail("the web view did not start in 15 s") }
-            var page: WKWebView?
-            for s in shows + [firstShow] {
-                let asked = Date()
-                mail.open(s.thread.id)
+            /// The web view once thread `s` is shown and its document in the page, or why not.
+            @MainActor func reached(_ s: MailShow) -> (WKWebView?, String?) {
                 // a thread kept already shows at once, before SwiftUI has put the web view in the window: wait for both
                 var shown: WKWebView?
                 guard wait(15, step: 0.002, until: {
                     shown = find(WKWebView.self, in: host)
                     return mail.shown?.thread.id == s.thread.id && shown != nil
                 }), let web = shown else {
-                    return fail("thread \(s.thread.id) was not shown in 15 s" + (mail.threadError.map { ": " + $0 } ?? ""))
+                    return (nil, "thread \(s.thread.id) was not shown in 15 s" + (mail.threadError.map { ": " + $0 } ?? ""))
                 }
                 guard inPage(web, id: s.messages[0].key, within: 15) else {
-                    return fail("thread \(s.thread.id)'s document did not reach the page in 15 s" + (mail.notice.map { ": " + $0 } ?? ""))
+                    return (nil, "thread \(s.thread.id)'s document did not reach the page in 15 s" + (mail.notice.map { ": " + $0 } ?? ""))
                 }
+                return (web, nil)
+            }
+            var page: WKWebView?
+            for s in shows + [firstShow] {
+                let asked = Date()
+                mail.open(s.thread.id)
+                let (reach, why) = reached(s)
+                guard let web = reach else { return fail(why ?? "") }
                 print(String(format: "thread %@ (%d characters) in the page %.3f s after it was opened",
                              s.thread.id, s.document.utf16.count, Date().timeIntervalSince(asked)))
                 if !s.widgets.isEmpty {
@@ -231,20 +369,116 @@ enum Renderer {
                     print("thread \(s.thread.id): \(drawn) of \(s.widgets.count) widgets drawn"
                           + (drawn < s.widgets.count ? " (" + (mail.notice ?? "no reason given") + ")" : ""))
                 }
+                let comments = Set(mail.draft(for: s.thread.id).comments.map(\.id))
+                if !comments.isEmpty {
+                    var lit = 0
+                    _ = wait(5, step: 0.01) {
+                        lit = evaluate("new Set(Array.prototype.map.call(document.querySelectorAll('mark[data-abk-comment]'), "
+                                       + "function (m) { return m.getAttribute('data-abk-comment'); })).size",
+                                       in: web, within: 5) as? Int ?? 0
+                        return lit >= comments.count
+                    }
+                    print("thread \(s.thread.id): \(lit) of \(comments.count) comments highlighted")
+                }
                 page = web
             }
-            guard let web = page else { return fail("no document was shown") }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.5))     // its layout, and the scroll to the open message
-            final class Taken { var image: NSImage?; var error: Error?; var done = false }
+            if archive {
+                mail.archiveOrRestore()
+                guard wait(5, step: 0.05, until: { !mail.undos.isEmpty && mail.tab == nil }) else {
+                    return fail("thread \(firstShow.thread.id)'s archive was not offered to Undo" + (mail.notice.map { ": " + $0 } ?? ""))
+                }
+                page = nil                                          // no thread open: the tab shows no document
+            }
+            let webs = page.map { [$0] } ?? []
+            guard let popped = popout ? shows.last : nil else {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.5))  // its layout, and the scroll to the open message
+                let (tab, why) = picture(host, webs: webs)
+                guard let image = tab else { return fail(why ?? "") }
+                let code = write(image, to: out)
+                if code == 0 { print("wrote \(out) (\(list.threads.count) threads, thread \(mail.selected ?? "none") open)") }
+                return code
+            }
+            // the last thread given, popped out into a window of its own, drawn beside the tab
+            let windows = MailWindows(mail: mail, zoom: model.$zoom.eraseToAnyPublisher(), onScreen: false)
+            let id = popped.thread.id
+            let asked = Date()
+            mail.popOut(id)
+            var popWeb: MailWebView?
+            guard wait(15, step: 0.002, until: {
+                popWeb = windows.windows[id]?.contentView.flatMap { find(MailWebView.self, in: $0) }
+                return mail.popouts[id]?.shown != nil && popWeb != nil
+            }), let other = popWeb, let window = windows.windows[id], let frame = window.contentView?.superview else {
+                return fail("thread \(id) was not popped out in 15 s" + (mail.popouts[id]?.error.map { ": " + $0 } ?? ""))
+            }
+            window.appearance = win.appearance               // the render's light or dark, not this Mac's
+            guard inPage(other, id: popped.messages[0].key, within: 15) else {
+                return fail("thread \(id)'s document did not reach its window's page in 15 s")
+            }
+            print(String(format: "thread %@ in its own window's page %.3f s after it was popped out (a new web view)",
+                         id, Date().timeIntervalSince(asked)))
+            if !popped.widgets.isEmpty {
+                print("thread \(id) in its window: \(widgetsDrawn(other, want: popped.widgets.count, within: 10)) of "
+                      + "\(popped.widgets.count) widgets drawn")
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+            let (tab, tabWhy) = picture(host, webs: webs)
+            let (pop, popWhy) = picture(frame, webs: [other])
+            guard let left = tab, let right = pop else { return fail(tabWhy ?? popWhy ?? "") }
+            guard let both = side(left, right) else { return fail("cannot make the picture of both") }
+            let code = withExtendedLifetime(windows) { write(both, to: out) }
+            if code == 0 {
+                print("wrote \(out) (\(list.threads.count) threads, thread \(mail.selected ?? "none") open in the tab, "
+                      + "thread \(id) in its window, titled “\(window.title)”)")
+            }
+            return code
+        }
+    }
+
+    /// What `view` draws, with what each of `webs` shows drawn over it: WebKit draws in its own process, so each is
+    /// captured with takeSnapshot and drawn in its place (window coordinates, which are `view`'s: the window's content
+    /// view, or the frame view round it). nil, and why, when one could not be captured.
+    static func picture(_ view: NSView, webs: [WKWebView]) -> (NSBitmapImageRep?, String?) {
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return (nil, "cannot draw the view") }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        final class Taken { var image: NSImage?; var error: Error?; var done = false }
+        var over: [(NSImage, NSRect)] = []
+        for web in webs {
             let taken = Taken()
             web.takeSnapshot(with: nil) { image, error in taken.image = image; taken.error = error; taken.done = true }
             guard wait(10, step: 0.05, until: { taken.done }), let image = taken.image else {
-                return fail("the document could not be captured: \(taken.error?.localizedDescription ?? "no picture in 10 s")")
+                return (nil, "the document could not be captured: \(taken.error?.localizedDescription ?? "no picture in 10 s")")
             }
-            let code = write(host, to: out, over: [(image, web.convert(web.bounds, to: nil))])
-            if code == 0 { print("wrote \(out) (\(list.threads.count) threads, thread \(firstShow.thread.id) open)") }
-            return code
+            over.append((image, web.convert(web.bounds, to: nil)))
         }
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return (nil, "cannot draw over the view") }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        for (image, rect) in over { image.draw(in: rect) }
+        NSGraphicsContext.restoreGraphicsState()
+        return (rep, nil)
+    }
+
+    /// `left` and `right` side by side, tops aligned, on a grey ground with room round them; nil when no bitmap can be
+    /// made for them.
+    static func side(_ left: NSBitmapImageRep, _ right: NSBitmapImageRep) -> NSBitmapImageRep? {
+        let room: CGFloat = 28
+        let size = NSSize(width: left.size.width + right.size.width + 3 * room,
+                          height: max(left.size.height, right.size.height) + 2 * room)
+        let scale = CGFloat(left.pixelsWide) / left.size.width
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale),
+                                         pixelsHigh: Int(size.height * scale), bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0,
+                                         bitsPerPixel: 0), let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        rep.size = size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        NSColor(white: 0.5, alpha: 1).setFill()
+        NSRect(origin: .zero, size: size).fill()
+        left.draw(in: NSRect(x: room, y: size.height - room - left.size.height, width: left.size.width, height: left.size.height))
+        right.draw(in: NSRect(x: 2 * room + left.size.width, y: size.height - room - right.size.height,
+                              width: right.size.width, height: right.size.height))
+        NSGraphicsContext.restoreGraphicsState()
+        return rep
     }
 
     /// What `source` evaluates to in `web`'s page, once its answer comes or `seconds` pass (nil without one).
@@ -252,6 +486,20 @@ enum Renderer {
         final class Got { var value: Any?; var done = false }
         let got = Got()
         web.evaluateJavaScript(source) { v, _ in got.value = v; got.done = true }
+        _ = wait(seconds, step: 0.002) { got.done }
+        return got.value
+    }
+
+    /// What the function body `source` returns, called with `arguments` in content world `world` of `web`'s page, once
+    /// its answer comes or `seconds` pass (nil without one, or when it throws).
+    static func evaluate(_ source: String, arguments: [String: Any], in web: WKWebView, world: WKContentWorld,
+                         within seconds: Double) -> Any? {
+        final class Got { var value: Any?; var done = false }
+        let got = Got()
+        web.callAsyncJavaScript(source, arguments: arguments, in: nil, in: world) { result in
+            if case .success(let v) = result { got.value = v }
+            got.done = true
+        }
         _ = wait(seconds, step: 0.002) { got.done }
         return got.value
     }
@@ -285,10 +533,11 @@ enum Renderer {
     }
 
     /// The first view of type T in `view`'s tree, `view` included.
-    static func find<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
-        if let v = view as? T { return v }
-        for sub in view.subviews { if let v = find(type, in: sub) { return v } }
-        return nil
+    static func find<T: NSView>(_ type: T.Type, in view: NSView) -> T? { all(type, in: view).first }
+
+    /// Every view of type T in `view`'s tree, `view` included, depth first.
+    static func all<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
+        ((view as? T).map { [$0] } ?? []) + view.subviews.flatMap { all(type, in: $0) }
     }
 
     static func fail(_ message: String) -> Int32 {
@@ -316,6 +565,119 @@ enum Renderer {
             try? png.write(to: URL(fileURLWithPath: "\(dir)/icon_\(name).png"))
         }
         return 0
+    }
+}
+
+/// A stand-in desktop for the Mail tab in renders and self-tests: mail_list answered from a saved list, mail_show from
+/// saved answers by thread, mail_mark by changing the thread's row as the tab shows a change (MailRules.changed), which
+/// later lists then give (less the threads a mark has moved out of the box asked for), and mail_fast by giving the row
+/// a fast mode of fastMinutes, its effort still to be lowered (as the mailroom answers), or none. Each answer comes on
+/// the main queue's next turn, as the desktop's do over the stream; anything else is refused, in `name`'s words. Either
+/// kind of saved answer may be the board action's or `agent-mail mailbox`'s own output, which has no "ok". It keeps
+/// every request, in order.
+@MainActor
+final class MailStandIn {
+    private(set) var asked: [[String: Any]] = []
+    private let list: [String: Any]
+    private let shows: [String: [String: Any]]
+    private let name: String
+    private var rows: [String: [String: Any]]       // each thread's row: the list's, else its SHOW's, as marked
+    private var order: [String] = []                // the list's threads, in its order
+    private var moved: Set<String> = []             // threads a mark has moved to another box
+
+    init(list: [String: Any], shows: [String: [String: Any]], name: String) {
+        self.list = list
+        self.shows = shows
+        self.name = name
+        rows = shows.compactMapValues { $0["thread"] as? [String: Any] }
+        for case let t as [String: Any] in list["threads"] as? [Any] ?? [] {
+            if let id = t["id"] as? String { rows[id] = t; order.append(id) }
+        }
+    }
+
+    /// The requests asked for `action`.
+    func asked(_ action: String) -> [[String: Any]] { asked.filter { $0["action"] as? String == action } }
+
+    /// How the model reaches it (MailModel.Call), which keeps it.
+    var call: MailModel.Call {
+        { request, done in
+            MainActor.assumeIsolated {
+                self.asked.append(request)
+                let action = request["action"] as? String ?? ""
+                let thread = request["thread"] as? String ?? (request["threads"] as? [String])?.first
+                var reply: [String: Any]?
+                switch action {
+                case "mail_show": reply = thread.flatMap(self.show)
+                case "mail_list": reply = self.listing(request)
+                case "mail_mark": reply = self.mark(request)
+                case "mail_fast": reply = self.fast(request)
+                case "mail_researcher": reply = self.researcher(request)
+                default: reply = nil
+                }
+                let why = reply == nil ? "\(self.name) has no answer for \(action) \(thread ?? "")" : nil
+                DispatchQueue.main.async { MainActor.assumeIsolated { done(reply, why) } }
+            }
+        }
+    }
+
+    private func show(_ id: String) -> [String: Any]? {
+        guard var answer = shows[id], var thread = answer["thread"] as? [String: Any], let row = rows[id] else {
+            return nil
+        }
+        for field in ["box", "unread", "snooze_until", "fast", "researcher"] {
+            thread[field] = row[field]
+        }
+        answer["thread"] = thread
+        answer["ok"] = true
+        return answer
+    }
+
+    private func mark(_ request: [String: Any]) -> [String: Any]? {
+        guard let id = (request["threads"] as? [String])?.first, var row = rows[id],
+              let op = (request["op"] as? String).flatMap(MailOp.init(rawValue:)),
+              let data = try? JSONSerialization.data(withJSONObject: row),
+              let t = try? JSON.decoder.decode(MailboxThread.self, from: data) else { return nil }
+        let n = MailRules.changed(t, op, until: request["until"] as? Double)
+        if n.box != t.box { moved.insert(id) }
+        row["unread"] = n.unread
+        row["box"] = n.box
+        row["snooze_until"] = n.snoozeUntil ?? NSNull()
+        rows[id] = row
+        return ["ok": true, "threads": [row]]
+    }
+
+    /// The minutes a fast mode switched on here lasts: the mailroom's default (its mailbox.fast_minutes).
+    static let fastMinutes = 5.0
+
+    private func fast(_ request: [String: Any]) -> [String: Any]? {
+        guard let id = request["thread"] as? String, var row = rows[id], let on = request["on"] as? Bool else { return nil }
+        let now = Date().timeIntervalSince1970
+        row["fast"] = on ? ["since": now, "until": now + 60 * MailStandIn.fastMinutes, "minutes": MailStandIn.fastMinutes,
+                            "agent": "alpha", "effort": "lowering", "was": "xhigh",
+                            "note": "Back to xhigh when fast mode ends."] as [String: Any] : NSNull()
+        rows[id] = row
+        return ["ok": true, "thread": row]
+    }
+
+    private func researcher(_ request: [String: Any]) -> [String: Any]? {
+        guard let id = request["thread"] as? String, var row = rows[id], let on = request["on"] as? Bool,
+              let tag = request["expected_tag"] as? String, var state = row["researcher"] as? [String: Any],
+              state["tag"] as? String == tag else { return nil }
+        state["on"] = on
+        state["delivery"] = "pending"
+        row["researcher"] = state
+        rows[id] = row
+        return ["ok": true, "thread": row]
+    }
+
+    private func listing(_ request: [String: Any]) -> [String: Any] {
+        let box = request["box"] as? String
+        var answer = list
+        answer["ok"] = true
+        answer["threads"] = order.compactMap { rows[$0] }.filter {
+            box == MailBox.all.rawValue || !moved.contains($0["id"] as? String ?? "") || $0["box"] as? String == box
+        }
+        return answer
     }
 }
 
@@ -470,7 +832,7 @@ enum KeyTest {
         // ⌘↩ in a dialog's text box presses its main button; plain Return still types a newline
         let (_, box) = textArea(width: 200, height: 80)
         var submitted = 0
-        box.onSubmit = { submitted += 1 }
+        box.submit = { submitted += 1 }
         func key(_ code: UInt16, _ flags: NSEvent.ModifierFlags) {
             if let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0,
                                         context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: code) {
@@ -479,9 +841,66 @@ enum KeyTest {
         }
         key(36, [.command]); key(76, [.command]); key(36, [])
         print("⌘↩ submits: \(submitted == 2) · Return types a newline: \(box.string == "\n")")
-        let ok = results.map { $0.1 } == [1.1, 1.25, 1.1, 1.0] && submitted == 2 && box.string == "\n"
+        let fails = dialogFiles()
+        fails.forEach { print("FAILED: dialog files: " + $0) }
+        let ok = results.map { $0.1 } == [1.1, 1.25, 1.1, 1.0] && submitted == 2 && box.string == "\n" && fails.isEmpty
         print(ok ? "keys OK" : "keys FAILED")
         return ok ? 0 : 1
+    }
+
+    /// A dialog's files (Dialogs.filesRow, MessageFiles): an image or a file on a pasteboard is taken, text is left to
+    /// be typed; each is named and sent as base64, within a reply's limits, a refusal said under the text in red; Remove
+    /// shows only with files, and takes them all out. What failed, else [].
+    static func dialogFiles() -> [String] {
+        var fails: [String] = []
+        func check(_ ok: Bool, _ what: String) { if !ok { fails.append(what) } }
+        let files = MessageFiles()
+        let (scroll, text) = textArea(width: 300, height: 80)
+        let (row, take) = Dialogs.filesRow(scroll, files, width: 300)
+        // Paste (⌘V) is offered only when the clipboard holds a type the box reads: a screenshot copied to it is an
+        // image alone, so a box that takes files reads images too; one that does not, only what a text box reads
+        check(!textArea(width: 300, height: 80).1.readablePasteboardTypes.contains(.png), "a text-only box reads no image")
+        text.take = take
+        check([.png, .tiff].allSatisfy(text.readablePasteboardTypes.contains),
+              "a box that takes files reads images, so Paste is offered for a screenshot: "
+              + text.readablePasteboardTypes.map(\.rawValue).joined(separator: ", "))
+        let label = row.subviews.compactMap { $0 as? NSTextField }.first
+        let remove = row.subviews.compactMap { $0 as? NSButton }.first { $0.title == "Remove" }
+        check(remove?.isHidden == true && label?.stringValue == files.summary,
+              "no files: Remove hidden, the label says what to do: \(label?.stringValue ?? "no label")")
+        let pb = NSPasteboard(name: NSPasteboard.Name("agentboard-keytest-\(UUID().uuidString)"))   // never the owner's clipboard
+        defer { pb.releaseGlobally() }
+        pb.clearContents()
+        pb.setString("words", forType: .string)
+        check(!take(pb) && files.files.isEmpty, "text on the pasteboard is left to be typed")
+        pb.clearContents()
+        pb.setData(Data([0x89, 0x50]), forType: .png)
+        check(take(pb) && files.files.map(\.data) == [Data([0x89, 0x50])]
+              && files.files.first?.name.hasPrefix("Pasted image ") == true, "an image is taken: \(files.files.map(\.name))")
+        check(remove?.isHidden == false && label?.stringValue.hasPrefix("1 file, ") == true,
+              "and named under the text: \(label?.stringValue ?? "")")
+        check(files.request == [["name": files.files.first?.name ?? "", "data": "iVA="]], "sent as base64: \(files.request)")
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("agentboard-keytest-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }           // this test's own folder
+        let csv = folder.appendingPathComponent("data.csv")
+        try? Data("a,b\n".utf8).write(to: csv)
+        check(files.add([.file(csv)], at: Date()) == nil && files.files.last?.name == "data.csv"
+              && files.files.last?.data == Data("a,b\n".utf8), "a file is read, under its own name")
+        check(files.add([.file(folder)], at: Date())?.contains("is not a file (a folder?)") == true && files.files.count == 2,
+              "a folder is refused, and nothing added")
+        check(files.add(Array(repeating: .image(Data([0])), count: MailModel.maxFiles - 1), at: Date())?
+                .contains("at most \(MailModel.maxFiles) files") == true && files.files.count == 2, "too many files")
+        check(files.add([.image(Data(count: MailModel.maxFileBytes))], at: Date())?.contains("a message carries at most")
+              == true && files.files.count == 2, "too many bytes")
+        files.removeAll()
+        check(files.files.isEmpty && remove?.isHidden == true, "Remove takes them all out")
+        pb.clearContents()
+        pb.writeObjects([folder as NSURL])
+        check(take(pb) && files.files.isEmpty && label?.textColor == .systemRed
+              && label?.stringValue.contains("is not a file") == true, "a refusal is said under the text, in red: "
+              + (label?.stringValue ?? ""))
+        return fails
     }
 }
 

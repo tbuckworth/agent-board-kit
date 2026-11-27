@@ -2,6 +2,7 @@
 """agent-orchestrate: run the orchestrator once, on one event, with a fresh context.
 
     agent-orchestrate [--source LABEL] [--json] "event text"   # or the text on stdin; LABEL: mail, peer, manual
+    agent-orchestrate [--source LABEL] --input-json < event.json   # {"text": ..., "files": [{"name", "data"}]}
     agent-orchestrate --runs [--limit N]      # recent runs: cost, turns, outcome
     agent-orchestrate --show-command          # the claude command an event runs
 
@@ -15,7 +16,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import config, orchestrate, piped  # noqa: E402
+from agentmail import config, mailbox, orchestrate, piped, replyfiles  # noqa: E402
 
 
 def main(argv=None):
@@ -27,6 +28,10 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--show-command", action="store_true")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--input-json", action="store_true",
+                    help='read the event and its files from stdin, {"text": TEXT, "files": [{"name": NAME, "data": '
+                         'BASE64}, ...]} as a Mail-tab reply gives them: the files are saved, as config owner_name\'s, '
+                         'and the event ends with their paths')
     a = ap.parse_args(argv)
     cfg = config.load()
 
@@ -45,12 +50,27 @@ def main(argv=None):
         print("total logged cost: $%.2f over %d runs" % (total, len(runs)))
         return 0
 
-    text = " ".join(a.text).strip()
-    if not text:
-        text = (piped.piped_text() or "").strip()       # only what was piped in: never the tool's open socket
-    if not text:
+    files = []
+    if a.input_json:
+        if a.text:
+            print("agent-orchestrate: with --input-json the event is in the JSON on stdin, not on the command line",
+                  file=sys.stderr)
+            return 1
+        try:
+            text, files = mailbox.piped_input("the message")
+        except mailbox.MailError as e:
+            print("agent-orchestrate: --input-json: %s" % e, file=sys.stderr)
+            return 1
+        text = text.strip()
+    else:
+        text = " ".join(a.text).strip()
+        if not text:
+            text = (piped.piped_text() or "").strip()       # only what was piped in: never the tool's open socket
+    if not text and not files:
         print("agent-orchestrate: no event text", file=sys.stderr)
         return 1
+    if files:
+        text = replyfiles.with_lines(text, replyfiles.attach(replyfiles.FILES_DIR, files, cfg["owner_name"]))
     info = orchestrate.run_event(text, a.source, cfg)
     if a.json:
         print(json.dumps(info, indent=2))

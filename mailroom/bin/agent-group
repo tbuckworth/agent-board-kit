@@ -3,13 +3,13 @@
 
     agent-group new TITLE [--with NAME[@HOST],...] [--task TASK] [--json] [--id GROUP]   # you, them and the owner
     agent-group new TITLE --with NAME[@HOST],... --for-mail N   # the orchestrator: the group the owner's mail N asks for
-    agent-group post GROUP [TEXT...] [--reply-to POST] [--id POST]  # or the text on stdin
+    agent-group post GROUP [TEXT...] [--topic=ID | --new-topic TITLE] [--reply-to=POST] [--id POST]  # or stdin
     agent-group inbox [GROUP] [--recent]       # your unread posts, oldest first, then read; --recent: the last 20
-    agent-group show GROUP [--json]            # members, maker, your alert setting and unread count
-    agent-group alerts GROUP all|named|never   # which agents' posts wake you; the owner's always do
-    agent-group add GROUP NAME[@HOST],...      # the group's maker, while a member, or the owner
-    agent-group remove GROUP NAME[@HOST],...
-    agent-group set GROUP [--title TITLE] [--with NAME[@HOST],...] [--json]   # the same: title, exact members
+    agent-group show GROUP [--json]            # members, maker, topics, your alert settings and unread count
+    agent-group alerts GROUP all|addressed|named|joined|never [--topic=ID]   # which posts wake you; the owner's always do
+    agent-group add GROUP NAME[@HOST],...      # its maker while a member, or the owner; any member may add agents
+    agent-group remove GROUP NAME[@HOST],...   # its maker while a member, or the owner
+    agent-group set GROUP [--title TITLE] [--with NAME[@HOST],...] [--json]   # title, exact members
     agent-group leave GROUP
     agent-group list [--json]
     agent-group posts GROUP [--since POST] [--json]   # read without marking anything read (the board)
@@ -19,7 +19,8 @@
 Who you are: this Claude or Codex session (CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID), --session NAME_OR_ID (with
 --cli claude|codex to look in one CLI's sessions only), or --as owner, which is refused inside an agent session.
 GROUP: its id, or 4 or more of its first characters or its title among your groups. A bare NAME is on this
-machine. On a machine with config mail_proxy (the Mac) every command runs on the desktop.
+machine; HOST is one of the owner's machines (config host_id and remote_hosts). On a machine with config mail_proxy
+(the Mac) every command runs on the desktop.
 The owner may post but does not follow groups: never rely on a post reaching them, and send them what they must
 know, decide or do by email. Details: README.md, section "Groups".
 """
@@ -83,7 +84,8 @@ def arguments(a):
                 text = (piped.piped_text() or "").strip()   # only what was piped in: never the tool's open socket
             except TimeoutError as e:
                 die("no post: %s; pass the text as arguments" % e)
-        return {"group": a.group, "text": text, "reply_to": a.reply_to, "post_id": a.id or groups.new_id()}
+        return {"group": a.group, "text": text, "reply_to": a.reply_to, "post_id": a.id or groups.new_id(),
+                "topic": a.topic, "new_topic": a.new_topic}
     if a.cmd in ("hide", "unhide"):
         return {"group": a.group, "hidden": a.cmd == "hide"}
     if a.cmd == "new":
@@ -93,8 +95,8 @@ def arguments(a):
 
 
 def for_mail(cfg, a, args):
-    """new --for-mail N: the orchestrator makes the group the owner's mail N asks for, as theirs, with the id derived from
-    the mail (groupmail.request_mail says when it may). Returns the actor; sets args' group id."""
+    """new --for-mail N: the orchestrator makes the group the owner's mail N asks for, as theirs, with the id derived
+    from the mail (groupmail.request_mail says when it may). Returns the actor; sets args' group id."""
     if cfg.get("mail_proxy"):
         die("--for-mail runs on the central mailroom, where the orchestrator runs")
     if os.environ.get("AGENT_ORCHESTRATOR") != "1":
@@ -160,8 +162,13 @@ def main(argv=None):
     p = sub.add_parser("post", parents=[who], help="post in a group")
     p.add_argument("group")
     p.add_argument("text", nargs="*", help="the post (or pipe it on stdin)")
-    p.add_argument("--reply-to", metavar="POST", help="the id of the post this answers")
+    p.add_argument("--reply-to", metavar="POST", help="the id of the post this answers, whose topic it stays in")
     p.add_argument("--id", metavar="POST", help="the post's id, to retry a post whose outcome is unknown")
+    in_topic = p.add_mutually_exclusive_group()
+    in_topic.add_argument("--topic", metavar="ID", help="post in this topic")
+    in_topic.add_argument("--new-topic", metavar="TITLE",
+                          help="open a topic with this title; an agent's goes in the group's topic of that title, if "
+                               "it has one")
     p = sub.add_parser("inbox", parents=[who], help="your unread posts, which are then marked read")
     p.add_argument("group", nargs="?")
     p.add_argument("--recent", action="store_true", help="the last %d posts, read or not" % groupcmd.RECENT)
@@ -170,15 +177,19 @@ def main(argv=None):
     p = sub.add_parser("alerts", parents=[who], help="which posts in a group wake you")
     p.add_argument("group")
     p.add_argument("alerts", choices=groups.ALERTS)
-    for name, what in (("add", "add agents"), ("remove", "remove agents")):
-        p = sub.add_parser(name, parents=[who], help=what + " (the maker or the owner)")
+    p.add_argument("--topic", metavar="ID", help="for this topic only, until your next setting for the group")
+    for name, what in (("add", "add agents (the maker or the owner; any member may add agents)"),
+                       ("remove", "remove agents (the maker or the owner)")):
+        p = sub.add_parser(name, parents=[who], help=what)
         p.add_argument("group")
         p.add_argument("members", metavar="NAME[@HOST],...")
     p = sub.add_parser("set", parents=[who, as_json],
-                       help="set a group's title and exact members, writing nothing if unchanged (the maker or the owner)")
+                       help="set a group's title and exact members, writing nothing if unchanged (the maker or the "
+                            "owner; any member may add agents)")
     p.add_argument("group")
     p.add_argument("--title")
-    p.add_argument("--with", dest="members", metavar="NAME[@HOST],...", help='every member ("" for none)')
+    p.add_argument("--with", dest="members", metavar="NAME[@HOST],...",
+                   help='every member ("" for none)')
     p = sub.add_parser("leave", parents=[who], help="leave a group")
     p.add_argument("group")
     sub.add_parser("list", parents=[who, as_json], help="your groups (the owner: all)")

@@ -1,8 +1,11 @@
 import email
 import email.policy
+import html
 import os
+import re
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -15,13 +18,12 @@ import fakes  # noqa: E402
 import homes  # noqa: E402
 from scripts import load_script  # noqa: E402
 from agentmail import config, outbound, piped  # noqa: E402
-from agentmail.compose import CODE_STYLE, cut_items, html_to_text, text_to_html  # noqa: E402
+from agentmail.compose import CODE_STYLE, LINK_STYLE, cut_items, html_to_text, placed_images, text_to_html  # noqa: E402
 from agentmail.store import Store  # noqa: E402
 
 
 def strip_styles(fragment):
     """The fragment without style attributes, so a test reads the structure."""
-    import re
     return re.sub(r' style="(?!text-align)[^"]*"', "", re.sub(r'style="[^"]*?(text-align: \w+;)"', r'style="\1"', fragment))
 
 
@@ -191,8 +193,10 @@ class TextToHtml(unittest.TestCase):
         b = strip_styles(body_of(text_to_html("*`code`* and *[x](https://a.b)*")))
         self.assertEqual(b, '<p><i><code>code</code></i> and <i><a href="https://a.b">x</a></i></p>')
         self.assertIn(r"\\server\share and grep \(a\)", body_of(text_to_html(r"\\server\share and grep \(a\)")))
+        # the escaped [ is no link markup; the address inside is linked as a bare one (BareAddresses)
         self.assertEqual(body_of(text_to_html("\\*not italic\\* and \\[x](https://a.b) and `\\*`")),
-                         '<p>*not italic* and [x](https://a.b) and <code style="%s">\\*</code></p>' % CODE_STYLE)
+                         '<p>*not italic* and [x](<a href="https://a.b" style="%s">https://a.b</a>) and '
+                         '<code style="%s">\\*</code></p>' % (LINK_STYLE, CODE_STYLE))
         self.assertEqual(body_of(text_to_html("***both*** and **bold *it* inside**")),
                          "<p><b><i>both</i></b> and <b>bold <i>it</i> inside</b></p>")
 
@@ -208,10 +212,132 @@ class TextToHtml(unittest.TestCase):
         self.assertIn("line-height", doc)
 
 
+def links(text):
+    """The paragraph text_to_html makes of one line of text, without styles."""
+    return strip_styles(body_of(text_to_html(text)))
+
+
+def a(url):
+    """The link a bare url becomes (url as typed; the href and the words escaped)."""
+    return '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(url, quote=False))
+
+
+class PlacedImages(unittest.TestCase):
+    """A line of its own `![alt](cid:NAME)` in a plain-text body shows the mail's --image NAME there; one not placed
+    goes at the end, as before; a NAME the mail has no image of is refused before anything is sent."""
+
+    def test_an_image_line_shows_the_image_in_its_place(self):
+        b = body_of(text_to_html("# Result\nThe point.\n  ![Fixes by prompt & model](cid:fill)\nAfter it."))
+        self.assertEqual(strip_styles(b), '<h3>Result</h3>\n<p>The point.</p>\n'
+                         '<p><img src="cid:fill" alt="Fixes by prompt &amp; model"></p>\n<p>After it.</p>')
+        self.assertIn('style="max-width:100%;height:auto"', b)
+        self.assertIn('alt="fill"', body_of(text_to_html("![](cid:fill)")))      # no alt text: the name
+
+    def test_only_a_line_of_its_own_and_never_in_code(self):
+        for text in ("See ![chart](cid:fill) here.", "```\n![chart](cid:fill)\n```", "![chart](https://x.test/a.png)"):
+            with self.subTest(text=text):
+                self.assertNotIn("<img", text_to_html(text))
+                self.assertEqual(placed_images(text), [])
+
+    def test_placed_images_are_not_repeated_at_the_end_and_the_rest_go_there(self):
+        text = "Headline.\n\n![The chart](cid:fill)\n\nMore."
+        doc = outbound.place_images(text_to_html(text), [("fill", b""), ("extra", b"")])
+        self.assertEqual(doc.count("cid:fill"), 1)
+        self.assertLess(doc.index("cid:fill"), doc.index("More."))
+        self.assertGreater(doc.index("cid:extra"), doc.index("More."))
+        self.assertEqual(placed_images(text), ["fill"])
+
+    def test_a_name_with_no_image_is_refused(self):
+        mail = outbound.Mail("Headline.\n\n![The chart](cid:fil)\n", None, [("fill", b"")], [])
+        with self.assertRaisesRegex(outbound.MailError, r"!\[\.\.\.\]\(cid:fil\) names no --image fil \(the mail's: fill\)"):
+            outbound.check_mail(mail)
+        outbound.check_mail(mail._replace(text="Headline.\n\n![The chart](cid:fill)\n"))   # its own: fine
+
+
+class BareAddresses(unittest.TestCase):
+    """An http or https address typed without [text](...) markup is a link, as GitHub's markdown links one."""
+
+    def test_a_bare_address_is_the_same_link_as_one_marked_up_with_itself(self):
+        url = "https://claude.ai/artifact/0b9e1c2d-aa31-4f2e-9d7c-5e6f7a8b9c0d"
+        self.assertEqual(links("The page: %s" % url), "<p>The page: %s</p>" % a(url))
+        self.assertEqual(body_of(text_to_html(url)), body_of(text_to_html("[%s](%s)" % (url, url))))
+        self.assertEqual(links("http://localhost:8080/x and https://b.example"),
+                         "<p>%s and %s</p>" % (a("http://localhost:8080/x"), a("https://b.example")))
+        self.assertEqual(links("HTTPS://Example.com/A"), "<p>%s</p>" % a("HTTPS://Example.com/A"))
+        b = links("# Results at https://x.y/r\n\n- see https://x.y/a\n\n"
+                  "| run | page |\n|---|---|\n| e6 | https://x.y/e6 |")
+        for url in ("https://x.y/r", "https://x.y/a", "https://x.y/e6"):     # in a heading, a list item, a table cell
+            self.assertIn(a(url), b)
+
+    def test_punctuation_after_an_address_stays_outside_it(self):
+        for p in ".,;:!?'*":
+            with self.subTest(p=p):
+                self.assertEqual(links("go to https://x.y/z%s" % p), "<p>go to %s%s</p>" % (a("https://x.y/z"), p))
+        self.assertEqual(links("Is it https://x.y/z?!"), "<p>Is it %s?!</p>" % a("https://x.y/z"))
+        self.assertEqual(links("'https://x.y/z'"), "<p>'%s'</p>" % a("https://x.y/z"))
+        self.assertEqual(links("**https://x.y/z**, and *https://x.y/w*."),
+                         "<p><b>%s</b>, and <i>%s</i>.</p>" % (a("https://x.y/z"), a("https://x.y/w")))
+        self.assertEqual(links("http://localhost:8080/run?id=3:"), "<p>%s:</p>" % a("http://localhost:8080/run?id=3"))
+        for bare in ("https://", "https://.", "see https://?!"):          # no address left once its punctuation goes
+            with self.subTest(bare=bare):
+                self.assertNotIn("<a", links(bare))
+
+    def test_brackets_inside_an_address_stay_and_a_closing_one_without_its_pair_goes(self):
+        wiki = "https://en.wikipedia.org/wiki/Python_(programming_language)"
+        self.assertEqual(links(wiki), "<p>%s</p>" % a(wiki))
+        self.assertEqual(links("(see https://x.y/z)"), "<p>(see %s)</p>" % a("https://x.y/z"))
+        self.assertEqual(links("(see %s)." % wiki), "<p>(see %s).</p>" % a(wiki))
+        self.assertEqual(links("[see https://x.y/z]"), "<p>[see %s]</p>" % a("https://x.y/z"))
+        self.assertEqual(links("https://x.y/a[0]/b"), "<p>%s</p>" % a("https://x.y/a[0]/b"))
+        self.assertEqual(links("http://[::1]:8080/"), "<p>%s</p>" % a("http://[::1]:8080/"))
+        self.assertEqual(links("<https://x.y/z>"), "<p>&lt;%s&gt;</p>" % a("https://x.y/z"))
+        self.assertEqual(links('"https://x.y/z"'), '<p>"%s"</p>' % a("https://x.y/z"))
+        self.assertEqual(links("https://x.y/z)].)"), "<p>%s)].)</p>" % a("https://x.y/z"))
+        start = time.monotonic()                     # a line of closing brackets is trimmed in one pass
+        self.assertEqual(links("https://x.y/z" + ")" * 200000), "<p>%s%s</p>" % (a("https://x.y/z"), ")" * 200000))
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_no_link_in_code(self):
+        self.assertEqual(links("`https://x.y/z`"), "<p><code>https://x.y/z</code></p>")
+        self.assertEqual(links("run `curl https://x.y/z` now"), "<p>run <code>curl https://x.y/z</code> now</p>")
+        self.assertEqual(links("Run:\n\n```\ncurl https://x.y/z\n```"), "<p>Run:</p>\n<pre>curl https://x.y/z</pre>")
+        # an address that runs on into a code span is left as typed, never linked to its first half
+        self.assertEqual(links("https://x.y/`z`"), "<p>https://x.y/<code>z</code></p>")
+
+    def test_a_marked_up_link_gets_no_second_anchor(self):
+        for text, href, words in (("[the docs](https://x.y/z)", "https://x.y/z", "the docs"),
+                                  ("[https://x.y/z](https://x.y/z)", "https://x.y/z", "https://x.y/z"),
+                                  ("[see https://a.b/c](https://x.y/z)", "https://x.y/z", "see https://a.b/c"),
+                                  ("*[x](https://a.b)*", "https://a.b", "x")):
+            with self.subTest(text=text):
+                b = links(text)
+                self.assertEqual(b.count("<a "), 1, b)
+                self.assertIn('<a href="%s">%s</a>' % (href, words), b)
+        # an escaped [ is no link markup, so the address in it is linked as a bare one
+        self.assertEqual(links("\\[x](https://a.b)"), "<p>[x](%s)</p>" % a("https://a.b"))
+
+    def test_an_address_is_escaped_in_its_href_and_its_words(self):
+        url = "https://x.y/p?a=1&b=2&it's=3#frag"
+        self.assertEqual(links("open %s now" % url),
+                         '<p>open <a href="https://x.y/p?a=1&amp;b=2&amp;it&#x27;s=3#frag">'
+                         "https://x.y/p?a=1&amp;b=2&amp;it's=3#frag</a> now</p>")
+        self.assertEqual(links("https://x.y/<script>"), "<p>%s&lt;script&gt;</p>" % a("https://x.y/"))
+
+    def test_only_http_and_https_addresses_are_linked(self):
+        for text in ("javascript:alert(1)", "data:text/html,<b>x</b>", "data:text/html;base64,PGI+eDwvYj4=",
+                     "mailto:owner@example.com", "www.example.com", "example.com/x", "ftp://x.y/z", "file:///etc/x",
+                     "xhttps://x.y/z", "[x](javascript:alert(1))", "[x](data:text/html,hi)"):
+            with self.subTest(text=text):
+                self.assertNotIn("<a", links(text))
+        # whatever comes before it, a link's href is the http(s) address itself
+        b = links("javascript:https://x.y/z and data:text/html,https://x.y/w")
+        self.assertEqual(re.findall(r'href="([^"]*)"', b), ["https://x.y/z", "https://x.y/w"])
+
+
 class Args:
     def __init__(self, **kw):
         self.__dict__.update(dict(body_file=None, html=None, session=None, cli=None, cc=None, unrouted=False,
-                                  image=None, attach=None, no_review=None, subject=None))
+                                  alert=None, image=None, attach=None, no_review=None, subject=None))
         self.__dict__.update(kw)
 
 

@@ -4,6 +4,9 @@ import SwiftUI
 // MARK: - root
 
 struct BoardView: View {
+    /// The window's narrowest width.
+    static let minWidth: CGFloat = 780
+
     @ObservedObject var model: BoardModel
 
     var body: some View {
@@ -16,7 +19,7 @@ struct BoardView: View {
                     case .board: BoardGrid(model: model)
                     case .overview: OverviewView(model: model)
                     case .mail: MailView(mail: model.mail, connected: model.snapshot != nil,
-                                         available: model.snapshot?.mailbox != nil)
+                                         available: model.snapshot?.mailbox != nil, working: model.workingAgents).equatable()
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -31,7 +34,7 @@ struct BoardView: View {
             Divider()
             FooterBar(model: model)
         }
-        .frame(minWidth: 780, minHeight: 480)
+        .frame(minWidth: BoardView.minWidth, minHeight: 480)
         .background(Color(nsColor: .windowBackgroundColor))
         .environment(\.zoom, model.zoom)
         .sheet(item: $model.sheet) { sheet in
@@ -39,6 +42,8 @@ struct BoardView: View {
             case .restart: RestartSheet(model: model)
             case .sent: SentSheet(model: model)
             case .time: TimeSheet(model: model)
+            case .phone: PhoneSheet(model: model)
+            case .keyring: KeyringSheet(model: model)
             case .switching(let s): SwitchSheet(session: s, model: model)
             case .chats(let id): ChatsSheet(model: model, selected: id)
             case .newChat(let id): NewChatSheet(model: model, preselected: id)
@@ -101,6 +106,7 @@ struct TopBar: View {
                         Text("read-check off").font(.system(size: 10 * z)).foregroundStyle(.secondary)
                             .help("Can't see what you've read in Gmail (\(g.error ?? "unknown")). Tiles stay green until you reply, or read the mail in the Mail tab.")
                     }
+                    KeyringChip(model: model)
                     DesktopChip(model: model)
                     SentButton(model: model)
                     ChatsButton(model: model)
@@ -321,11 +327,7 @@ struct UsageBars: View {
                                 .font(.system(size: 10 * z, weight: .semibold)).foregroundColor(AgentState.blocked.color).lineLimit(1)
                                 .help(SharedLogin.body(acct, shared, in: model.usage?.accounts ?? []))
                         }
-                        if (acct.windows ?? []).isEmpty, let err = acct.error {
-                            Text(err.hasPrefix("no login") ? "not logged in yet" : err)
-                                .font(.system(size: 10 * z)).foregroundStyle(.secondary).lineLimit(1)
-                                .frame(maxWidth: 200 * z, alignment: .leading)
-                        }
+                        status(acct)
                         HStack(spacing: 8) {
                             ForEach(acct.windows ?? []) { w in
                                 let left = w.left
@@ -354,11 +356,7 @@ struct UsageBars: View {
                         }
                     }
                     .contentShape(Rectangle())
-                    .onHover { inside in
-                        model.hoverInfo = inside ? (acct.error ?? accountTitle(acct) + " · " + (acct.windows ?? []).map { w in
-                            "\(w.name ?? w.kind ?? "window") resets \(Fmt.resetAt(w.resetsAt, now: model.now))"
-                        }.joined(separator: " · ")) : nil
-                    }
+                    .onHover { inside in model.hoverInfo = inside ? hoverText(acct) : nil }
                 }
             } else {
                 Text(model.usage?.error ?? "no usage data yet").font(.system(size: 11 * z)).foregroundStyle(.secondary)
@@ -387,6 +385,45 @@ struct UsageBars: View {
 
     func accountTitle(_ a: UsageAccount) -> String {
         a.plan.map { "\(a.shortLabel) · \($0)" } ?? a.shortLabel
+    }
+
+    /// Under the account's title, before its window meters: a per-token login's spend meter (it has no windows), or
+    /// why there are no windows.
+    @ViewBuilder func status(_ acct: UsageAccount) -> some View {
+        if let sp = acct.spend {
+            // what it spent this week, red once past its budget
+            Meter(label: "spent", fraction: sp.fraction, value: sp.text,
+                  tint: sp.over ? AgentState.blocked.color : Palette.ok, width: 184,
+                  detail: spendDetail(acct, sp), onHoverDetail: { model.hoverInfo = $0 })
+        } else if acct.billing == "per_token" {
+            Text("billed per token").font(.system(size: 10 * z)).foregroundStyle(.secondary).lineLimit(1)
+        } else if (acct.windows ?? []).isEmpty, let err = acct.error {
+            Text(err.hasPrefix("no login") ? "not logged in yet" : err)
+                .font(.system(size: 10 * z)).foregroundStyle(.secondary).lineLimit(1)
+                .frame(maxWidth: 200 * z, alignment: .leading)
+        }
+    }
+
+    /// What hovering over an account says: its spend, or its error, or when each of its windows resets.
+    func hoverText(_ acct: UsageAccount) -> String {
+        if let sp = acct.spend { return spendDetail(acct, sp) }
+        if let err = acct.error { return err }
+        return accountTitle(acct) + " · " + (acct.windows ?? []).map { w in
+            "\(w.name ?? w.kind ?? "window") resets \(Fmt.resetAt(w.resetsAt, now: model.now))"
+        }.joined(separator: " · ")
+    }
+
+    /// Its spend in words: since when (the week's start, as the desktop counts it), of what budget, and what was left out.
+    func spendDetail(_ a: UsageAccount, _ sp: UsageSpend) -> String {
+        let notes = (sp.notes ?? []).isEmpty ? "" : " · " + (sp.notes ?? []).joined(separator: " · ")
+        let since = sp.since.map { ts -> String in
+            let f = DateFormatter()
+            f.dateFormat = "EEE d MMM HH:mm"
+            return "since " + f.string(from: Date(timeIntervalSince1970: ts))
+        } ?? "this week"
+        return "\(accountTitle(a)): \(UsageSpend.money(sp.dollars, cents: true)) spent \(since), " +
+            "of a weekly budget of \(UsageSpend.money(sp.budget, cents: sp.budget.rounded() != sp.budget))" +
+            (sp.over ? ", over it" : "") + ", at its per-token prices, from its agents' transcripts" + notes
     }
 
     func creditsDetail(_ cr: CreditsMeter, _ bal: Double) -> String {
@@ -877,7 +914,7 @@ struct DraggableTile: View {
             .overlay(alignment: .leading) {
                 if targeted { Capsule().fill(Color.accentColor).frame(width: 3).offset(x: -5) }
             }
-            .onTapGesture(count: 2) { model.selectedID = agent.id; model.openLatestMail(agent) }
+            .onTapGesture(count: 2) { model.openFromTile(agent) }
             .onTapGesture { model.selectedID = model.selectedID == agent.id ? nil : agent.id }
             .draggable(agent.id) {
                 TileView(agent: agent, selected: false, now: model.now).frame(width: 180)
@@ -902,7 +939,9 @@ struct TileMenu: View {
     var body: some View {
         ForEach(agentActions(agent, model: model)) { MenuAction(action: $0) }
         Divider()
-        Button("Open latest mail in Gmail") { model.openLatestMail(agent) }.disabled(model.latestMailURL(for: agent) == nil)
+        if agent.mail.lastOutKept != true {        // mail kept for the Mail tab alone: Gmail has none, the next item opens it
+            Button("Open latest mail in Gmail") { model.openLatestMail(agent) }.disabled(model.latestMailURL(for: agent) == nil)
+        }
         Button("Open latest mail in the Mail tab") { model.openInMail(agent) }
             .disabled(model.snapshot?.mailbox == nil || (agent.mail.lastOutThread ?? "").isEmpty)
         Button("Open in Kitty") { Kitty.open(agent, model: model) }.disabled(!Kitty.canOpen(agent))
@@ -1404,7 +1443,9 @@ struct FooterBar: View {
             } else if let e = model.collectorError {
                 Text(e).font(.system(size: 11 * z)).foregroundColor(AgentState.blocked.color).lineLimit(1)
             } else if model.tab == .mail {
-                Text("↑↓ threads · ←→ mails · Space page · r reply · e archive · Esc leaves a text box · ⌘↩ sends").lineLimit(1).font(.system(size: 10 * z)).foregroundStyle(.tertiary)
+                // no ⌘↩ here: the reply box says it beside Send until you have replied (ReplyStates)
+                Text("↑↓ threads · ←→ mails · Space page · r reply · e archive · u unread · s snooze · z undo · Esc stops typing")
+                    .lineLimit(1).font(.system(size: 10 * z)).foregroundStyle(.tertiary)
             } else {
                 Text("double-click: its latest mail · drag to arrange · right-click for actions · ⌘R · ⌘+/⌘- · ⌥⌘A").font(.system(size: 10 * z)).foregroundStyle(.tertiary)
             }

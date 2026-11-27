@@ -1,5 +1,104 @@
 # Changelog
 
+## 2026-11-27
+
+**No email needed** (mailroom, board, installer). The kit no longer needs a Gmail account or a Google Cloud
+project. With `WITH_GMAIL="no"` (the new default in `kit.env`), the mailroom runs with `"gmail": false`: agent mail to
+you and every alert are kept for the board's Mail tab and the phone app, nothing is sent through, read from or polled
+in Gmail, and mail to anyone else is refused (exit 5). You start work with the board's **Orchestrator…** button (or the
+phone app's), and your replies in the Mail tab reach their agent within a second or two. Security alerts (a phone
+enrolled, fast mode unable to put an agent back) are also posted as a Mac notification. Gmail stays available:
+`WITH_GMAIL="yes"` and `AGENT_EMAIL` bring back today's email path, and a `kit.env` from before this update that has
+`AGENT_EMAIL` set keeps Gmail on. `agent-mail status` says whether Gmail is off and lists settings that only work with it.
+
+**Agent Mail on your phone** (board, optional). `WITH_PHONE_APP="yes"`: the Mail tab as an app on your own Tailscale
+network, installed from Chrome on Android, signed in with a passkey; each reply and orchestrator message needs your
+fingerprint again. Enrol the phone from the Mac's **Phone…** menu. Drafts are shared between the Mac and the phone.
+
+**Every feature of the original setup that works with your own accounts** (mailroom, board, Mac app; each off until
+you turn it on):
+- the **Researcher** switch per thread (Mail tab and phone app), which hands an agent to the public `researcher`
+  research-workflow plugin; `WITH_RESEARCHER="yes"` installs the plugin;
+- a **per-token login** through OpenRouter, used only when you choose it, with a weekly spend meter on the board;
+- the **ask box** on the Mac (⌃⌥A): ask the desk or one agent by typing or dictating, and hear the answer, a
+  sentence at a time, from a local voice model (`WITH_SPEECH`);
+- the **desk**: one always-running Claude you talk to, which reads your repos and messages agents when you ask
+  (`WITH_DESK`); it falls through your logins when one hits a usage limit;
+- the **voice page**: a Gemini Live front desk on your phone with read-only tools over your agents
+  (`WITH_VOICE_PAGE`, your own Gemini API key);
+- **unlocking the desktop's keyring** from the Mac or the phone after a restart (`WITH_KEYRING_UNLOCK`);
+- a **transcript archive** of every agent session, catalogued by board group (`WITH_TRANSCRIPTS`, `TRANSCRIPTS_DIR`);
+- the **reMarkable** route: documents from your tablet start a reader agent (needs Gmail).
+
+
+**Getting started, in one page** (docs). [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) walks a new user from
+nothing to a working setup in order, with a check after every step, an overview diagram, a day-to-day cheat sheet,
+optional extras and the common pitfalls. The numbered guides stay as the reference.
+
+**With Gmail on, agent mail can still stay off it** (mailroom, cloud-watchdog). With `"mailbox": {"owner_delivery":
+"local"}`, mail whose every recipient is you is kept for the Mail tab and not sent through Gmail; alerts name their
+kind (`agent-mail send --unrouted --alert KIND`), and security alerts plus the kinds in `mailbox.gmail_alerts` still
+come by Gmail. With Gmail off (above) all of this is moot: everything is kept.
+
+**Fast mode** (mailroom, board). A **Fast** switch on a Mail-tab thread turns that agent's effort down (with its own
+effort keys in its tmux pane) and asks for quick plain replies, for a back-and-forth; it ends by itself after a few
+minutes of quiet and puts the effort back. In fast mode Return sends your reply. `agent-mail fast-trial` tries a new
+Claude Code or Codex version's effort keys before fast mode uses them, and `agent-cli-update` runs it after each
+update.
+
+**The Mail tab** (board). Forward any agent mail as a fresh draft in your own Gmail. Comment on selected text, and
+answer each question in a mail separately. Undo (z, ⌘Z) for archive, snooze, inbox and read marks; new keys u
+(unread) and s (snooze). Double-click a thread to open it in its own window; click a plot, table or image to enlarge
+it; a Copy button on every code block. Drafts are kept on the Linux machine with their last versions (Discard can be
+undone). Threads and the Time page are coloured by board group (`~/.config/agent-board/colours.json` names your own
+colours). Your replies reach their agent within a second or two. A brown dot marks a thread whose agent is at work.
+**Sync with Gmail is gone**: your Gmail and the tab now keep their own read and archive state.
+
+**Dialogs take files** (board, mailroom). The Message and Orchestrator dialogs take pasted screenshots, dropped files
+or Attach…; `agent-send` and `agent-orchestrate --input-json` save the files for the agent and list their paths at the
+end of the message. The board's Orchestrator button runs the orchestrator in its own systemd scope, and a repeated
+click starts nothing twice.
+
+**Group chats have topics** (mailroom, board, instructions). A group can be divided into topics (`--new-topic TITLE`,
+`--topic=ID`; the board's Chats lists them); a reply stays in its post's topic. A new alert level, `addressed`, also
+wakes an agent on any post that starts a new thread, and alerts can be set per topic.
+
+**Agent mail** (mailroom). A bare `https://` address is a link; a line of its own `![alt](cid:NAME)` places an image
+there in plain-text mail; wide tables scroll instead of squeezing; bar plots can give each series a texture, and
+filled bars show a percentage per segment. An empty mail (no text, image or attachment) is refused.
+
+**Codex and logins** (mailroom, board). A message for an idle Codex agent is typed at its prompt at once instead of
+waiting for Codex's queue; one held after an interrupt is released, or shown on the board as not delivered with the
+reason. `agent-failover` moves an idle agent up to the best login with headroom, wherever it started, and an agent
+kept on its model bills extra usage on it last (the mail says how to switch it). The usage breakdown counts Codex
+review threads on the thread that asked for them.
+
+**cloud-watchdog**. Every alert names its kind (`cloud-idle`, `cloud-stop`, `cloud-cost`, `cloud-colleague`,
+`cloud-blind`, `cloud-heartbeat`, `cloud-check`), so the mailroom can route it when your agent mail stays off Gmail.
+
+Updating:
+
+1. Check that no orchestrator run is in flight (`agent-orchestrate --runs`): the steps below replace its brief and
+   restart the mailroom.
+2. `git pull`, then look at the new keys in `kit.example.env` and copy the ones you want into
+   `~/.config/agent-kit/kit.env`. **Your Gmail stays on**: a `kit.env` with `AGENT_EMAIL` set and no `WITH_GMAIL`
+   is read as `WITH_GMAIL="yes"`. To drop Gmail, set `WITH_GMAIL="no"` (agent mail then lives in the Mail tab and the
+   phone app only).
+3. `./install.sh --start`. This writes the mailroom's `gmail` switch, re-renders the agents' instructions (topics,
+   alert levels, the phone app), installs the units for what you turned on, and, with `WITH_RESEARCHER` or
+   `WITH_SPEECH`, the plugin or the speech venv. Then `./install.sh --only orchestrator --force` replaces the
+   orchestrator brief with this version; your old one is kept beside it as `AGENTS.md.bak-<time>` to merge from if
+   you had edited it (its `STATE.md` is never overwritten).
+4. `systemctl --user restart agent-mailroom` (and `agent-failover` and `agent-memwatch` if you run them).
+5. Rebuild and reinstall the board's Mac app (`cd board/mac && ./build-app.sh && ./install.sh`), then choose **New
+   build ready: relaunch**, and allow its notifications. Update the Mac app and the Linux machine together: the new
+   desktop refuses an old app's Orchestrator requests. The to-do apps did not change.
+6. Restart running Claude Code and Codex sessions so they load the new instructions.
+7. If you used **Sync with Gmail**: it is gone. `gmail_credentials` now serves the read-check, Forward (which needs
+   the `gmail.modify` or `gmail.compose` scope) and the Time page.
+8. The phone app and the other features each have a setup section: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md),
+   sections 5 and 9. Then `kit doctor`.
+
 ## 2026-11-19
 
 **The Mail tab** (board, mailroom). The board has a **Mail** tab with the mail between you and your agents,

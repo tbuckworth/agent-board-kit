@@ -6,4 +6,6 @@ Type=oneshot
 # PATH as a login shell has it: claude and codex are usually in ~/.local/bin
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
 ExecStart={{PYTHON}} {{KIT_DIR}}/board/bin/agent-cli-update
-TimeoutStartSec=1500
+# Two updates and two fast-mode trials, at their longest (agentboard/cliupdate.py): each update UPDATE_SECONDS and two
+# VERSION_SECONDS (660 s), each trial TRIAL_SECONDS and twice TRIAL_KILL_SECONDS (660 s); 2640 s in all.
+TimeoutStartSec=2700

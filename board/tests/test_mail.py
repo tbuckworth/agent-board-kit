@@ -7,15 +7,20 @@ stand-in that records the argv and stdin it was given, and the mailroom checkout
 is a temporary folder.
 """
 import base64
+import email
+import email.policy
 import functools
+import hashlib
 import importlib.util
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
+from email.message import EmailMessage
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
@@ -24,7 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import fixtures  # noqa: E402
 import stand_ins  # noqa: E402
-from agentboard import actions, mailbox, sent, sources  # noqa: E402
+from agentboard import (actions, colours, gmailstate, groups, mailbox, maildrafts, mailforward, sent,  # noqa: E402
+                        sources)
 
 THREAD = "18f2a9c0d1e2f3a4"
 KEY = "Zt0pZt0pZt0pZt0pZt0pZt"
@@ -43,13 +49,16 @@ def answer(obj):
 
 
 class MailTest(unittest.TestCase):
-    """Each test runs with the board's records in a temporary folder and a mailroom install there that keeps a
-    mailbox (its agentmail/mailbox.py), unless the test removes it from `self.root`."""
+    """Each test runs with the board's records in a temporary folder, with no layout there yet, and a mailroom
+    install there that keeps a mailbox (its agentmail/mailbox.py), unless the test removes it from `self.root`."""
 
     def setUp(self):
         d = Path(tempfile.mkdtemp())
-        self.real = (sent.PATH, sent.MARKS, actions.AUDIT, sources.find_bin)
+        self.real = (sent.PATH, sent.MARKS, actions.AUDIT, sources.find_bin, groups.GROUPS, maildrafts.ROOT,
+                     maildrafts.CONFIG)
         sent.PATH, sent.MARKS, actions.AUDIT = d / "sent.jsonl", d / "sent-marks.jsonl", d / "actions.jsonl"
+        maildrafts.ROOT, maildrafts.CONFIG = d / "mail-drafts", d / "drafts.json"     # the drafts a reply clears
+        groups.GROUPS = d / "groups.json"
         self.root = d / "mailroom"
         (self.root / "bin").mkdir(parents=True)
         (self.root / "agentmail").mkdir()
@@ -61,7 +70,8 @@ class MailTest(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
 
     def tearDown(self):
-        sent.PATH, sent.MARKS, actions.AUDIT, sources.find_bin = self.real
+        (sent.PATH, sent.MARKS, actions.AUDIT, sources.find_bin, groups.GROUPS, maildrafts.ROOT,
+         maildrafts.CONFIG) = self.real
 
     def act(self, req, run):
         return actions.dispatch(req, lambda: [], lambda: [], run=run)
@@ -91,6 +101,106 @@ class ActionTest(MailTest):
         self.assertEqual(run.calls[1][0], [self.exe, "mailbox", "part", "--", "i31", "1"])
         self.assertEqual(self.audited(), [])                                   # reading is not on the record
 
+    def test_a_list_asked_with_sessions_names_each_thread_s_agents_from_the_store(self):
+        other = dict(LISTED["threads"][0], id="18f2a9c0d1e2f3a5", agents=["mailroom"])
+        listed = dict(LISTED, threads=LISTED["threads"] + [other])
+        d = Path(tempfile.mkdtemp())
+        con = fixtures.mailroom_db(d / "mailroom.sqlite")       # the mailroom's store, as the collector reads it
+        con.executemany("insert into sessions values(?,?,?,?,?,?,?)", [
+            ("tagf", "claude", "s1", "fab", "/x", 0, "desktop"),
+            ("tagb", "codex", "s2", "beta", "/y", 0, "desktop"),
+            ("tagm", "claude", "s3", "mac", "/z", 0, "mac")])
+        con.executemany("insert into sent(tag, thread_id, to_addr, subject, sent_at) values(?,?,?,?,?)", [
+            ("tagf", THREAD, "owner@example.com", "Run results", NOW - 120),
+            ("tagb", THREAD, "owner@example.com", "Re: Run results", NOW - 90),
+            ("tagm", THREAD, "owner@example.com", "Re: Run results", NOW - 60),
+            ("tagf", "another-thread", "owner@example.com", "Other", NOW - 30)])
+        con.commit()
+        con.close()
+
+        def listing(req, store):
+            return actions.dispatch(req, lambda: [], lambda: [], run=AgentMail(answer(listed)), mail_store=store)
+
+        res = listing({"action": "mail_list", "sessions": True},
+                      sources.MailStore(d / "mailroom.sqlite", host_id="desktop"))
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([t["sessions"] for t in res["threads"]],
+                         [[{"cli": "claude", "id": "s1"}, {"cli": "codex", "id": "s2"}],   # the Mac's session left out
+                          []])                                                            # unrouted mail: none
+        self.assertEqual(res["threads"][0]["agents"], ["alpha (claude)"])                 # the rest as it came
+        self.assertNotIn("sessions_error", res)
+        # not asked for: the answer as it came, the store not read (a missing one would have said so)
+        self.assertEqual(listing({"action": "mail_list"}, sources.MailStore(d / "none.sqlite", host_id="desktop")),
+                         dict(listed, ok=True))
+        res = listing({"action": "mail_list", "sessions": True}, sources.MailStore(d / "none.sqlite", host_id="desktop"))
+        missing = "FileNotFoundError: no database at %s" % (d / "none.sqlite")
+        self.assertEqual(res, dict(listed, ok=True, sessions_error=missing, groups_error=missing))
+        (d / "broken.sqlite").write_text("not a database")
+        res = listing({"action": "mail_list", "sessions": True}, sources.MailStore(d / "broken.sqlite", host_id="desktop"))
+        self.assertEqual(res, dict(listed, ok=True, sessions_error="DatabaseError: file is not a database",
+                                   groups_error="DatabaseError: file is not a database"))
+
+    def test_a_list_asked_with_sessions_gives_each_thread_its_newest_agent_s_group_and_colours(self):
+        p, s, r, w, g, n, m = ("%08d-0000-4000-8000-000000000000" % i for i in range(1, 8))   # session ids
+        own = Path(tempfile.mkdtemp()) / "colours.json"       # the owner's own colours.json, naming four groups
+        own.write_text(json.dumps({"groups": {"Work": "#0E8A84", "Side": "#3E9B4F", "Admin": "#6A5ACD",
+                                              "Personal": "#CF4F7E"}, "reserve": ["#2E5C8A", "#A85551"],
+                                   "ungrouped": "#8C877F", "shades": {"lightness": 0.10, "chroma": 0.92}}))
+        saved = colours.OWN
+        colours.OWN = own
+        self.addCleanup(setattr, colours, "OWN", saved)
+        sources.write_json(groups.GROUPS, {"updated": NOW, "groups": [
+            {"name": "Work", "members": [], "subgroups": [
+                {"name": "Parser", "members": [p]}, {"name": "Release", "members": []},
+                {"name": "Docs", "members": []}]},
+            {"name": "Side", "members": [], "subgroups": [{"name": "Evals", "members": [s]},
+                                                                {"name": "Reading", "members": []}]},
+            {"name": "Research", "members": [r], "subgroups": []},          # a group colours.json does not name
+            {"name": "Admin", "members": [], "subgroups": []}, {"name": "Personal", "members": [], "subgroups": []}]})
+        sources.write_json(groups.history_path(), {
+            p: {"group": "Work", "subgroup": "Parser"}, s: {"group": "Side", "subgroup": "Evals"},
+            r: {"group": "Research", "subgroup": None},
+            w: {"group": "Work", "subgroup": "Old"},              # a closed tile whose sub-group has gone since
+            g: {"group": "Gone", "subgroup": None},               # a closed tile whose group has gone
+            m: {"group": "Admin", "subgroup": None}})             # a Mac session's id: never a tile on this machine
+        d = Path(tempfile.mkdtemp())
+        con = fixtures.mailroom_db(d / "mailroom.sqlite")
+        con.executemany("insert into sessions values(?,?,?,?,?,?,?)", [
+            ("tag" + k, "claude", sid, k, "/x", 0, "mac" if sid == m else "desktop")
+            for k, sid in zip("psrwgnm", (p, s, r, w, g, n, m))])
+        sent_rows = [(1, "p", "t1"), (2, "s", "t2"), (3, "r", "t3"), (4, "w", "t4"), (5, "g", "t5"), (6, "n", "t6"),
+                     (7, "p", "t7"), (8, "m", "t7"), (9, "s", "t9"), (10, "p", "t9")]
+        con.executemany("insert into sent(id, tag, thread_id, to_addr, subject, sent_at) values(?,?,?,?,?,?)",
+                        [(i, "tag" + k, t, "owner@example.com", "x", NOW) for i, k, t in sent_rows])
+        con.commit()
+        con.close()
+        newest = {"t1": 1, "t2": 2, "t3": 3, "t4": 4, "t5": 5, "t6": 6, "t7": 8, "t8": 0, "t9": 10}   # t8: the owner's own only
+        listed = dict(LISTED, threads=[dict(LISTED["threads"][0], id=t, newest=i) for t, i in newest.items()])
+        store = sources.MailStore(d / "mailroom.sqlite", host_id="desktop")
+        res = actions.dispatch({"action": "mail_list", "sessions": True}, lambda: [], lambda: [],
+                               run=AgentMail(answer(listed)), mail_store=store)
+        self.assertTrue(res["ok"], res)
+        self.assertNotIn("groups_error", res)
+        got = {t["id"]: (t["group"], t["subgroup"], t["colour"], t["shade"]) for t in res["threads"]}
+        ungrouped = (None, None, "#8C877F", "#8C877F")
+        self.assertEqual(got, {
+            "t1": ("Work", "Parser", "#0E8A84", "#006A65"),   # its sub-group's shade, the darkest
+            "t2": ("Side", "Evals", "#3E9B4F", "#257B37"),
+            "t3": ("Research", None, "#2E5C8A", "#2E5C8A"),                   # the reserve's first colour
+            "t4": ("Work", None, "#0E8A84", "#0E8A84"),                       # the group's colour, no sub-group now
+            "t5": ungrouped, "t6": ungrouped,                                 # a group gone; never grouped
+            "t7": ungrouped,                                                  # its newest from the Mac's session
+            "t8": ungrouped,                                                  # no agent mail
+            "t9": ("Work", "Parser", "#0E8A84", "#006A65")})  # the newest agent's, not the first's
+        self.assertEqual(res["threads"][0]["sessions"], [{"cli": "claude", "id": p}])   # the sessions still there
+        # a layout that cannot be read: the sessions, and why there are no colours
+        groups.GROUPS.write_text("not a layout")
+        res = actions.dispatch({"action": "mail_list", "sessions": True}, lambda: [], lambda: [],
+                               run=AgentMail(answer(listed)), mail_store=store)
+        self.assertEqual(res["groups_error"][:11], "ValueError:")
+        self.assertNotIn("colour", res["threads"][0])
+        self.assertEqual(res["threads"][0]["sessions"], [{"cli": "claude", "id": p}])
+
     def test_a_read_mark_is_not_on_the_record_and_the_other_marks_are(self):
         run = AgentMail(answer({"ok": True, "threads": LISTED["threads"]}))
         res = self.act({"action": "mail_mark", "threads": [THREAD], "op": "read", "upto": 7}, run)
@@ -107,11 +217,96 @@ class ActionTest(MailTest):
         self.assertEqual([(r["op"], r["threads"]) for r in self.audited()], [("snooze", [THREAD, "abc"]),
                                                                              ("inbox", [THREAD])])
 
+    def test_fast_mode_is_switched_by_agent_mail_and_each_switch_is_on_the_record(self):
+        fast = {"since": NOW, "until": NOW + 300, "minutes": 5, "agent": "fab", "effort": "low", "was": "xhigh",
+                "note": "Effort low until fast mode ends, then xhigh again."}
+        on, off = dict(LISTED["threads"][0], fast=fast), dict(LISTED["threads"][0], fast=None)
+        run = AgentMail(answer({"ok": True, "thread": on}), answer({"ok": True, "thread": off}))
+        self.assertEqual(self.act({"action": "mail_fast", "thread": THREAD, "on": True}, run), {"ok": True, "thread": on})
+        self.assertEqual(self.act({"action": "mail_fast", "thread": THREAD, "on": False}, run), {"ok": True, "thread": off})
+        self.assertEqual(run.calls, [([self.exe, "mailbox", "fast", "--", THREAD, "on"], None),
+                                     ([self.exe, "mailbox", "fast", "--", THREAD, "off"], None)])
+        self.assertEqual([{k: v for k, v in r.items() if k != "ts"} for r in self.audited()], [
+            {"action": "mail_fast", "thread": THREAD, "on": True, "agent": "fab", "effort": "low", "until": NOW + 300},
+            {"action": "mail_fast", "thread": THREAD, "on": False, "agent": None, "effort": None, "until": None}])
+
+    def test_an_answer_with_no_thread_is_on_the_record_as_such(self):
+        res = self.act({"action": "mail_fast", "thread": THREAD, "on": True}, AgentMail(answer({"ok": True})))
+        self.assertEqual(res, {"ok": True})
+        self.assertEqual([{k: v for k, v in r.items() if k != "ts"} for r in self.audited()], [
+            {"action": "mail_fast", "thread": THREAD, "on": True, "agent": None, "effort": None, "until": None,
+             "problem": "agent-mail's answer had no thread"}])
+
+    def test_fast_mode_refused_by_agent_mail_says_why_and_is_not_on_the_record(self):
+        why = "agent-mail: fast mode is for a thread one agent owns; this one is a group's"
+        res = self.act({"action": "mail_fast", "thread": THREAD, "on": True}, AgentMail((1, "", why + "\n")))
+        self.assertEqual(res, {"ok": False, "error": why})
+        res = self.act({"action": "mail_fast", "thread": THREAD, "on": False},
+                       AgentMail((4, "", "agent-mail: no thread %s in the mailbox\n" % THREAD)))
+        self.assertEqual(res, {"ok": False, "error": "agent-mail: no thread %s in the mailbox" % THREAD})
+        self.assertEqual(self.audited(), [])
+
+    def test_researcher_switch_uses_the_mailroom_thread_and_records_confirmed_state(self):
+        rows = [dict(LISTED["threads"][0], researcher={"on": on, "agent": "fab", "tag": "fab00001"})
+                for on in (True, False)]
+        run = AgentMail(*(answer({"ok": True, "thread": t}) for t in rows))
+        for t in rows:
+            on = t["researcher"]["on"]
+            self.assertEqual(self.act({"action": "mail_researcher", "thread": THREAD, "on": on,
+                                       "expected_tag": "fab00001"}, run),
+                             {"ok": True, "thread": t})
+        self.assertEqual(run.calls, [([self.exe, "mailbox", "researcher", "--expect-tag", "fab00001", "--", THREAD,
+                                      value], None)
+                                     for value in ("on", "off")])
+        self.assertEqual([(r["action"], r["thread"], r["on"], r["agent"]) for r in self.audited()],
+                         [("mail_researcher", THREAD, True, "fab"), ("mail_researcher", THREAD, False, "fab")])
+
+    def test_researcher_refuses_invalid_input_and_requires_an_authoritative_answer(self):
+        req = {"action": "mail_researcher", "thread": THREAD, "on": True, "expected_tag": "fab00001"}
+        run = AgentMail()
+        for invalid in (dict(req, on=1), dict(req, on="on"), dict(req, on=None), dict(req, thread="--help")):
+            self.assertEqual(self.act(invalid, run),
+                             {"ok": False, "error": "thread must be a thread id and on true or false"})
+        for invalid in (None, "--help", True, "fab (claude)", "a b c d"):
+            res = self.act(dict(req, expected_tag=invalid), run)
+            self.assertFalse(res["ok"], res)
+            self.assertIn("expected_tag", res["error"])
+        self.assertFalse(self.act({k: v for k, v in req.items() if k != "expected_tag"}, run)["ok"])
+        self.assertEqual(run.calls, [])
+        row = dict(LISTED["threads"][0], researcher={"on": True, "agent": "fab", "tag": "fab00001"})
+        for item in (None, dict(row, id="other"), dict(row, researcher=None),
+                     dict(row, researcher={"on": 1, "agent": "fab", "tag": "fab00001"}),
+                     dict(row, researcher={"on": False, "agent": "fab", "tag": "fab00001"}),
+                     dict(row, researcher={"on": True, "agent": "fab", "tag": "fab00002"})):
+            res = self.act(req, AgentMail(answer({"ok": True, "thread": item})))
+            self.assertFalse(res["ok"], res)
+            self.assertIn("confirm", res["error"])
+        for failed in ((2, "", "unknown command researcher"), answer({"ok": False, "error": "route changed"})):
+            res = self.act(req, AgentMail(failed))
+            self.assertFalse(res["ok"], res)
+            self.assertTrue("researcher" in res["error"] or "route changed" in res["error"], res)
+
+    def test_researcher_crosses_the_command_process_boundary(self):
+        row = dict(LISTED["threads"][0], researcher={"on": True, "agent": "fab", "tag": "fab00001"})
+        # Use the board's real process runner with a stand-in executable for the live mailroom.
+        command = Path(self.exe)
+        command.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"assert sys.argv[1:] == ['mailbox', 'researcher', '--expect-tag', 'fab00001', '--', {THREAD!r}, 'on']\n"
+            f"print({json.dumps({'ok': True, 'thread': row})!r})\n"
+        )
+        command.chmod(0o700)
+        res = self.act({"action": "mail_researcher", "thread": THREAD, "on": True, "expected_tag": "fab00001"},
+                       sources.run)
+        self.assertEqual(res, {"ok": True, "thread": row})
+
     def test_a_reply_goes_on_stdin_is_kept_by_the_mailroom_and_not_on_the_sent_record(self):
         run = AgentMail(answer({"ok": True, "key": "i31", "status": "sending"}))
         text = "--help; rm -rf ~ $(x)\nsecond line"
         res = self.act({"action": "mail_reply", "thread": THREAD, "key": KEY, "text": "  %s\n" % text}, run)
-        self.assertEqual(res, {"ok": True, "key": "i31", "status": "sending"})
+        self.assertEqual(res, {"ok": True, "key": "i31", "status": "sending",
+                               "draft": {"cleared": False, "rev": None}})      # no draft held its key
         self.assertEqual(run.calls, [([self.exe, "mailbox", "answer", "--key", KEY, "--", THREAD], text)])
         self.assertFalse(sent.PATH.exists())          # the mailroom keeps it as the owner's mail; the Time page counts it once
         rec, = self.audited()
@@ -125,7 +320,7 @@ class ActionTest(MailTest):
         files = [{"name": "plot.png", "data": base64.b64encode(b"\x89PNG...").decode()},
                  {"name": "notes.txt", "data": base64.b64encode(b"two\n").decode()}]
         res = self.act({"action": "mail_reply", "thread": THREAD, "key": KEY, "text": " see these \n", "files": files}, run)
-        self.assertEqual(res, {"ok": True, "key": "i32", "status": "sending"})
+        self.assertEqual(res, {"ok": True, "key": "i32", "status": "sending", "draft": {"cleared": False, "rev": None}})
         argv, stdin = run.calls[0]
         self.assertEqual(argv, [self.exe, "mailbox", "answer", "--key", KEY, "--json", "--", THREAD])
         self.assertEqual(json.loads(stdin), {"text": "see these", "files": files})
@@ -160,6 +355,7 @@ class ActionTest(MailTest):
                     {"action": "mail_list", "query": "x" * 201},
                     {"action": "mail_list", "query": 3},
                     {"action": "mail_list", "query": "a\x00b"},
+                    {"action": "mail_list", "sessions": "yes"},
                     {"action": "mail_show", "thread": "--help"},
                     {"action": "mail_show", "thread": "a/b"},
                     {"action": "mail_show", "thread": THREAD + "\n"},                         # the whole id only
@@ -197,13 +393,38 @@ class ActionTest(MailTest):
                      "files": [{"name": "a", "data": "eA=="}] * 21},
                     {"action": "mail_reply", "thread": THREAD, "key": KEY, "text": "hi",
                      "files": [{"name": "big", "data": base64.b64encode(b"x" * (25 << 20 | 1)).decode()}]},
+                    {"action": "mail_fast", "thread": THREAD},                                   # no on
+                    {"action": "mail_fast", "thread": THREAD, "on": "on"},
+                    {"action": "mail_fast", "thread": THREAD, "on": 1},
+                    {"action": "mail_fast", "thread": "--help", "on": True},
+                    {"action": "mail_fast", "thread": [THREAD], "on": True},
                     {"action": "mail_part", "key": "x3", "index": 1},
                     {"action": "mail_part", "key": "s3", "index": 0},
                     {"action": "mail_part", "key": "s3; x", "index": 1}):
             res = self.act(req, run)
             self.assertFalse(res["ok"], req)
             self.assertTrue(res["error"], req)
+            if req["action"] == "mail_reply":
+                self.assertIs(res.get("refused"), True, req)      # never kept: the Mac may let it be changed
         self.assertEqual(run.calls, [])
+        self.assertEqual(self.audited(), [])
+
+    def test_a_reply_agent_mail_did_not_answer_may_have_been_kept(self):
+        """agent-mail timing out (or failing) after the mailroom kept the reply: the answer is not a refusal, so the Mac
+        keeps the reply as it was, under its key, for Send to send once."""
+        res = self.act({"action": "mail_reply", "thread": THREAD, "key": KEY, "text": "Ship it."},
+                       AgentMail((124, "", "timed out after 60s")))
+        self.assertEqual(res, {"ok": False, "error": "timed out after 60s"})
+        res = self.act({"action": "mail_reply", "thread": THREAD, "key": KEY, "text": "Ship it."},
+                       AgentMail((1, "", "agent-mail: refused: thread is not in the mailbox\n")))    # the words do not count
+        self.assertEqual(res, {"ok": False, "error": "agent-mail: refused: thread is not in the mailbox"})
+
+    def test_a_reply_agent_mail_refused_was_not_kept(self):
+        """agent-mail's exit code for a reply it refused before recording anything (the mailroom's
+        mailbox.ANSWER_REFUSED): the answer is a refusal, so the Mac lets the reply be changed."""
+        res = self.act({"action": "mail_reply", "thread": THREAD, "key": KEY, "text": "Ship it."},
+                       AgentMail((mailbox.ANSWER_REFUSED, "", "agent-mail: thread %s is not in the mailbox\n" % THREAD)))
+        self.assertEqual(res, {"ok": False, "error": "agent-mail: thread %s is not in the mailbox" % THREAD, "refused": True})
         self.assertEqual(self.audited(), [])
 
     def test_agent_mail_failing_or_missing_is_the_answer_s_error(self):
@@ -269,92 +490,7 @@ class ReceiveTest(unittest.TestCase):
         self.assertEqual((day / "film.mov.part").read_bytes(), b"half")
 
 
-BOX = {"g1": "<M1@mail.gmail.com>", "g2": "<m2@x>", "g3": "<m3@x>"}    # the owner's Gmail: Gmail id -> Message-ID
-
-
-class SyncTest(MailTest):
-    def sync(self, gmail, run):
-        return actions.dispatch({"action": "mail_sync"}, lambda: [], lambda: [], run=run, gmail=gmail)
-
-    @staticmethod
-    def changes(calls):
-        """The label changes asked of Gmail: batchModify's bodies."""
-        return [body for method, url, _, body in calls if method == "POST" and url.endswith("/batchModify")]
-
-    def test_the_tab_and_gmail_are_brought_into_step(self):
-        inbox, unread = {"g1", "g2"}, {"g2", "g3"}
-        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, inbox=inbox, unread=unread)
-        run = AgentMail(answer({"archived": 5, "read": 6,
-                                "gmail": {"archive": ["m1@mail.gmail.com"], "read": ["m2@x", "m3@x"]}}))
-        res = self.sync(gmail, run)
-        self.assertEqual(res, {"ok": True, "archived": 5, "read": 6, "gmail_archived": 1, "gmail_read": 2})
-        (argv, stdin), = run.calls
-        self.assertEqual(argv, [self.exe, "mailbox", "sync"])
-        self.assertEqual(json.loads(stdin), {"inbox": ["m1@mail.gmail.com", "m2@x"], "unread": ["m2@x", "m3@x"]})
-        self.assertEqual(self.changes(calls), [{"ids": ["g1"], "removeLabelIds": ["INBOX"]},
-                                               {"ids": ["g2", "g3"], "removeLabelIds": ["UNREAD"]}])
-        self.assertEqual((inbox, unread), ({"g2"}, set()))                    # Gmail as the tab has it now
-        self.assertTrue(any("from%3Aagents%40example.com+in%3Ainbox" in u for _, u, _, _ in calls), calls)
-        self.assertTrue(all("AT-secret" not in u and "AT-secret" not in json.dumps(b) for _, u, _, b in calls))
-        rec, = self.audited()
-        self.assertEqual({k: rec[k] for k in ("action", "archived", "read", "gmail_archived", "gmail_read")},
-                         {"action": "mail_sync", "archived": 5, "read": 6, "gmail_archived": 1, "gmail_read": 2})
-
-    def test_nothing_to_change_in_gmail_asks_nothing_of_it(self):
-        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, inbox={"g1"}, unread=set())
-        run = AgentMail(answer({"archived": 0, "read": 0, "gmail": {"archive": [], "read": []}}))
-        self.assertEqual(self.sync(gmail, run), {"ok": True, "archived": 0, "read": 0, "gmail_archived": 0,
-                                                 "gmail_read": 0})
-        self.assertEqual(self.changes(calls), [])
-
-    def test_a_thousand_ids_to_a_request(self):
-        unread = {"g%d" % n for n in range(1500)}
-        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, inbox=set(), unread=unread)
-        gmail.remove_label(sorted(unread), "UNREAD")
-        self.assertEqual([len(c["ids"]) for c in self.changes(calls)], [1000, 500])
-        self.assertEqual(unread, set())
-
-    def test_every_page_of_gmail_s_answer_counts(self):
-        unread = {"g%d" % n for n in range(4, 1205)}               # more pages than the read check ever lists
-        gmail, _ = fixtures.gmail_of(fixtures.OWNER, BOX, inbox={"g1"}, unread=unread)
-        self.assertEqual(gmail.state(), ({"m1@mail.gmail.com": ["g1"]},
-                                         {"g%d@x" % n: ["g%d" % n] for n in range(4, 1205)}))
-
-    def test_gmail_failing_the_changes_says_the_tab_changed_and_is_recorded(self):
-        gmail, _ = fixtures.gmail_of(fixtures.OWNER, BOX, inbox={"g1"}, unread=set(), fail="batchModify")
-        run = AgentMail(answer({"archived": 2, "read": 1, "gmail": {"archive": ["m1@mail.gmail.com"], "read": []}}))
-        self.assertEqual(self.sync(gmail, run),
-                         {"ok": False, "error": "the tab is in step with Gmail (2 threads archived, 1 read), but changing "
-                                                "Gmail failed: Google API answered HTTP 503; sync again to finish"})
-        rec, = self.audited()
-        self.assertEqual({k: rec[k] for k in ("action", "archived", "read", "gmail_error")},
-                         {"action": "mail_sync", "archived": 2, "read": 1,
-                          "gmail_error": "Google API answered HTTP 503"})
-
-    def test_gmail_failing_to_answer_changes_nothing(self):
-        gmail, _ = fixtures.gmail_of(fixtures.OWNER, BOX, inbox={"g1"}, unread=set(), fail="is%3Aunread")
-        run = AgentMail()
-        self.assertEqual(self.sync(gmail, run), {"ok": False, "error": "Google API answered HTTP 503"})
-        self.assertEqual((run.calls, self.audited()), ([], []))
-
-    def test_no_gmail_login_on_the_desktop_is_the_answer_s_error(self):
-        run = AgentMail()
-        no_login = {"error": "the tab cannot sync with Gmail: the board config names no Gmail login of the owner's "
-                             "(gmail_credentials), or the mailroom's config names no agents' account", "ok": False}
-        res = actions.dispatch({"action": "mail_sync"}, lambda: [], lambda: [], run=run)    # off: the kit's default
-        self.assertEqual(res, no_login)
-        with mock.patch.dict(os.environ, {"AGENT_BOARD_GMAIL_CREDS": str(self.root / "no-login.json")}):
-            res = actions.dispatch({"action": "mail_sync"}, lambda: [], lambda: [], run=run)     # named, but missing
-        self.assertEqual(res, no_login)
-        self.assertEqual((run.calls, self.audited()), ([], []))
-
-    def test_someone_else_s_gmail_is_never_used(self):
-        gmail, calls = fixtures.gmail_of(fixtures.AGENTS, BOX, inbox={"g1"}, unread=set())
-        run = AgentMail()
-        res = self.sync(gmail, run)
-        self.assertFalse(res["ok"])
-        self.assertIn("not the owner's", res["error"])
-        self.assertEqual((run.calls, self.audited(), self.changes(calls)), ([], [], []))
+BOX = {"g1": "<M1@mail.gmail.com>", "g2": "<m2@x>"}    # the owner's Gmail: Gmail id -> Message-ID
 
 
 class SummaryTest(MailTest):
@@ -372,20 +508,267 @@ class SummaryTest(MailTest):
         self.assertEqual(run.calls, [])
 
 
+TAG = "abcd2345"
+AGENTS = fixtures.AGENTS
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 4         # an inline plot's bytes, made up
+CSV = b"run,accuracy\nE6,0.91\n"
+# An agent's mail as the mailroom sends it (its HTML from the agent's markdown, a widget's fallback, a plot inline and a
+# file attached), answering in a new thread, so that it ends with the line naming the old one
+HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family: sans-serif">
+<p>E6 finished: <b>accuracy 0.91</b>, up from 0.87.</p>
+<p><img src="cid:curve" alt="curve" style="max-width:100%;height:auto"></p>
+<div data-agentmail-widget="0">
+<p><b>Run E7 next?</b></p>
+<ol><li><b>Yes</b> (recommended)</li><li><b>No</b></li></ol>
+<p>If you don't answer: Yes</p>
+<p>Reply with the number.</p>
+</div>
+<hr><p style="color:#6e7781;font-size:13px">Continues the thread &quot;E5 plan&quot;. <a href="https://mail.google.com/mail/?authuser=owner%40example.com#search/rfc822msgid%3Ax">Open the mail this answers in Gmail</a></p>
+</body></html>
+"""
+FORWARDED_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family: sans-serif">
+<p>E6 finished: <b>accuracy 0.91</b>, up from 0.87.</p>
+<p><img src="cid:curve" alt="curve" style="max-width:100%;height:auto"></p>
+<div>
+<p><b>Run E7 next?</b></p>
+<ol><li><b>Yes</b> (recommended)</li><li><b>No</b></li></ol>
+<p>If you don't answer: Yes</p>
+
+</div>
+</body></html>
+"""
+TEXT = """E6 finished: **accuracy 0.91**, up from 0.87.
+
+**Run E7 next?**
+
+1. Yes (recommended)
+2. No
+
+If you don't answer: Yes
+Reply with the number.
+
+--
+Continues the thread "E5 plan". The mail this answers: https://mail.google.com/mail/?authuser=owner%40example.com#x
+"""
+FORWARDED_TEXT = """E6 finished: **accuracy 0.91**, up from 0.87.
+
+**Run E7 next?**
+
+1. Yes (recommended)
+2. No
+
+If you don't answer: Yes
+"""
+
+
+def sent_mail(subject, text=TEXT, html=HTML, images=(("curve", PNG),), files=(("e6.csv", CSV),)):
+    """A mail's bytes as the mailroom's outbound.compose writes an agent's (another repo, whose message store a test
+    cannot share): from the agents' account in the agent's name, to the owner, answering the owner's mail, the reply tag in
+    Reply-To and its own header; its text, and its HTML (None: none) with `images` related to it; `files` attached."""
+    msg = EmailMessage()
+    msg["From"] = "Agent (fab (claude)) <%s>" % AGENTS
+    msg["To"] = fixtures.OWNER
+    msg["Subject"] = subject
+    msg["Reply-To"] = "Agent <agents+%s@example.com>" % TAG
+    msg["X-Agent-Mailroom"] = TAG
+    msg["In-Reply-To"] = msg["References"] = "<owner-1@mail.gmail.com>"
+    msg.set_content(text)
+    if html is not None:
+        msg.add_alternative(html, subtype="html")
+        for name, data in images:
+            msg.get_payload()[1].add_related(data, maintype="image", subtype="png", cid="<%s>" % name,
+                                             filename=name + ".png", disposition="inline")
+    for name, data in files:
+        msg.add_attachment(data, maintype="text", subtype="csv", filename=name)
+    return msg.as_bytes()
+
+
+def parsed(raw):
+    return email.message_from_bytes(raw, policy=email.policy.default)
+
+
+class ForwardTest(MailTest):
+    def store(self, *mails):
+        """A mailroom store in a temporary folder with a sent row for each (sent id, thread, subject, the mail's bytes
+        or None), the bytes kept in its message store as the mailroom files them; a MailStore reading it."""
+        d = Path(tempfile.mkdtemp())
+        con = fixtures.mailroom_db(d / "mailroom.sqlite")
+        for sid, thread, subject, raw in mails:
+            sha = raw and hashlib.sha256(raw).hexdigest()
+            if raw:
+                (d / "messages" / sha[:2]).mkdir(parents=True, exist_ok=True)
+                (d / "messages" / sha[:2] / (sha + ".eml")).write_bytes(raw)
+            con.execute("insert into sent(id, tag, thread_id, to_addr, subject, sent_at, eml) values(?,?,?,?,?,?,?)",
+                        (sid, TAG, thread, fixtures.OWNER, subject, int(NOW), sha))
+        con.commit()
+        con.close()
+        return sources.MailStore(d / "mailroom.sqlite", host_id="desktop", messages=d / "messages")
+
+    def forward(self, req, store, gmail):
+        return actions.dispatch(dict(req, action="mail_forward"), lambda: [], lambda: [], gmail=gmail, mail_store=store)
+
+    @staticmethod
+    def uploads(calls):
+        """The drafts uploaded: (url, headers, bytes) each."""
+        return [(url, headers, sent_bytes) for method, url, headers, sent_bytes in calls if "/upload/" in url]
+
+    def test_a_forward_is_a_fresh_mail_of_that_message_with_its_images_and_files(self):
+        subject = "Re: Run results [#%s]" % TAG
+        store = self.store((7, THREAD, subject, sent_mail(subject)), (8, THREAD, subject, sent_mail(subject, "later")))
+        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, unread=set())
+        res = self.forward({"thread": THREAD, "key": "s7"}, store, gmail)
+        self.assertEqual(res, {"ok": True, "draft": "r-1", "message": "d1"})
+        (url, headers, raw), = self.uploads(calls)
+        self.assertEqual(url, "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=media")
+        self.assertEqual(headers, {"Authorization": "Bearer AT-secret", "Content-Type": "message/rfc822"})
+        self.assertTrue(all("AT-secret" not in u for _, u, _, _ in calls))
+        msg = parsed(raw)
+        self.assertEqual(list(msg.keys()), ["Subject", "MIME-Version", "Content-Type"])   # no sender, recipient, reply
+        self.assertEqual(msg["Subject"], "Run results")
+        self.assertEqual([p.get_content_type() for p in msg.walk()],
+                         ["multipart/mixed", "multipart/alternative", "text/plain", "multipart/related", "text/html",
+                          "image/png", "text/csv"])
+        self.assertEqual(msg.get_body(("plain",)).get_content(), FORWARDED_TEXT)
+        self.assertEqual(msg.get_body(("html",)).get_content(), FORWARDED_HTML)
+        image, csv = [p for p in msg.walk() if not p.is_multipart()][2:]
+        self.assertEqual((image["Content-ID"], image.get_content_disposition(), image.get_content()),
+                         ("<curve>", "inline", PNG))
+        self.assertEqual((csv.get_filename(), csv.get_content_disposition(), csv.get_content().encode()),
+                         ("e6.csv", "attachment", CSV))
+        rec, = self.audited()
+        self.assertEqual({k: v for k, v in rec.items() if k != "ts"},
+                         {"action": "mail_forward", "thread": THREAD, "key": "s7", "draft": "r-1", "message": "d1",
+                          "bytes": len(raw), "images": 1, "files": ["e6.csv"]})
+
+    def test_the_subject_loses_its_reply_tag_and_re_as_the_tab_heads_the_thread(self):
+        self.assertEqual(mailforward.subject("Re: Run results [#%s]" % TAG), "Run results")
+        self.assertEqual(mailforward.subject("RE: re:Fwd: Run [#%s] results " % TAG), "Run results")
+        self.assertEqual(mailforward.subject("Run results"), "Run results")
+        self.assertEqual(mailforward.subject("Are: the [#notatag!] stays"), "Are: the [#notatag!] stays")
+        self.assertEqual(mailforward.subject("[mailroom] Re: held mail"), "[mailroom] Re: held mail")
+
+    def test_the_review_s_note_on_a_mail_sent_unchanged_is_left_out(self):
+        note = ("[Sent unchanged by the mailroom: the pre-send review asked the agent for changes and it did not revise "
+                "or withdraw this mail within 30 minutes.]")
+        own = sent_mail("E6", text=note + "\n\nE6 is done.\n", images=(), files=(),
+                        html='<html><body style="margin:0"><p style="color:#6e7781;font-size:13px">%s</p>\n'
+                             '<p>E6 is done.</p></body></html>\n' % note)
+        rendered = sent_mail("E6", text=note + "\n\nE6 is done.\n", images=(), files=(),
+                             html='<body style="margin:0">\n<p>%s</p>\n<p>E6 is done.</p>\n</body>\n' % note)
+        for raw, html in ((own, '<html><body style="margin:0"><p>E6 is done.</p></body></html>\n'),
+                          (rendered, '<body style="margin:0">\n<p>E6 is done.</p>\n</body>\n')):
+            msg = parsed(mailforward.draft(raw, "E6").raw)
+            self.assertEqual(msg.get_body(("plain",)).get_content(), "E6 is done.\n")
+            self.assertEqual(msg.get_body(("html",)).get_content(), html)
+
+    def test_a_mail_with_only_text_or_only_html_keeps_that_alone(self):
+        old = EmailMessage()
+        old["Subject"] = "E6"
+        old.set_content("E6 is done.\n")
+        old.add_attachment(CSV, maintype="text", subtype="csv", filename="e6.csv")
+        msg = parsed(mailforward.draft(old.as_bytes(), "E6").raw)
+        self.assertEqual([p.get_content_type() for p in msg.walk()], ["multipart/mixed", "text/plain", "text/csv"])
+        old = EmailMessage()
+        old.set_content("<p>E6 <img src=\"cid:curve\"></p>\n", subtype="html")
+        old.add_related(PNG, maintype="image", subtype="png", cid="<curve>")
+        fwd = mailforward.draft(old.as_bytes(), "E6")
+        self.assertEqual([p.get_content_type() for p in parsed(fwd.raw).walk()],
+                         ["multipart/related", "text/html", "image/png"])
+        self.assertEqual((fwd.images, fwd.files), (1, []))
+        old = EmailMessage()
+        old.add_attachment(CSV, maintype="text", subtype="csv", filename="e6.csv")
+        with self.assertRaisesRegex(ValueError, "neither a text nor an HTML body"):
+            mailforward.draft(old.as_bytes(), "E6")
+
+    def test_a_draft_over_gmail_s_limit_is_refused_before_anything_is_sent(self):
+        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, unread=set())
+        with self.assertRaisesRegex(ValueError, r"^the draft would be 35\.0 MB, more than the 35 MB Gmail takes in "
+                                                r"one, so none was made$"):
+            gmail.create_draft(b"x" * (gmailstate.MAX_DRAFT_BYTES + 1))
+        self.assertEqual(calls, [])
+        self.assertEqual(gmail.create_draft(b"x" * gmailstate.MAX_DRAFT_BYTES)["message"]["id"], "d1")
+
+    def test_what_cannot_be_forwarded_says_why_and_makes_no_draft(self):
+        subject = "Re: Run results [#%s]" % TAG
+        raw = sent_mail(subject)
+        store = self.store((7, THREAD, subject, raw), (9, "another-thread", subject, raw), (10, THREAD, subject, None))
+        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, unread=set())
+        for req, error in (
+                ({"thread": THREAD, "key": "i5"}, "thread must be a thread id and key an agent's mail (s<id>)"),
+                ({"thread": "-x", "key": "s7"}, "thread must be a thread id and key an agent's mail (s<id>)"),
+                ({"thread": THREAD, "key": "s9"}, "agent mail s9 is not in thread %s" % THREAD),
+                ({"thread": THREAD, "key": "s11"}, "the mailroom has no agent mail s11"),
+                ({"thread": THREAD, "key": "s10"}, "the mailroom kept no copy of agent mail s10: it was sent before the "
+                                                   "mailroom kept copies, and not copied from Gmail since")):
+            self.assertEqual(self.forward(req, store, gmail), {"ok": False, "error": error})
+        sha = hashlib.sha256(raw).hexdigest()
+        (store.messages / sha[:2] / (sha + ".eml")).write_bytes(raw + b"x")
+        self.assertEqual(self.forward({"thread": THREAD, "key": "s7"}, store, gmail),
+                         {"ok": False, "error": "the mailroom's copy of agent mail s7 is damaged: it does not hash to "
+                                                "its name"})
+        with sqlite3.connect(store.path) as con:                   # a copy named by something not a sha256
+            con.execute("update sent set eml = ? where id = 7", ("../../config.json",))
+        self.assertEqual(self.forward({"thread": THREAD, "key": "s7"}, store, gmail),
+                         {"ok": False, "error": "agent mail s7 names its copy '../../config.json', which is not a "
+                                                "sha256"})
+        res = self.forward({"thread": THREAD, "key": "s7"}, sources.MailStore(store.path.parent / "none.sqlite"), gmail)
+        self.assertEqual(res, {"ok": False, "error": "no database at %s" % (store.path.parent / "none.sqlite")})
+        self.assertEqual((self.uploads(calls), self.audited()), ([], []))
+
+    def test_a_draft_gmail_names_no_message_of_is_said_and_on_the_record(self):
+        subject = "Re: Run results [#%s]" % TAG
+        store = self.store((7, THREAD, subject, sent_mail(subject)))
+        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, unread=set(), draft={"id": "r-9"})
+        self.assertEqual(self.forward({"thread": THREAD, "key": "s7"}, store, gmail),
+                         {"ok": False, "error": "Gmail made the draft but named no message to open; it is in Gmail's "
+                                                "Drafts"})
+        (_, _, raw), = self.uploads(calls)
+        rec, = self.audited()
+        self.assertEqual({k: v for k, v in rec.items() if k != "ts"},
+                         {"action": "mail_forward", "thread": THREAD, "key": "s7", "draft": "r-9", "message": None,
+                          "bytes": len(raw), "images": 1, "files": ["e6.csv"]})
+
+    def test_no_gmail_another_s_gmail_or_gmail_failing_makes_no_draft_and_no_record(self):
+        subject = "Re: Run results [#%s]" % TAG
+        store = self.store((7, THREAD, subject, sent_mail(subject)))
+        no_login = {"ok": False, "error": "the tab cannot make a Gmail draft: the board config names no Gmail login of "
+                                          "the owner's (gmail_credentials), or the mailroom's config names no agents' "
+                                          "account"}
+        res = actions.dispatch({"action": "mail_forward", "thread": THREAD, "key": "s7"}, lambda: [], lambda: [],
+                               mail_store=store)                                     # off: the kit's default
+        self.assertEqual(res, no_login)
+        with mock.patch.dict(os.environ, {"AGENT_BOARD_GMAIL_CREDS": str(self.root / "no-login.json")}):
+            res = actions.dispatch({"action": "mail_forward", "thread": THREAD, "key": "s7"}, lambda: [], lambda: [],
+                                   mail_store=store)                                 # named, but missing
+        self.assertEqual(res, no_login)
+        gmail, calls = fixtures.gmail_of(AGENTS, BOX, unread=set())
+        res = self.forward({"thread": THREAD, "key": "s7"}, store, gmail)
+        self.assertEqual(res, {"ok": False, "error": "the Gmail login there is not the owner's (it is %s); not used" % AGENTS})
+        self.assertEqual(self.uploads(calls), [])
+        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, unread=set(), fail="/drafts")
+        res = self.forward({"thread": THREAD, "key": "s7"}, store, gmail)
+        self.assertEqual(res, {"ok": False, "error": "Google API answered HTTP 503"})
+        self.assertEqual(self.audited(), [])
+
+
 class CollectorTest(MailTest):
     SID = "11111111-2222-3333-4444-555555555555"
 
-    def board(self, d, read, **kw):
+    def board(self, d, read, mid, **kw):
         """A real collector on a status log and mailroom store in `d`: one agent whose latest mail to the owner
-        (Message-ID <m1@x>) is unanswered, and a mailbox whose summary counts the Message-IDs in `read` as read in the tab. kw: the
-        collector's other arguments (gmail, sent)."""
+        (Message-ID `mid`) is unanswered, and a mailbox whose summary counts the Message-IDs in `read` as read in the
+        tab. kw: the collector's other arguments (gmail, sent)."""
         (d / "events.jsonl").write_text(json.dumps({"ts": NOW - 4000, "event": "start", "session_id": self.SID,
                                                     "cli": "claude", "name": "alpha", "cwd": "/x"}) + "\n")
         con = fixtures.mailroom_db(d / "mailroom.sqlite")
         con.execute("insert into sessions(tag, cli, session_id, session_name, origin_host) values(?,?,?,?,?)",
                     ("abcd1234", "claude", self.SID, "alpha", "desktop"))
         con.execute("insert into sent(tag, thread_id, message_id, to_addr, subject, sent_at) values(?,?,?,?,?,?)",
-                    ("abcd1234", "t1", "<m1@x>", fixtures.OWNER, "Fixed", int(NOW - 290)))
+                    ("abcd1234", "t1", mid, fixtures.OWNER, "Fixed", int(NOW - 290)))
         con.commit()
         con.close()
         run = AgentMail(answer({"unread": 1, "inbox": 4, "read": read}))
@@ -394,21 +777,21 @@ class CollectorTest(MailTest):
 
     def test_mail_read_in_the_tab_turns_the_tile_from_waiting_and_the_snapshot_carries_the_counts(self):
         with tempfile.TemporaryDirectory() as d:
-            snap = self.board(Path(d), ["<M1@x>"]).snapshot(NOW)
+            snap = self.board(Path(d), ["<M1@x>"], "<m1@x>").snapshot(NOW)
             a, = snap["agents"]
             self.assertTrue(a["mail"]["read"])
             self.assertNotEqual(a["state"], "waiting")
             self.assertIn("read its mail", a["reason"])
             self.assertEqual((snap["mailbox"], snap["problems"]), ({"unread": 1, "inbox": 4}, []))
         with tempfile.TemporaryDirectory() as d:
-            a, = self.board(Path(d), ["<other@x>"]).snapshot(NOW)["agents"]
+            a, = self.board(Path(d), ["<other@x>"], "<m1@x>").snapshot(NOW)["agents"]
             self.assertIsNone(a["mail"]["read"])                 # no Gmail on this board: not known, still waiting
             self.assertEqual(a["state"], "waiting")
 
     def test_the_tab_counting_a_mail_read_wins_over_gmail_and_gmail_answers_the_rest(self):
-        gmail, _ = fixtures.gmail_of(fixtures.OWNER, BOX, inbox=set(), unread={"g1", "g2"})
+        gmail, _ = fixtures.gmail_of(fixtures.OWNER, BOX, unread={"g1", "g2"})
         with tempfile.TemporaryDirectory() as d:
-            col = self.board(Path(d), ["<M1@mail.gmail.com>"], gmail=gmail)
+            col = self.board(Path(d), ["<M1@mail.gmail.com>"], "<m1@x>", gmail=gmail)
             col.agents(NOW)                                     # reads the mailbox's summary
             self.assertIsNone(col.is_read("<m2@x>"))            # Gmail not looked at yet: unknown, and now asked
             gmail.is_read("<M1@mail.gmail.com>")                # asked too, so Gmail's answer for it would be known
@@ -417,18 +800,44 @@ class CollectorTest(MailTest):
             self.assertIs(col.is_read("<m1@MAIL.gmail.com>"), True)    # unread in Gmail, read in the tab
             self.assertIs(col.is_read("<m2@x>"), False)                # not read in the tab: Gmail's answer
 
+    def test_mail_kept_for_the_tab_alone_is_unread_until_the_tab_reads_it_and_gmail_is_never_searched_for_it(self):
+        kept = "<177.4.5@agent-mailroom.local>"                 # the mailroom kept it: Gmail never had it
+        gmail, calls = fixtures.gmail_of(fixtures.OWNER, BOX, unread=set())
+        with tempfile.TemporaryDirectory() as d:
+            col = self.board(Path(d), ["<m2@x>"], kept, gmail=gmail)
+            for _ in range(2):                                  # the snapshot asks, Gmail checks, and again
+                a, = col.snapshot(NOW)["agents"]
+                gmail.maybe_refresh(force=True)
+            self.assertTrue(gmail.status["ok"], gmail.status)
+            self.assertEqual([u for _, u, _, _ in calls if "rfc822msgid" in u], [])
+            self.assertEqual((a["mail"]["read"], a["mail"]["last_out_kept"], a["mail"]["gmail_thread"]),
+                             (False, True, None))              # unread in the tab, not "no reply yet"
+            self.assertEqual(a["state"], "waiting")
+        with tempfile.TemporaryDirectory() as d:
+            a, = self.board(Path(d), [kept.upper()], kept, gmail=gmail).snapshot(NOW)["agents"]
+            self.assertIs(a["mail"]["read"], True)                  # read in the tab: the tile stops waiting
+            self.assertIn("read its mail", a["reason"])
+        with tempfile.TemporaryDirectory() as d:
+            col = self.board(Path(d), [], kept)
+            col.mailbox.load = functools.partial(mailbox.summary, run=AgentMail((1, "", "agent-mail: locked")))
+            a, = col.snapshot(NOW)["agents"]
+            self.assertIsNone(a["mail"]["read"])                    # no summary yet: the tab cannot say
+        with tempfile.TemporaryDirectory() as d:
+            a, = self.board(Path(d), [], "<m1@x>").snapshot(NOW)["agents"]
+            self.assertIs(a["mail"]["last_out_kept"], False)       # Gmail's: its link stays
+
     def test_a_done_message_is_ticked_off_once_its_email_is_read_in_the_tab_alone(self):
         sent.record("send", "alpha", "fix it", True, ts=NOW - 600, ref="hhhh", id=self.SID)
         sent.MARKS.write_text(json.dumps({"ts": NOW - 300, "ref": "hhhh", "event": "done", "note": "fixed"}) + "\n")
         with tempfile.TemporaryDirectory() as d:
-            col = self.board(Path(d), ["<m1@x>"], sent=sent)     # no Gmail on this board
+            col = self.board(Path(d), ["<m1@x>"], "<m1@x>", sent=sent)     # no Gmail on this board
             col.snapshot(NOW)
             self.assertEqual(col.tick_seen(NOW), ["hhhh"])
             self.assertEqual(sent.messages()[0]["tick"]["note"], 'you read its email "Fixed"')
 
     def test_a_failing_summary_is_a_problem_and_the_board_carries_on(self):
         with tempfile.TemporaryDirectory() as d:
-            col = self.board(Path(d), [])
+            col = self.board(Path(d), [], "<m1@x>")
             col.mailbox.load = functools.partial(mailbox.summary, run=AgentMail((1, "", "agent-mail: locked")))
             snap = col.snapshot(NOW)
             self.assertNotIn("mailbox", snap)                  # no value yet: the Mac's tab says why there is none

@@ -787,6 +787,8 @@ class Refresh(unittest.TestCase):
             doc = timeuse.refresh(cfg, now=now, table=table)
             self.assertEqual((len(doc["daily"]), doc["block"]), (3, 300))
             self.assertEqual(doc["unsorted"], timeuse.UNSORTED)                 # the Mac reads the name from here
+            self.assertEqual(doc["colours"], {"groups": [{"name": "Work", "colour": "#0E8A84", "shades": []}],
+                                              "ungrouped": "#8C877F"})           # the Mail tab's colours too
             self.assertEqual(json.loads(timeuse.OUT.read_text())["config"], cfg)
             self.assertEqual(doc["daily"][-1]["rows"], [{"group": "Work", "subgroup": None, "inferred": False, "minutes": 5.0,
                                                          "work_minutes": 5.0}])

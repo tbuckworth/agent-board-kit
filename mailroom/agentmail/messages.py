@@ -1,9 +1,9 @@
-"""The message store: every mail an agent sends, as the exact MIME bytes handed to Gmail, and every reply the owner
-writes in the Mail tab with files (mailbox.reply_message, which no Gmail sees), each in a file named by its sha256 under
-config.MESSAGES_DIR (`<first 2 hex>/<sha256>.eml`). outbound.transmit keeps each agent mail here before it sends it,
-and the sent row records the sha256 (`sent.eml`); mailbox.answer keeps a reply with files, and its inbound row records
-the sha256 (`inbound.eml`). A file never changes once written, so a copy of it (agent-mail backup) is checked by its
-name alone."""
+"""The message store: every mail outbound.transmit sends or keeps (agents' mail and mailroom alerts, not the nudge),
+as its exact MIME bytes, and every reply the owner writes in the Mail tab with files (mailbox.reply_message, which no
+Gmail sees), each in a file named by its sha256 under config.MESSAGES_DIR (`<first 2 hex>/<sha256>.eml`).
+outbound.transmit writes each mail here before it sends or keeps it, and the sent row records the sha256
+(`sent.eml`); mailbox.answer keeps a reply with files, and its inbound row records the sha256 (`inbound.eml`). A file
+never changes once written, so a copy of it (agent-mail backup) is checked by its name alone."""
 import hashlib
 import re
 from pathlib import Path

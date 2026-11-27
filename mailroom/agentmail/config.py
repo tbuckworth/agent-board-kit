@@ -1,9 +1,10 @@
-"""Paths and configuration. Nothing here holds a secret; the token lives in TOKEN_PATH.
+"""Paths and configuration. Nothing here holds a secret; the Gmail token, when Gmail is used, lives in TOKEN_PATH.
 
 Every personal value (the agents account, the owner's name and address, the GitHub owner, where
-repos live) comes from ~/.config/agent-mail/config.json. DEFAULTS are neutral: `account` must be
-set before anything sends or polls mail, and `allowlist` must name the owner before any mail is
-delivered.
+repos live) comes from ~/.config/agent-mail/config.json. DEFAULTS are neutral: `allowlist` must name the owner
+before any mail reaches them or any reply of theirs is routed. With Gmail on (`"gmail": true`, the default),
+`account` must be set before anything sends or polls mail; with Gmail off (`"gmail": false`) nothing calls Gmail,
+and agent mail, all of it to the owner, is kept for the board's Mail tab, from LOCAL_ACCOUNT unless `account` is set.
 """
 import copy
 import json
@@ -18,18 +19,32 @@ CLIENT_SECRETS_PATH = CONF_DIR / "credentials.json"
 CONFIG_PATH = CONF_DIR / "config.json"
 STATE_DIR = Path(os.environ.get("AGENT_MAIL_STATE_DIR", HOME / ".local" / "state" / "agent-mail"))
 DB_PATH = STATE_DIR / "mailroom.sqlite"
-# Every mail an agent sends, as the MIME bytes handed to Gmail, one file per sha256 (agentmail/messages.py).
+# One JSON line per security alert (outbound.SECURITY_ALERTS) kept for the Mail tab rather than sent through Gmail,
+# {"at", "kind", "subject", "thread_id"}, appended and never rewritten (outbound.record_security_alert): the agent
+# board reads it and notifies the owner on the Mac, where the phone app cannot dismiss it.
+SECURITY_ALERTS_PATH = STATE_DIR / "security-alerts.jsonl"
+# The message store (agentmail/messages.py says what it holds).
 MESSAGES_DIR = STATE_DIR / "messages"
 LOCK_PATH = STATE_DIR / "mailroom.lock"
+# Held by whatever types or presses keys in an agent's tmux pane (commands.keys_lock), so two never mix their keys.
+KEYS_LOCK = STATE_DIR / "keys.lock"
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 # The coding-agent CLIs the tools start and talk to, and the DEFAULTS keys holding the model and effort agent-spawn
 # gives a new agent of each.
 CLIS = ("claude", "codex")
 SPAWN_KEYS = {"claude": {"model": "spawn_claude_model", "effort": "spawn_claude_effort"},
               "codex": {"model": "spawn_codex_model", "effort": "spawn_codex_effort"}}
+RESEARCHER_PLATFORM_PYTHONS = {
+    "darwin": ("/opt/homebrew/bin/python3.12", "/opt/homebrew/opt/python@3.12/bin/python3.12",
+               "/usr/local/bin/python3.12", "/usr/local/opt/python@3.12/bin/python3.12",
+               "/opt/homebrew/bin/python3", "/usr/local/bin/python3"),
+}
 # What an agent may type for the owner where an address or a name is wanted (agent-mail --to owner, agent-group
 # --as owner), whatever config owner_name says; the owner's name itself works too.
 OWNER_ALIAS = "owner"
+# The From address of agent mail with Gmail off and no `account` set: it is only ever kept, never sent. Its domain
+# is routing.LOCAL_DOMAIN, that of the Message-IDs the mailroom makes itself.
+LOCAL_ACCOUNT = "agents@agent-mailroom.local"
 
 
 class ConfigError(Exception):
@@ -38,7 +53,13 @@ class ConfigError(Exception):
 
 # Every config key and its default; config.json overrides them (load).
 DEFAULTS = {
-    # The dedicated agents Gmail account (required): every agent sends from it, the mailroom polls it.
+    # Whether the mailroom uses Gmail at all. true: agent mail goes through the agents Gmail account (`account`), whose
+    # inbox the daemon polls. false: nothing calls Gmail and no token is needed; agent mail to the owner and every
+    # alert are kept for the board's Mail tab and phone app, mail to anyone else is refused, and the owner answers in
+    # the tab (README.md, "Running without Gmail").
+    "gmail": True,
+    # The dedicated agents Gmail account (required with Gmail on): every agent sends from it, the mailroom polls it.
+    # With Gmail off it is only the From address of kept mail (LOCAL_ACCOUNT when unset).
     "account": None,
     # From display name on agent mail: "<from_name> (<session name>)".
     "from_name": "Agents",
@@ -61,7 +82,14 @@ DEFAULTS = {
     "repos_root": "~/code",
     # Repo for tasks that belong to no project (read by the orchestrator brief and the to-do tools).
     "general_repo": "~/code/general",
-    "poll_seconds": 30,   # agent-mailroom's wait between Gmail polls
+    "poll_seconds": 30,   # agent-mailroom's wait between Gmail polls (with Gmail off, between its passes)
+    # The tmux server every tmux command runs against (commands.tmux passes it as -S): a socket path, or null for
+    # tmux's own default for this user, $TMUX_TMPDIR/tmux-UID/default (TMUX_TMPDIR unset: /tmp). $TMUX is never used.
+    "tmux_socket": None,
+    # agent-send's waits for a live Codex agent: to see whether Codex took a message typed at its prompt or queued, for
+    # the keys lock, and for the release of one Codex holds after an interrupted turn: every key and its default is in
+    # agentmail/codexqueue.py DEFAULTS, e.g. {"check_seconds": 15}.
+    "codex_queue": {},
     # When the matched session is not live: resume it (claude --resume --bg / codex exec resume)?
     "resume_offline": True,
     # Resume with permissions bypassed / full-access sandbox, as the agents' sessions run anyway; also what
@@ -82,16 +110,17 @@ DEFAULTS = {
     "orchestrator_codex_model": None,
     "orchestrator_codex_effort": "high",
     # agent-spawn's model and effort per CLI when --model/--effort are not given. null leaves that choice to the
-    # CLI's own default (the kit's default for Claude). Set full ids in config.json, e.g. "claude-fable-5-2", so a new
+    # CLI's own default (the kit's default for Claude). Set full ids in config.json, e.g. "claude-opus-5-5", so a new
     # release does not change what spawned agents run.
     "spawn_claude_model": None,
     "spawn_claude_effort": "xhigh",
     # The models a Claude agent steps down to, in order, after spawn_claude_model (claude_model_order), e.g.
-    # ["claude-opus-5-5"]. A new agent routed by usage, or one agent-failover moves on a limit, takes each Claude
+    # ["claude-fable-5-2"]. A new agent routed by usage, or one agent-failover moves on a limit, takes each Claude
     # login in usage.order on the first model, then each on the next, and so on; only once none has headroom does it
-    # go where it bills extra usage, and only on the last model. agent-failover moves it back once the login and model
-    # it started on have reset. [] (the default) keeps every agent on spawn_claude_model; it is ignored while
-    # spawn_claude_model is null.
+    # go where it bills extra usage, and only on the last model. Once idle, agent-failover moves it up to the first
+    # place with headroom earlier in that order (README, "Moving it up"). A step down gains headroom only on a model
+    # with usage windows of its own (agent-usage shows which have one). [] (the default) keeps every agent on
+    # spawn_claude_model; it is ignored while spawn_claude_model is null.
     "claude_fallback_models": [],
     "spawn_codex_model": "gpt-6.1-sol",
     "spawn_codex_effort": "xhigh",
@@ -137,7 +166,8 @@ DEFAULTS = {
     "agent_thread_cap": 12,
     # One-line notice to the owner when a collaborator starts a new thread.
     "notify_owner_new_collab_thread": True,
-    # Where mailroom alerts go (default: the owner's address, owner_address), and whether they are sent at all.
+    # Where mailroom alerts go (default: the owner's address, owner_address), and whether they are sent at all. With
+    # Gmail off they go to the owner's address whatever alert_to says (alert_address).
     "alert_to": None,
     "alerts_enabled": True,
     # False on machines whose sessions the mailroom cannot reach (the Mac): agent-mail send refuses.
@@ -154,6 +184,39 @@ DEFAULTS = {
     # agent-mail recover: seconds per search (at most 20) and days of sessions searched (at most 30).
     "recovery_seconds": 20,
     "recovery_days": 14,
+    # Documents sent from the owner's reMarkable tablet start a reader agent (agentmail/remarkable.py; README.md,
+    # "reMarkable documents"). It needs Gmail ("gmail": true): the tablet mails the document to `address`, a secret
+    # plus-address of the agents account, kept only in config.json; the route is off while `address` is unset. A mail
+    # must come from `sender`, show a DKIM pass for `dkim_domain` and, when `display_name` (the owner's reMarkable
+    # account name) is set, that name. Its agent runs `cli` in a worktree of `repo` (the owner's inbox repo, whose
+    # AGENTS.md it follows) under `worktrees_dir` (null: the repo's path with "-worktrees" added); model and effort
+    # come from spawn_<cli>_*; `fallback_cli` runs when a preflight finds Claude out of credit.
+    "remarkable": {
+        "address": None,
+        "sender": "my@remarkable.com",
+        "display_name": None,
+        "dkim_domain": "remarkable.com",
+        "repo": None,
+        "worktrees_dir": None,
+        "cli": "claude",
+        "fallback_cli": "codex",
+    },
+    # Where agent mail to the owner goes: through Gmail (the default), or kept for the board's Mail tab alone; every
+    # key and its default is in agentmail/outbound.py MAILBOX_DEFAULTS, e.g. {"owner_delivery": "local",
+    # "nudge_minutes": 30}.
+    "mailbox": {},
+    # Researcher controls (agentmail/researchermode.py; README.md, "Researcher mode"): the Mail tab's switch that has
+    # a routed agent run the `researcher` plugin (researcher_payload.PLUGIN_URL). researcher_workflow: how each CLI
+    # invokes its installed interactive workflow. researcher_marketplaces: the plugin marketplace each CLI installed it
+    # from on this host (config/researcher-marketplace is the kit's for Claude Code). researcher_python: candidate
+    # interpreter paths on this host for the plugin's helpers; null uses the platform paths, PATH and Agent Mail's
+    # Python. Nothing happens until the owner turns the switch on for a thread.
+    "researcher_workflow": {
+        "claude": "Use the `researcher:researcher` command (`/researcher:researcher`) from the verified files.",
+        "codex": "Use the `$researcher:researcher` skill from the verified files.",
+    },
+    "researcher_marketplaces": {"claude": "agent-kit", "codex": "agent-kit-codex"},
+    "researcher_python": None,
     # agent-mail backup (agentmail/backup.py): the directories it copies the message store and the database to, each
     # on a disk other than the state's. Empty: the command refuses.
     "backup": {"targets": []},
@@ -181,8 +244,16 @@ def owner_address(cfg):
 
 
 def alert_address(cfg):
-    """Where mailroom alerts go: alert_to, else the owner's address; None when neither is set."""
+    """Where mailroom alerts go: alert_to, else the owner's address; None when neither is set. With Gmail off
+    (gmail_on), the owner's address alone, since only mail to the owner is kept for the Mail tab."""
+    if not gmail_on(cfg):
+        return owner_address(cfg)
     return cfg.get("alert_to") or owner_address(cfg)
+
+
+def gmail_on(cfg):
+    """Whether the mailroom uses Gmail (config "gmail", load checks it is true or false)."""
+    return cfg.get("gmail", DEFAULTS["gmail"]) is not False
 
 
 def is_owner_alias(cfg, value):
@@ -218,7 +289,10 @@ def load():
     cfg = copy.deepcopy(DEFAULTS)
     if CONFIG_PATH.exists():
         cfg = merged(cfg, json.loads(CONFIG_PATH.read_text()))
-    cfg["account"] = (cfg.get("account") or "").strip().lower() or None
+    if not isinstance(cfg.get("gmail"), bool):
+        raise ConfigError("config `gmail` in %s must be true or false (JSON, no quotes), not %s"
+                          % (CONFIG_PATH, json.dumps(cfg.get("gmail"))))
+    cfg["account"] = (cfg.get("account") or "").strip().lower() or (None if cfg["gmail"] else LOCAL_ACCOUNT)
     cfg["allowlist"] = [a.lower() for a in (cfg.get("allowlist") or [])]
     cfg["owner_name"] = (cfg.get("owner_name") or "").strip() or DEFAULTS["owner_name"]
     cfg["collaborators"] = {k.lower(): (v or {}) for k, v in (cfg.get("collaborators") or {}).items()}
@@ -242,8 +316,9 @@ def oauth_client_path(cfg):
 
 
 def require_account(cfg):
-    """The agents account, or ConfigError with what to set."""
+    """The agents account, or ConfigError with what to set. With Gmail off, load has set it (LOCAL_ACCOUNT)."""
     if not cfg.get("account"):
         raise ConfigError("config `account` is not set: put the agents Gmail address in %s, "
-                          'e.g. {"account": "agents@example.com", "allowlist": ["owner@example.com"]}' % CONFIG_PATH)
+                          'e.g. {"account": "agents@example.com", "allowlist": ["owner@example.com"]}, or turn Gmail '
+                          'off there with {"gmail": false} to keep agent mail for the Mail tab alone' % CONFIG_PATH)
     return cfg["account"]

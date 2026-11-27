@@ -2,8 +2,10 @@
 import re
 import secrets
 from email.utils import parseaddr
+from typing import Iterable, Optional
 
 ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"   # no 0/o/1/l/i ambiguity when read aloud
+# agent-board's agentboard/sources.py copies this in REPLY_TAG, which mailforward.py uses: change both together.
 TAG_RE = r"[a-z0-9]{6,12}"
 
 # Marks on the mail the agents account sends: a routed mail carries its reply tag in MAILROOM_HEADER, an alert
@@ -16,6 +18,7 @@ ALERT_PREFIX = "[mailroom] "
 GROUP_CLI = "group"
 # What mail clients put before a reply's subject (Re:) and a forward's (Fw:, Fwd:), possibly several deep.
 _REPLY = r"re\s*:\s*"
+# agent-board's agentboard/mailforward.py copies this in REPLY_PREFIXES: change both together.
 _PREFIXES = re.compile(r"^\s*(?:%s|fwd?\s*:\s*)*" % _REPLY, re.I)
 
 
@@ -84,8 +87,14 @@ def local_gmail_id(key):
     return LOCAL_PREFIX + key
 
 
+# The domain of the Message-IDs the mailroom makes itself: a tab reply's, and those of agent mail kept for the Mail tab
+# alone (outbound.transmit).
+# agent-board's sources.MAILROOM_DOMAIN copies this to tell mail in the Mail tab alone: change both together.
+LOCAL_DOMAIN = "agent-mailroom.local"
+
+
 def local_message_id(key):
-    return "<mailbox.%s@agent-mailroom.local>" % key
+    return "<mailbox.%s@%s>" % (key, LOCAL_DOMAIN)
 
 
 def is_local(gmail_id):
@@ -105,6 +114,15 @@ def is_alert(hdrs, account):
 
 def message_ids(value):
     return re.findall(r"<[^>\s]+>", value or "")
+
+
+def direct_reply_parent(headers: Iterable[tuple[str, str]]) -> Optional[str]:
+    """The sole Message-ID in the sole In-Reply-To header. Header names are lower case."""
+    parents = [value for key, value in headers if key == "in-reply-to"]
+    if len(parents) != 1:
+        return None
+    ids = message_ids(parents[0])
+    return ids[0] if len(ids) == 1 else None
 
 
 def sender(value):

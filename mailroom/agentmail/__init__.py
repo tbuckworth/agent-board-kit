@@ -1,39 +1,47 @@
 """The library the commands in bin/ share. README.md documents the commands.
 
 Modules:
-  accounts: Claude logins (config `usage.claude_accounts`): lookup, readiness, owner rules, env, a new login's setup
-  alerts: Mailroom alerts to the owner: plain, untagged, deduplicated mail
+  accounts: Claude logins (config `usage.claude_accounts`): lookup, readiness, owner rules, launch options, env, a new login's setup
+  alerts: Mailroom alerts to the owner: unrouted, marked, deduplicated mail; the content-free nudge while mail waits in the Mail tab
   backup: agent-mail backup: the message store and the database copied to config backup.targets
   claude_session: A Claude Code session's transcript, process, pane and background jobs; moving it to another login
   cli: Stopping a script with its name and a message; refusing to act as the owner inside an agent session
   close: agent-close: ending an agent's session and removing its worktree once its work is landed
+  codexqueue: A message to a live Codex agent: typed at its idle prompt, else followed in its queue, releasing one held after an interrupt
   commands: Running a command, the tmux helper, a repo's main checkout, an option's value in a command line
   compose: Plain text to HTML for outgoing mail, and HTML back to text (a mail's plain part, or its words at a glance)
-  config: Paths, `DEFAULTS`, and `config.json` merged over them
+  config: Paths, `DEFAULTS`, and `config.json` merged over them; whether Gmail is used at all (`gmail_on`)
   deliver: Handing a text to a session through agent-send, and the delivery receipt agent-send writes
   failover: agent-failover: spotting a limit, deciding where an agent goes, moving it; the extra-usage spend mail
-  gmail: The Gmail API layer
+  fastmode: Fast mode on a Mail-tab thread: its state and end, the line on the owner's messages, the review skip, the effort put back
+  fasttrial: agent-mail fast-trial: fast mode's effort keys tried on a new CLI version in a throwaway session, and the version added to the tested list
+  gmail: The Gmail API layer, and what stands in for the service with Gmail off in config (OFF)
   groupcmd: agent-group's commands on the central mailroom, the Mac's proxy to them, delivering a post, the notices
   groupmail: Groups and email: the mail to the owner for each new group, their reply as their post, their mail asking for one
-  groups: Groups as append-only envelope records: ids, envelopes, the fold, which posts alert whom, the store, notice flags
-  headless: A `claude -p` run (orchestrator, reviewer) and the logins to run it on
+  groups: Groups as append-only envelope records: ids, envelopes, the fold, topics, which posts alert whom, the store, notice flags
+  headless: A `claude -p` run (orchestrator, reviewer, reMarkable preflight) and the logins to run it on
+  imagefile: An image agent mail embeds, read from its bytes: its type and its size in pixels
   jsonfile: Atomic JSON, text and byte writes, durable on request; JSON-lines logs and their tails
   launch: Starting Claude Code or Codex in a tmux pane: the launch line, Codex's start, the brief's preamble
   listing: What agent-mail prints of sent mail, inbound mail and a proxied send's receipt
-  mailbox: The owner's mailbox for the board's Mail tab: threads, their flags and the rules, list, mark, sync, answer, show, part, summary, backfill
+  mailbox: The owner's mailbox for the board's Mail tab: threads, their flags and the rules, the Fast and Researcher switches, list, mark, sync, answer, fast, researcher, show, part, summary, backfill
   mailroom: One inbound mail, for the daemon and agent-mail: holds, its session, orchestrator context and thread, delivery, state and labels
   mailview: The Mail tab's view of a stored mail: its parts, its HTML sanitized, a whole thread as one HTML page
   memcap: Per-agent memory caps in systemd scopes
   memwatch: Who holds the memory, and when to warn
-  messages: The message store: the MIME bytes of every agent mail and of the owner's Mail-tab replies with files, by sha256
+  messages: The message store: the MIME bytes of every agent mail and mailroom alert, and of the owner's Mail-tab replies with files, by sha256
   orchestrate: One orchestrator event: the lock, the run on each login in turn, the run log
-  outbound: agent-mail's sending: who --to and --cc name, the MIME message, kept then sent, send and reply after the review, held drafts
+  outbound: agent-mail's sending: who --to and --cc name, the MIME message, kept then sent (or kept for the Mail tab alone), send and reply after the review, held drafts; without Gmail, mail to others refused and security alerts recorded
+  paneeffort: A live agent's tmux pane (Claude Code and Codex): whether its idle prompt takes keys now, and its effort read and changed with its own keys
   piped: Reading piped or redirected input without waiting on one that never ends
   procs: The process tree from /proc
   recovery: The bounded, read-only ownership search for an unowned reply
   registry: The address book: both CLIs' session registries, and finding a session by name or id
+  remarkable: Documents from the owner's reMarkable tablet start a reader agent (needs Gmail)
   remote: The authenticated SSH transport between machines
-  replyfiles: The files in the owner's Mail-tab replies: safe names, read back from the store, written where the agent opens them
+  replyfiles: The files in the owner's Mail-tab replies and in --input-json messages: safe names and types, stored, written where the agent opens them
+  researcher_payload: Verify the installed Researcher workflow on the receiving CLI and host
+  researchermode: Researcher controls, sent to and acknowledged by the conversation that owns a routing tag
   report: Assembling and rendering the status report
   review: The pre-send review
   reviewgate: Codex and a repo's own .codex/hooks.json: a worktree whose hooks its main checkout lacks
@@ -51,6 +59,7 @@ Modules:
 
 Data files:
   email_rules.md: The owner's mail rules, which `agent-mail guide` prints and the reviewer applies
+  researcher_prompt.md: the interactive workflow instructions sent while Researcher mode is on
   review_prompt.md: The reviewer's prompt for mail to the owner
   review_prompt_outside.md: The reviewer's prompt for mail to anyone else
 """

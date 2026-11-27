@@ -2,8 +2,10 @@ import AppKit
 import SwiftUI
 
 // Where the owner's time went, per day and board group (the desktop computes it: agentboard/timeuse.py).
-// Sub-groups are shades of their group's colour. Time the desktop guessed a group for (an ungrouped tile, a
-// meeting, a document, an email) is hatched. Hovering names a segment below the chart. Clicking narrows: a group
+// Each group has its colour, the Mail tab's, and sub-groups are shades of it, darker to lighter in layout order;
+// Unsorted time is Ungrouped's grey (the desktop sends them all: agentboard/colours.py). Time the desktop guessed a
+// group for (an ungrouped tile, a meeting, a document, an email) is hatched. Hovering names a segment below the chart.
+// Clicking narrows: a group
 // shows only that group, split by sub-group; then a sub-group shows only that sub-group. Everything shown can count
 // all time, only work time or only the rest (the desktop's work hours; the choice is remembered). Clicking a day's date
 // lists what counted that day. "1 day" shows one day across its hours instead, a lane per group and per
@@ -69,6 +71,7 @@ struct TimeDoc: Decodable {
     var daily: [TimeDay]
     var items: [TimeItem]
     var unsorted: String          // the group of time no group fits (timeuse.UNSORTED)
+    var colours: GroupColours     // the groups' colours and sub-groups' shades; Unsorted takes Ungrouped's
 
     /// The figures counting only `hours`: every row's and item's minutes, and every item's blocks, in that time, and
     /// the rows and items with none of it left out. The days stay; TimeSheet decides which it shows.
@@ -119,27 +122,6 @@ struct TimeSegment: Identifiable {
     var inferred: Bool
     var minutes: Double
     var id: String { name + (inferred ? "~" : "") }
-}
-
-enum TimeColors {
-    /// The validated categorical order (dataviz palette), by position in the board's layout; Unsorted is grey.
-    static let order: [UInt32] = [0x2A78D6, 0xEB6834, 0x1BAF7A, 0xEDA100, 0xE87BA4, 0x008300, 0x6250D6]
-    static let unsorted = Color(hex: 0xA3A29C)
-
-    static func group(_ name: String, layout: [TimeLayoutGroup]) -> Color {
-        guard let i = layout.firstIndex(where: { $0.name == name }) else { return unsorted }
-        return Color(hex: order[i % order.count])
-    }
-
-    /// Sub-groups take lighter shades of the group's colour; time in no sub-group keeps the colour itself.
-    static func subgroup(_ sub: String?, of group: String, layout: [TimeLayoutGroup]) -> Color {
-        let base = NSColor(TimeColors.group(group, layout: layout))
-        guard let sub = sub, let g = layout.first(where: { $0.name == group }),
-              let i = g.subgroups.firstIndex(of: sub) else { return Color(nsColor: base) }
-        let n = max(g.subgroups.count, 1)
-        let mix = 0.25 + 0.45 * Double(i) / Double(n)          // 0.25 ... 0.7 towards white
-        return Color(nsColor: base.blended(withFraction: mix, of: NSColor.white) ?? base)
-    }
 }
 
 /// One lane of the one-day view: a group's time in no sub-group, or one sub-group's, and the blocks (their start
@@ -243,6 +225,9 @@ struct TimeSheet: View {
         oneDay ? allDays.filter { $0.day == focusDay } : Array((doc?.daily ?? []).suffix(range)).filter(shows)
     }
     var layout: [TimeLayoutGroup] { doc?.layout ?? [] }
+    /// The groups' colours (TimeDoc.colours). Before the figures come there are no groups, days or items to colour,
+    /// as with `layout`: an empty set stands in, never drawn.
+    var colours: GroupColours { doc?.colours ?? GroupColours(groups: [], ungrouped: HexColour(rgb: 0)) }
     var groupNames: [String] {
         var names = layout.map(\.name)
         if let u = doc?.unsorted, days.contains(where: { $0.rows.contains { $0.group == u } }) { names.append(u) }
@@ -373,7 +358,7 @@ struct TimeSheet: View {
 
     var groupLegend: some View {
         ForEach(groupNames, id: \.self) { g in
-            legendEntry(g, color: TimeColors.group(g, layout: layout), hours: hours(group: g, sub: nil), on: false,
+            legendEntry(g, color: colours.group(g), hours: hours(group: g, sub: nil), on: false,
                         help: "Show only \(g), split by sub-group") {
                 selected = g
                 sub = nil
@@ -385,7 +370,7 @@ struct TimeSheet: View {
     func subLegend(_ g: String) -> some View {
         ForEach(Array(subNames(g).enumerated()), id: \.offset) { _, s in
             let on: Bool = sub == .some(s)
-            legendEntry(s ?? "no sub-group", color: TimeColors.subgroup(s, of: g, layout: layout), hours: hours(group: g, sub: .some(s)),
+            legendEntry(s ?? "no sub-group", color: colours.subgroup(s, of: g), hours: hours(group: g, sub: .some(s)),
                         on: on, help: on ? "Show all of \(g)" : "Show only \(s ?? "time in no sub-group")") {
                 sub = on ? nil : .some(s)
                 openLine = nil
@@ -435,7 +420,7 @@ struct TimeSheet: View {
                     let m = rows.filter { $0.subgroup == s && $0.inferred == inferred }.map(\.minutes).reduce(0, +)
                     if m > 0 {
                         out.append(TimeSegment(group: g, sub: s, name: s.map { "\(g): \($0)" } ?? g,
-                                               color: TimeColors.subgroup(s, of: g, layout: layout), inferred: inferred, minutes: m))
+                                               color: colours.subgroup(s, of: g), inferred: inferred, minutes: m))
                     }
                 }
             }
@@ -629,7 +614,7 @@ struct TimeSheet: View {
                             HStack(spacing: 8) {
                                 Image(systemName: openLine == r.id ? "chevron.down" : "chevron.right")
                                     .font(.system(size: 9 * z)).foregroundStyle(.secondary).frame(width: 10)
-                                RoundedRectangle(cornerRadius: 2).fill(TimeColors.subgroup(r.sub, of: r.group, layout: layout))
+                                RoundedRectangle(cornerRadius: 2).fill(colours.subgroup(r.sub, of: r.group))
                                     .frame(width: 9, height: 9)
                                 Text(TimeSheet.hours(r.minutes)).monospacedDigit().frame(width: 52, alignment: .trailing)
                                 Text(r.label).lineLimit(1)
@@ -784,6 +769,7 @@ enum TimeTest {
         // TimeDoc.showing: a Monday with a block in work time and one after it, and a Saturday
         let row = { (m: Int, w: Int) in #"{"group": "Work", "subgroup": null, "inferred": false, "minutes": \#(m), "work_minutes": \#(w)}"# }
         let json = #"{"block": 300, "layout": [], "warnings": [], "waiting": [], "unsorted": "Unsorted", "#
+            + ##""colours": {"groups": [], "ungrouped": "#8C877F"}, "##
             + #""items": [{"day": "2026-11-02", "group": "Work", "#
             + #""subgroup": null, "inferred": false, "key": "k", "label": "k", "kind": "prompt", "minutes": 10, "work_minutes": 5, "#
             + #""blocks": [\#(at(9, 0)), \#(at(18, 0))], "work_blocks": [\#(at(9, 0))], "kinds": {}}], "daily": ["#
@@ -800,6 +786,21 @@ enum TimeTest {
             check(doc.daily.map(\.workday) == [true, false], "a day says whether it is a workday")
         } catch {
             check(false, "time.json with work time not understood: \(describeDecodeError(error))")
+        }
+        // the colours the desktop sends (agentboard/colours.py): a group's, its sub-groups' shades, Ungrouped's
+        let palette = ##"{"groups": [{"name": "Work", "colour": "#0E8A84", "shades": [{"name": "Alpha", "##
+            + ##""colour": "#006A65"}, {"name": "Beta", "colour": "#007A75"}]}], "ungrouped": "#8C877F"}"##
+        if let c = try? JSON.decoder.decode(GroupColours.self, from: Data(palette.utf8)) {
+            check(c.group("Work") == Color(hex: 0x0E8A84) && c.group("Unsorted") == Color(hex: 0x8C877F),
+                  "a group has its colour, time in no group Ungrouped's")
+            check(c.subgroup("Alpha", of: "Work") == Color(hex: 0x006A65)
+                  && c.subgroup(nil, of: "Work") == Color(hex: 0x0E8A84), "a sub-group has its shade, time in none the group's")
+            check(c.subgroup("Gone", of: "Work") == Color(hex: 0x0E8A84), "a sub-group no longer there: the group's colour")
+        } else {
+            check(false, "the desktop's colours do not decode")
+        }
+        for bad in ["\"0E8A84\"", "\"#0E8A8\"", "\"#0E8A8G\"", "\"#0E8A84 \"", "14"] {
+            check((try? JSON.decoder.decode([HexColour].self, from: Data("[\(bad)]".utf8))) == nil, "\(bad) is not a colour")
         }
         print(fails.isEmpty ? "time: all checks pass" : fails.map { "FAIL " + $0 }.joined(separator: "\n"))
         return fails.isEmpty ? 0 : 1

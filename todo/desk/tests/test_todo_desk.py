@@ -856,7 +856,7 @@ class Identity(unittest.TestCase):
 
 A1 = "d21ff850-e1bb-46d1-8d0a-c5bc8842af30"
 A2 = "01a11bf1-5b48-7651-b12c-140cb15c777e"
-A3 = "c007cb1b-4d4f-43ef-96eb-23c485a4fa22"
+A3 = "5e550000-0000-4000-8000-000000000001"
 GONE = "c7bfd808-0000-0000-0000-000000000000"
 SNAPSHOT = {"agents": [
     {"id": A1, "cli": "claude", "display": "importance-urgency reply", "state": "busy", "live": True,

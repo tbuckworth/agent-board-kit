@@ -1,9 +1,11 @@
 """The board's tile groups: the layout the Mac app sends, and the group each tile was last in.
 
 The layout lives on the Mac; the app sends it here (the "groups" action) whenever it changes, and the desktop keeps
-the latest copy in groups.json for the Time page, the usage breakdown and sub-group chats (subchats.py). Saving a
-layout also updates groups-history.json, which keeps each tile's group after the tile closes and the Mac stops sending
-it. A tile that is running but in no group has been ungrouped, and leaves the history.
+the latest copy in groups.json for the Time page, the usage breakdown, the voice page's excluded groups, the
+transcript archive, sub-group chats (subchats.py) and the group colours of the Mail tab's threads
+(mailbox.add_groups). Saving a layout also updates groups-history.json, which keeps each tile's group after the tile
+closes and the Mac stops sending it. A tile that is running but in no group has been ungrouped, and leaves the
+history.
 """
 import re
 import time
@@ -65,6 +67,15 @@ def placements(groups):
     return out
 
 
+def placed(history, layout):
+    """{session id: (group, sub-group or None)} of the tiles the owner placed (`history`) whose group is on the board
+    (`layout`, layout()'s form); a sub-group no longer in its group is dropped. The Time page, the transcript archive
+    and the Mail tab's colours place a session by this."""
+    subs = {g["name"]: set(g["subgroups"]) for g in layout}
+    return {sid: (h["group"], h["subgroup"] if h["subgroup"] in subs[h["group"]] else None)
+            for sid, h in history.items() if h["group"] in subs}
+
+
 def stored():
     """The saved layout, {"updated", "groups"}; {} before the Mac has sent one. A file that exists but does not hold
     a layout raises (ValueError, or read_json's OSError), rather than being taken for an empty one."""
@@ -98,8 +109,9 @@ def layout():
             for g in stored().get("groups") or []]
 
 
-def members(names, saved=None):
-    """{session id: group path ("Work" or "Work / Sub")} for the named groups, sub-groups included."""
+def members(names=None, saved=None):
+    """{session id: group path ("Work" or "Work / Sub")} for the named groups (every group when `names` is None),
+    sub-groups included. Raises as stored() does."""
     saved = stored() if saved is None else saved
     return {sid: p["group"] + (" / " + p["subgroup"] if p["subgroup"] else "")
-            for sid, p in placements(saved.get("groups") or []).items() if p["group"] in names}
+            for sid, p in placements(saved.get("groups") or []).items() if names is None or p["group"] in names}

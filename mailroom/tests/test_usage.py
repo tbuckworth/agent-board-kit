@@ -17,9 +17,10 @@ sys.path.insert(0, str(ROOT))
 
 import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
 import fakes  # noqa: E402
-from homes import Homes, config_file, dead_pid  # noqa: E402
+from homes import NEON, Homes, config_file, dead_pid, per_token_login  # noqa: E402
 from scripts import load_script  # noqa: E402
-from agentmail import accounts, commands, config, launch, registry, send, trust, usage  # noqa: E402
+from agentmail import (accounts, claude_session, commands, config, headless, launch, registry, send,  # noqa: E402
+                       trust, usage)
 
 NOW = 1791300000.0  # 2026-10-06
 # Shapes as Claude Code 2.1.291 and codex-cli 0.160.0 return them (identities removed).
@@ -537,8 +538,8 @@ class StaleEntry(unittest.TestCase):
         self.h = Homes(self, logins=("personal", "work"))
         self.base, self.personal, self.work = self.h.base, self.h.homes["personal"], self.h.homes["work"]
         dead = json.loads((ROOT / "tests" / "fixtures" / "stale-registry" / "4242424.json").read_text())
-        self.sid, self.name = dead["sessionId"], dead["name"]
-        self.cwd = str(self.base)   # a folder that exists, as the agent's did (a resume refuses a missing one)
+        # its folder one that exists: agent-send resumes a session only in its folder (a resume refuses a missing one)
+        self.sid, self.cwd, self.name = dead["sessionId"], str(self.base), dead["name"]
         self.fields = {k: v for k, v in dead.items() if k not in ("pid", "sessionId", "name", "cwd", "messagingSocketPath")}
         old_sock = self.base / "4242424.sock"   # the killed claude's socket file stays behind
         old_sock.write_text("")
@@ -603,8 +604,6 @@ class StaleEntry(unittest.TestCase):
         """The agent offline, its newest conversation on work (where the move left it), an older copy on personal;
         a reply arrives and the mailroom resumes it."""
         self.live.unlink()
-        d = json.loads(self.dead.read_text())
-        self.dead.write_text(json.dumps(dict(d, cwd=str(self.base))))
         copies = {}
         for home, text, age in ((self.personal, "before the move", 7200), (self.work, "after the move", 0)):
             p = home / "projects" / "-work" / (self.sid + ".jsonl")
@@ -766,12 +765,13 @@ class Spawn(unittest.TestCase):
             launch.start_claude("%6", "/bin/claude", "n2", None, "m", "high", "/b.md")
         # another login: the pane's session gets its CLAUDE_CONFIG_DIR, and the pane's shell exports it
         self.assertEqual(calls[0], ("set-environment", "-t", "%5", "CLAUDE_CONFIG_DIR", str(self.pro)))
-        self.assertEqual(calls[1][-1], "stty sane; export CLAUDE_CONFIG_DIR=%s; /bin/claude --name n "
+        self.assertEqual(calls[1], ("send-keys", "-t", "%5", "C-u"))   # the shell's line cleared first
+        self.assertEqual(calls[2][-1], "stty sane; export CLAUDE_CONFIG_DIR=%s; /bin/claude --name n "
                                        "--dangerously-skip-permissions --model m --effort high \"$(cat /b.md)\""
                          % self.pro)
         # the default login: removed from the session's environment and from the pane's shell
-        self.assertEqual(calls[3], ("set-environment", "-t", "%6", "-r", "CLAUDE_CONFIG_DIR"))
-        self.assertTrue(calls[4][-1].startswith("stty sane; unset CLAUDE_CONFIG_DIR; /bin/claude "))
+        self.assertEqual(calls[4], ("set-environment", "-t", "%6", "-r", "CLAUDE_CONFIG_DIR"))
+        self.assertTrue(calls[6][-1].startswith("stty sane; unset CLAUDE_CONFIG_DIR; /bin/claude "))
 
     def test_codex_launch_skips_the_update_menu(self):
         calls = []
@@ -829,6 +829,257 @@ class Spawn(unittest.TestCase):
         with mock.patch.object(trust, "CODEX_CONFIG", conf.parent / "config.toml" / "config.toml"), \
                 self.assertRaises(OSError):
             trust.trust_codex("/w")   # its folder is a file: the write fails
+
+
+class PerTokenLogin(unittest.TestCase):
+    """A login with a settings file and a model of its own, billed per token and used only when a person names it
+    (Gemini 4 Neon through OpenRouter, in Claude Code)."""
+
+    def setUp(self):
+        self.gemini = per_token_login(self)
+        self.dir, self.settings = str(Path(self.gemini["config_dir"]).resolve()), self.gemini["settings"]
+        self.cfg = json.loads(json.dumps(TWO))
+        self.cfg["usage"]["claude_accounts"]["gemini"] = self.gemini
+        self.s = usage.settings(self.cfg)
+
+    def test_launch_args_are_the_logins_settings_and_model_and_none_elsewhere(self):
+        own = ["--settings", str(Path(self.settings).resolve()), "--model", NEON]
+        self.assertEqual(accounts.launch_args(self.s, self.dir), own)
+        self.assertEqual(accounts.launch_args(self.s, self.dir + "/../.claude-gemini/"), own)   # however it is spelt
+        self.assertEqual(accounts.launch_args(self.s, None), [])          # the default login
+        self.assertEqual(accounts.launch_args(self.s, PRO_DIR), [])       # a login that sets neither
+        self.assertEqual(accounts.launch_args(self.s, "/nowhere"), [])
+        self.cfg["usage"]["claude_accounts"]["pro"]["settings"] = self.settings
+        self.assertEqual(accounts.launch_args(usage.settings(self.cfg), PRO_DIR), own[:2])
+        asked = []   # a control request (usage, model catalog) runs with them too; the claude CLI is the boundary
+        answer = json.dumps({"type": "control_response", "response": {"subtype": "success", "response": {}}})
+        def run(cmd, **kw):
+            asked.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, answer, "")
+        claude_session.claude_control("/bin/claude", self.gemini, {"subtype": "initialize"}, 5, None, run)
+        self.assertEqual(asked[0][-4:], own)
+
+    def test_login_flags_carry_no_settings_and_put_the_logins_model_in_place_of_any(self):
+        carried = ["--dangerously-skip-permissions", "--model", "claude-opus-5-5", "--settings", "/old.json",
+                   "--effort", "high", "--settings=/x.json", "--model=claude-fable-5-2"]
+        on_gemini = accounts.login_flags(self.s, self.dir, carried)
+        self.assertEqual(on_gemini, ["--dangerously-skip-permissions", "--effort", "high", "--settings",
+                                     str(Path(self.settings).resolve()), "--model", NEON])
+        self.assertEqual(accounts.login_flags(self.s, self.dir, on_gemini), on_gemini)   # twice: the same
+        self.assertEqual(accounts.login_flags(self.s, PRO_DIR, on_gemini),                # off it: no settings kept
+                         ["--dangerously-skip-permissions", "--effort", "high", "--model", NEON])
+
+    def test_the_model_a_move_or_a_new_agent_runs(self):
+        """accounts.move_model, which agent-spawn, agent-switch and agent-failover's moves all ask."""
+        def move(src, dst, asked, current="claude-fable-5-2"):
+            return accounts.move_model(self.s, src, dst, asked, current, "claude-opus-5-5")
+        self.assertEqual(move("pro", "gemini", None), NEON)                    # onto it: its model
+        self.assertEqual(move(None, "gemini", NEON), NEON)
+        self.assertEqual(move("gemini", "pro", None, NEON), "claude-opus-5-5")   # off it: a new agent's
+        self.assertEqual(move("gemini", "pro", None, "google/gemini-4-neon-20261101"), "claude-opus-5-5")
+        self.assertEqual(move("gemini", "pro", "claude-sonnet-5-5"), "claude-sonnet-5-5")
+        self.assertEqual(move("pro", "enterprise", None), "claude-fable-5-2")    # elsewhere: as it runs
+        self.assertEqual(move("pro", "enterprise", None, NEON), "claude-opus-5-5")
+        self.assertIsNone(accounts.move_model(self.s, "gemini", "pro", None, NEON, None))   # the CLI's own
+        for src, dst, asked, msg in (("pro", "gemini", "claude-opus-5-5", "Claude login gemini runs only %s, not "
+                                      "claude-opus-5-5: leave out the model" % NEON),
+                                     ("gemini", "pro", NEON, "Claude login pro cannot run %s, the model of a login "
+                                      "that runs no other: leave out the model" % NEON)):
+            with self.assertRaises(ValueError) as e:
+                move(src, dst, asked)
+            self.assertEqual(str(e.exception), msg)
+
+    def test_settings_or_a_model_on_the_default_login_are_refused(self):
+        """The default login's claude runs with neither (launch_args finds no account for its config dir None)."""
+        for keys, named in (({"model": NEON}, "model"), ({"settings": self.settings}, "settings"),
+                            ({"settings": self.settings, "model": NEON}, "settings and model")):
+            self.cfg["usage"]["claude_accounts"]["enterprise"] = dict({"config_dir": None}, **keys)
+            with self.assertRaises(ValueError) as e:
+                usage.settings(self.cfg)
+            self.assertEqual(str(e.exception), "config usage.claude_accounts.enterprise sets %s but no config_dir: a "
+                             "login with its own settings file or model needs a config dir of its own (agent-usage "
+                             "init-account)" % named)
+        config_file(self, self.cfg)   # and where a command reads the config
+        with self.assertRaisesRegex(ValueError, "enterprise sets settings and model but no config_dir"):
+            accounts.claude_env({})
+        self.cfg["usage"]["claude_accounts"]["enterprise"] = {"config_dir": None, "manual": True}
+        self.assertNotIn("claude:enterprise", usage.ranked(usage.settings(self.cfg)))
+
+    def test_ready_with_its_settings_file_and_no_login_of_its_own(self):
+        with mock.patch.object(accounts.sys, "platform", "linux"):
+            self.assertEqual(accounts.account_ready(self.gemini), (True, ""))   # no .credentials.json needed
+            ok, why = accounts.account_ready(dict(self.gemini, settings="/nonexistent/s.json"))
+            self.assertEqual((ok, why), (False, "settings file /nonexistent/s.json does not exist"))
+            self.assertIn("does not exist (set it up", accounts.account_ready(dict(self.gemini, config_dir="/nope"))[1])
+
+    def test_no_child_claude_inherits_a_settings_files_variables(self):
+        """Claude Code gives a Gemini agent's commands its settings' env (the endpoint and every model alias): a
+        review, a spawn or a switch run from that agent must not hand them to a claude on another login."""
+        self.cfg["usage"]["claude_accounts"]["gemini"] = dict(self.gemini, settings=self.settings)
+        extra = json.loads(Path(self.settings).read_text())
+        extra["env"]["OPENROUTER_ONLY_IN_THIS_FILE"] = "1"   # names come from the file, not a copy of its keys
+        Path(self.settings).write_text(json.dumps(extra))
+        config_file(self, self.cfg)
+        parent = dict({k: "gemini" for k in extra["env"]}, CLAUDE_CONFIG_DIR=self.dir, ANTHROPIC_NEW_VARIABLE="x",
+                      PATH="/bin", HOME="/home/x")
+        leaked = set(extra["env"]) | {"ANTHROPIC_NEW_VARIABLE"}
+        env = accounts.claude_env({"config_dir": PRO_DIR}, parent)
+        self.assertEqual((env["PATH"], env["CLAUDE_CONFIG_DIR"]), ("/bin", str(Path(PRO_DIR).resolve())))
+        self.assertEqual(leaked & set(env), set())
+        self.assertNotIn("CLAUDE_CONFIG_DIR", accounts.claude_env({}, parent))
+        for damaged, why in (("{not json", "cannot be read"), ('{"env": ["X"]}', 'is not an object with an "env"')):
+            Path(self.settings).write_text(damaged)   # its variables unknown: no child claude starts
+            with self.assertRaisesRegex(ValueError, "login gemini's settings file %s %s"
+                                        % (Path(self.settings).resolve(), why)):
+                accounts.claude_env({}, parent)
+        Path(self.settings).write_text(json.dumps(extra))
+        # every place that starts a claude child: the headless runs (orchestrator, reviewer), the usage and model
+        # probes, and a background session's resume and stop
+        with mock.patch.object(registry, "claude_bin", return_value="/bin/claude"):
+            runs = headless.logins(dict(self.cfg, orchestrator_fallback_secret=""),   # no API key: never the vault
+                                   headless.claude_command("haiku", None, []), parent, None)
+        self.assertEqual([name for name, _, _ in runs], ["pro", "enterprise"])   # never the manual login
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(kw["env"])
+            return subprocess.CompletedProcess(cmd, 0, "backgrounded · x", "")
+        with mock.patch.dict(os.environ, parent, clear=True):
+            with self.assertRaises(usage.UsageError):
+                usage.fetch_claude({"config_dir": PRO_DIR}, claude="/bin/claude", run=run)
+            with mock.patch.object(claude_session.subprocess, "run", side_effect=run):
+                claude_session.bg_resume("/bin/claude", {"id": "s" * 36, "cwd": ""}, [], PRO_DIR, "hi")
+                claude_session.bg_job("/bin/claude", "stop", "s" * 36, None)
+        for env in [e for _, _, e in runs] + calls:
+            self.assertEqual(leaked & set(env), set())
+            self.assertEqual(env["PATH"], "/bin")
+
+    def test_never_in_the_order_and_never_picked(self):
+        self.assertEqual(usage.ranked(self.s), ["claude:pro", "claude:enterprise", "codex"])
+        del self.cfg["usage"]["order"]   # the default: every login, the manual one ignored
+        self.assertEqual(usage.ranked(usage.settings(self.cfg)), ["claude:pro", "claude:enterprise", "codex"])
+        self.cfg["usage"]["order"] = ["claude:gemini", "claude:pro", "codex"]   # listed by mistake: still skipped
+        s = usage.settings(self.cfg)
+        self.assertEqual(usage.ranked(s), ["claude:pro", "codex"])
+        self.assertNotIn("claude:gemini", [t for t, _ in usage.places(s, ["claude-opus-5-5"], "gpt-6.1-sol")])
+        self.assertIn("claude:gemini", usage.targets(s))                  # agent-usage still shows it
+        out = {t: snap(t, [win("session", "5-hour", 0)]) for t in ("claude:pro", "claude:enterprise")}
+        out["claude:gemini"] = dict(usage.per_token(self.gemini), target="claude:gemini", cli="claude",
+                                    account="gemini")
+        rec = usage.recommend(out, self.cfg, only_cli="claude")
+        self.assertNotEqual(rec["use"], "claude:gemini")
+        self.assertNotIn("claude:gemini", [c["target"] for c in rec["candidates"]])
+
+    def test_its_usage_is_not_read_it_is_billed_per_token(self):
+        read = []
+
+        def reader(t, s):
+            read.append(t)
+            return {"windows": [win("session", "5-hour", 80)], "source": "server", "observed_at": NOW}
+        cache = Path(tempfile.mkdtemp()) / "cache.json"
+        snaps = usage.snapshots(self.cfg, reader=reader, cache_file=cache, now=NOW)
+        self.assertNotIn("claude:gemini", read)
+        self.assertEqual(snaps["claude:gemini"], {"target": "claude:gemini", "cli": "claude", "account": "gemini",
+                                                  "label": "Gemini Neon (OpenRouter)", "billing": "per_token",
+                                                  "windows": [], "weekly_budget_usd": 500})
+        self.assertNotIn("claude:gemini", json.loads(cache.read_text()))
+        self.assertEqual(usage.assess(snaps["claude:gemini"], self.s)["status"], "ok")
+        self.assertEqual(usage.summary(snaps["claude:gemini"]), "billed per token, weekly budget $500.00")
+        text = usage.render_text(snaps, usage.recommend(snaps, self.cfg), self.cfg, now=NOW)
+        self.assertIn("claude:gemini      Gemini Neon (OpenRouter)  [not read: used only when asked for by name]\n"
+                      "    billed per token, weekly budget $500.00; no plan usage windows", text)
+        au = load_script("agent-usage")
+        config_file(self, self.cfg)
+        # usage.snapshots as above: its probes of the other logins would ask Anthropic and OpenAI
+        with mock.patch.object(au.usage, "snapshots", return_value=snaps), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            au.main(["--json"])
+        acct = [a for a in json.loads(out.getvalue())["accounts"] if a["target"] == "claude:gemini"]
+        self.assertEqual(acct, [snaps["claude:gemini"]])
+
+    def test_init_account_leaves_it_out_of_the_order_it_prints(self):
+        au = load_script("agent-usage")
+        config_file(self, self.cfg)
+        home = Path(tempfile.mkdtemp())
+        with mock.patch.object(registry, "DEFAULT_CLAUDE_HOME", home), \
+                contextlib.redirect_stdout(io.StringIO()) as out:   # the default login's home: a temporary one
+            self.assertEqual(au.main(["init-account", "two", "--config-dir", str(home / ".claude-two")]), 0)
+        snippet = json.loads(next(ln for ln in out.getvalue().splitlines() if ln.strip().startswith("{")))
+        self.assertIn("gemini", snippet["usage"]["claude_accounts"])
+        self.assertEqual(snippet["usage"]["order"], ["claude:two", "claude:pro", "claude:enterprise", "codex"])
+
+    def test_agent_usage_login_prints_how_to_start_claude_there(self):
+        au = load_script("agent-usage")
+        config_file(self, self.cfg)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(au.main(["login", "gemini", "--json"]), 0)
+        settings = str(Path(self.settings).resolve())
+        self.assertEqual(json.loads(out.getvalue()), {
+            "name": "gemini", "label": "Gemini Neon (OpenRouter)", "config_dir": self.dir, "settings": settings,
+            "model": NEON, "manual": True, "args": ["--settings", settings, "--model", NEON]})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(au.main(["login", "enterprise", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue()), {"name": "enterprise", "label": "enterprise", "config_dir": None,
+                                                      "settings": None, "model": None, "manual": False, "args": []})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(au.main(["login", "gemini"]), 0)
+        self.assertIn("manual      yes\nargs        --settings %s --model %s\n" % (settings, NEON), out.getvalue())
+        for name in ("codex", "max"):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(au.main(["login", name, "--json"]), 1)
+            self.assertEqual(err.getvalue(), "agent-usage: %r is not a Claude login (usage.claude_accounts has "
+                                             "enterprise, gemini, pro)\n" % name)
+
+    def test_spawn_runs_the_logins_own_model_and_refuses_another(self):
+        sp = load_script("agent-spawn")
+        a = argparse.Namespace(cli=None, account="gemini", model=None, effort="high", new_repo="x", org="example-user")
+        with mock.patch.object(accounts.sys, "platform", "linux"):
+            plan = sp.plan_agent(a, self.cfg, {})
+            self.assertEqual((plan["account"], plan["config_dir"], plan["model"], plan["effort"]),
+                             ("gemini", self.dir, NEON, "high"))
+            same = argparse.Namespace(**dict(vars(a), model=NEON))
+            self.assertEqual(sp.plan_agent(same, self.cfg, {})["model"], NEON)
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                sp.plan_agent(argparse.Namespace(**dict(vars(a), model="claude-opus-5-5")), self.cfg, {})
+        self.assertIn("Claude login gemini runs only %s, not claude-opus-5-5: leave out the model" % NEON,
+                      err.getvalue())
+        self.cfg["spawn_route"] = "auto"   # routing by usage never starts an agent there
+        a = argparse.Namespace(cli=None, account=None, model=None)
+        everything_out = {t: snap(t, [win("session", "5-hour", 0)])
+                          for t in ("claude:pro", "claude:enterprise", "codex")}
+        self.assertNotEqual(sp.choose_route(a, self.cfg, None, read=lambda cfg: everything_out)["account"], "gemini")
+
+    def test_a_resume_in_the_background_there_runs_its_settings_and_model(self):
+        """agent-send's resume of an exited session, and a background session's move: `claude --resume --bg`."""
+        config_file(self, self.cfg)
+        sid, runs = "5e550000-0000-4000-8000-000000000001", []
+
+        def run(cmd, **kw):   # the claude CLI is the boundary
+            runs.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "backgrounded \u00b7 %s" % sid[:8], "")
+        with mock.patch.object(claude_session.subprocess, "run", side_effect=run):
+            ok, _ = claude_session.bg_resume("/bin/claude", {"id": sid, "cwd": ""}, ["--dangerously-skip-permissions",
+                                                                                    "--model", "opus"], self.dir, "hi")
+            (Path(self.dir) / "jobs" / sid[:8]).mkdir(parents=True)   # its daemon ran it: its saved options stand
+            (Path(self.dir) / "jobs" / sid[:8] / "state.json").write_text(json.dumps({"respawnFlags": ["--settings"]}))
+            claude_session.bg_resume("/bin/claude", {"id": sid, "cwd": ""}, ["--dangerously-skip-permissions"],
+                                     self.dir, "hi")
+        self.assertTrue(ok)
+        self.assertEqual(runs, [["/bin/claude", "--resume", sid, "--bg", "--dangerously-skip-permissions", "--settings",
+                                 str(Path(self.settings).resolve()), "--model", NEON, "hi"],
+                                ["/bin/claude", "--resume", sid, "--bg", "hi"]])
+
+    def test_the_launch_line_runs_its_settings_and_model(self):
+        config_file(self, self.cfg)
+        calls = []
+        # tmux is the boundary: record what would be typed in the pane
+        with mock.patch.object(launch.commands, "tmux", side_effect=lambda *a, **k: calls.append(a)), \
+                mock.patch.object(launch.time, "sleep"):
+            line = launch.start_claude("%5", "/bin/claude", "n", self.dir, "claude-opus-5-5", "high", "/b.md")
+        self.assertEqual(line, "stty sane; export CLAUDE_CONFIG_DIR=%s; /bin/claude --name n "
+                               "--dangerously-skip-permissions --effort high --settings %s --model %s "
+                               "\"$(cat /b.md)\"" % (self.dir, Path(self.settings).resolve(), NEON))
+        self.assertEqual(calls[0], ("set-environment", "-t", "%5", "CLAUDE_CONFIG_DIR", self.dir))
 
 
 class Cli(unittest.TestCase):

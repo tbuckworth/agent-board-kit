@@ -1,21 +1,20 @@
-"""Optional: the agents' mail in the owner's own Gmail, from the owner's login: whether it has been read, and, when the
-owner syncs the Mail tab with Gmail, archiving it or marking it read there.
+"""Optional: the agents' mail in the owner's own Gmail, from the owner's login: whether it has been read; and a draft
+there when the owner forwards an agent's mail from the Mail tab.
 
 Off unless the board config (~/.config/agent-board/config.json) names an OAuth file in "gmail_credentials" (or
 AGENT_BOARD_GMAIL_CREDS is set; google.gmail_login): an "authorized_user" JSON with client_id, client_secret and
 refresh_token for the owner's own Gmail. The read-check needs the gmail.readonly scope (gmail.metadata is not enough:
-it searches); the Mail tab's sync also changes labels, so it needs gmail.modify, and with a read-only login Gmail
-refuses that side and the sync's answer says so. The file a Gmail MCP server keeps works. Without it the board shows
-"read-check off" and the sync says the desktop has no Gmail login.
+it searches); the Mail tab's Forward makes a draft, so it needs gmail.compose (or gmail.modify) as well, and with a
+read-only login Gmail refuses it and the Forward's answer says so. The file a Gmail MCP server keeps works. Without
+it the board shows "read-check off" and the Forward says the desktop has no Gmail login.
 
 Once a minute: one `messages.list` of the *unread* mail from the agents' address in the last 8 days, and, only for
 mails the board newly cares about (each agent's latest unanswered mail), one `messages.list q=rfc822msgid:...` to
-find it in the owner's mailbox (cached). On request (state(), for the Mail tab's sync with Gmail), the agents' mail in
-the owner's inbox and the agents' unread mail, by Message-ID; and remove_label(), which that sync uses to archive or
-mark read those of them the tab has archived or read. It never reads a body, never looks at another sender's mail,
-and changes nothing but the Inbox and Unread labels of mail state() found. The login is checked to belong to an owner
-address (mailroom config owner_email / allowlist) first; the access token stays in memory and is never put in a URL
-or an error message.
+find it in the owner's mailbox (cached); never for mail the mailroom keeps for the Mail tab alone, which Gmail has no
+copy of (sources.tab_only). On request, create_draft(), which makes the draft of a forward (mailforward.py). It never
+reads a body, never looks at another sender's mail, and changes nothing there but the drafts it makes. The login is
+checked to belong to an owner address (mailroom config owner_email / allowlist) first; the access token stays in
+memory and is never put in a URL or an error message.
 """
 from pathlib import Path
 
@@ -25,7 +24,9 @@ API = "https://gmail.googleapis.com/gmail/v1/users/me"
 WINDOW_DAYS = 8
 INTERVAL = 60       # seconds between checks
 CHECK_PAGES = 5     # result pages a check reads: 500 mails, far more than 8 days of agent mail
-BATCH = 1000       # Gmail ids one batchModify request takes
+UPLOAD = "https://gmail.googleapis.com/upload/gmail/v1/users/me"
+MAX_DRAFT_BYTES = 35 << 20   # the largest message Gmail's drafts.create takes through its upload endpoint
+DRAFT_SECONDS = 300          # allowed for sending a draft's bytes: the largest at 1 Mbit/s
 
 
 def for_owner(sync, sender=None, owners=None):
@@ -42,8 +43,8 @@ def for_owner(sync, sender=None, owners=None):
 
 
 class GmailState:
-    """The read state, checked every INTERVAL seconds as a Periodic (in the background unless `sync`), and the
-    sync's reads and label changes on request."""
+    """The read state, checked every INTERVAL seconds as a Periodic (in the background unless `sync`), and on
+    request a forward's draft (create_draft)."""
 
     def __init__(self, sender, owners, creds_path, http=None, sync=False):
         self.sender = sender
@@ -60,13 +61,13 @@ class GmailState:
     def _get(self, path, **params):
         return self.client.get(API + path, params)
 
-    def _list(self, q, max_pages):
-        """The mail Gmail search q finds, {id, threadId} each, 100 to a page, at most max_pages pages (None: every
-        one)."""
-        return list(self.client.pages(API + "/messages", {"q": q, "maxResults": 100}, "messages", max_pages=max_pages))
+    def _list(self, q):
+        """The mail Gmail search q finds, {id, threadId} each, 100 to a page, at most CHECK_PAGES pages."""
+        return list(self.client.pages(API + "/messages", {"q": q, "maxResults": 100}, "messages",
+                                      max_pages=CHECK_PAGES))
 
     def _ids(self, q):
-        return [m["id"] for m in self._list(q, CHECK_PAGES)]
+        return [m["id"] for m in self._list(q)]
 
     def verify(self):
         """Check, once, that the login exists and is the owner's. Raises RuntimeError otherwise."""
@@ -78,33 +79,17 @@ class GmailState:
                 raise RuntimeError("the Gmail login there is not the owner's (it is %s); not used" % (who or "unknown"))
             self.verified = True
 
-    def messages(self, q):
-        """The mail in the owner's mailbox that Gmail search q finds, as {Message-ID (sources.norm_id): [its Gmail
-        ids]}: one metadata read per mail. Raises RuntimeError when the login is not the owner's (verify) or Gmail fails
+    def create_draft(self, raw):
+        """A draft in the owner's Gmail of the message `raw` (its MIME bytes, which name no sender: Gmail fills in the
+        owner's), sent whole as message/rfc822 to the upload endpoint (uploadType=media), which takes up to
+        MAX_DRAFT_BYTES: Gmail's Draft, {"id", "message": {"id", ...}}. Raises ValueError for a message over that,
+        before sending anything; RuntimeError when the login is not the owner's (verify) or Gmail refuses
         (google.GoogleError)."""
+        if len(raw) > MAX_DRAFT_BYTES:
+            raise ValueError("the draft would be %.1f MB, more than the %d MB Gmail takes in one, so none was made"
+                             % (len(raw) / (1 << 20), MAX_DRAFT_BYTES >> 20))
         self.verify()
-        found = {}
-        for m in self._list(q, max_pages=None):
-            mid = sources.norm_id(google.header(self._get("/messages/" + m["id"], format="metadata",
-                                                          metadataHeaders="Message-ID"), "Message-ID"))
-            if mid:
-                found.setdefault(mid, []).append(m["id"])
-        return found
-
-    def state(self):
-        """(the agents' mail in the owner's Gmail inbox, the agents' mail the owner has not read), each as messages()
-        gives it: what the Mail tab's sync brings into step with the tab. Raises RuntimeError when the login is not the
-        owner's."""
-        return self.messages("from:%s in:inbox" % self.sender), self.messages("from:%s is:unread" % self.sender)
-
-    def remove_label(self, gmail_ids, label):
-        """Take `label` off the mails with these Gmail ids: "INBOX" archives them, "UNREAD" marks them read. At most
-        BATCH ids to a request (Gmail's batchModify limit). Raises RuntimeError when the login is not the owner's
-        (verify) or Gmail refuses (google.GoogleError: a login that may only read is refused with HTTP 403)."""
-        self.verify()
-        ids = sorted(set(gmail_ids))
-        for i in range(0, len(ids), BATCH):
-            self.client.post(API + "/messages/batchModify", {"ids": ids[i:i + BATCH], "removeLabelIds": [label]})
+        return self.client.upload(UPLOAD + "/drafts?uploadType=media", raw, "message/rfc822", DRAFT_SECONDS)
 
     def poll_once(self):
         self.verify()
@@ -112,7 +97,7 @@ class GmailState:
         wanted, self.wanted = self.wanted, set()     # the board re-asks every few seconds; stale wants lapse
         for m in wanted:
             if not self.found.get(m):          # not looked up yet, or not delivered last time
-                hits = self._list("rfc822msgid:%s" % m, CHECK_PAGES)
+                hits = self._list("rfc822msgid:%s" % m)
                 self.found[m] = [h["id"] for h in hits]
                 if hits and hits[0].get("threadId"):
                     self.threads[m] = hits[0]["threadId"]
@@ -143,9 +128,11 @@ class GmailState:
 
     def is_read(self, message_id):
         """True read, False unread, None not known (not in the owner's mailbox yet, or Gmail unavailable).
-        Asking also marks the mail as wanted, so the next poll looks it up."""
+        Asking also marks the mail as wanted, so the next poll looks it up; but for mail in the Mail tab alone
+        (sources.tab_only), which no search of the owner's mailbox would ever find, the answer is None and nothing is
+        looked up."""
         m = sources.norm_id(message_id)
-        if not m:
+        if not m or sources.tab_only(m):
             return None
         self.wanted.add(m)
         gids = self.found.get(m)

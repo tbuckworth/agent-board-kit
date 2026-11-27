@@ -25,7 +25,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import google, groups, screen, sources, timesources
+from . import colours, google, groups, screen, sources, timesources
 from .config import tasks_repo as configured_tasks_repo
 
 STATE = sources.BOARD_STATE
@@ -49,7 +49,7 @@ DEFAULTS = {
     "fixed_groups": {},
 }
 BUCKET = 300
-FORMAT = 2                            # time.json's shape; load() takes a file of another format for a missing one
+FORMAT = 3                            # time.json's shape; load() takes a file of another format for a missing one
 UNSORTED = "Unsorted"                 # the group of time no group fits; sent in time.json as "unsorted" (Time.swift)
 FILL_KINDS = {"screen"}               # kinds that count only in blocks no other activity accounts for
 # what a source may fail with: the page leaves that source out and names it
@@ -174,9 +174,7 @@ def assign(acts, history, layout, labels, fixed, guesser):
 
     An item in `fixed` (fixed_groups: {key: group}) counts in that group as if grouped by hand. A tile's history
     counts only while its group is on the board; a sub-group no longer there is dropped."""
-    subs = {g["name"]: set(g["subgroups"]) for g in layout}
-    placed = {sid: (h["group"], h["subgroup"] if h["subgroup"] in subs[h["group"]] else None)
-              for sid, h in history.items() if h["group"] in subs}
+    placed = groups.placed(history, layout)
     repo = {}
     for a in acts:
         if a["key"].startswith("s:") and a["key"] not in repo:
@@ -335,11 +333,13 @@ def span(cfg, now):
 
 def refresh(cfg, now=None, table=default_sources):
     """Recompute the page's figures and write them to time.json (decoded by the Mac app's TimeDoc, Time.swift), with
-    the settings they were computed with. Reads every source that table(since, until, cfg, warnings) lists
-    (default_sources: transcripts, the mailroom, sent.jsonl, Google, `gh`, the uploaded screen time), may
-    call the model for new guesses (paid), and keeps the caches up to date (a damaged one is noted in LOG and
-    rebuilt). Runs one at a time, under a lock: a second caller waits for the first."""
+    the settings they were computed with and the layout's colours (colours.py). Reads every source that
+    table(since, until, cfg, warnings) lists (default_sources: transcripts, the mailroom, sent.jsonl, Google, `gh`, the
+    uploaded screen time), may call the model for new guesses (paid), and keeps the caches up to date (a damaged one
+    is noted in LOG and rebuilt). Runs one at a time, under a lock: a second caller waits for the first. Raises
+    colours.load's ValueError or OSError, before reading anything else, when colours.json does not load."""
     now = now or time.time()
+    palette = colours.load()            # first: a colours.json that does not load stops it before any paid guess
     days, since = span(cfg, now)
     with sources.file_lock(LOCK):
         warnings, waiting = [], []
@@ -354,8 +354,8 @@ def refresh(cfg, now=None, table=default_sources):
         summary = {"activities": dict(collections.Counter(a["kind"] for a in acts)), "guessed": stats,
                    "approximate documents": sum(1 for a in acts if a.get("approx"))}
         doc = {"format": FORMAT, "generated": now, "config": cfg, "block": BUCKET, "layout": layout,
-               "unsorted": UNSORTED, "summary": summary, "warnings": warnings, "waiting": waiting, "daily": daily,
-               "items": items}
+               "colours": colours.for_layout(layout, palette), "unsorted": UNSORTED, "summary": summary,
+               "warnings": warnings, "waiting": waiting, "daily": daily, "items": items}
         sources.write_json(OUT, doc, mode=0o600)
     return doc
 

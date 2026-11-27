@@ -17,7 +17,7 @@ struct UsageSplit: Decodable {
     var otherPct: Double?
     var groups: [SplitGroup]
     var chart: SplitChart
-    var layout: [TimeLayoutGroup]
+    var colours: GroupColours     // the groups' colours, the Time page's and the Mail tab's
     var notes: [String]?
 }
 
@@ -92,8 +92,8 @@ enum SplitBands {
         }
     }
 
-    static func color(_ band: String, layout: [TimeLayoutGroup]) -> Color {
-        band == other ? otherColor : TimeColors.group(band, layout: layout)
+    static func color(_ band: String, colours: GroupColours) -> Color {
+        band == other ? otherColor : colours.group(band)
     }
 }
 
@@ -178,7 +178,7 @@ struct UsageSplitSheet: View {
             AreaMark(x: .value("Time", p.date), y: .value("Use", p.value), stacking: .standard)
                 .foregroundStyle(by: .value("Group", p.band))
         }
-        .chartForegroundStyleScale(domain: bands, range: bands.map { SplitBands.color($0, layout: s.layout) })
+        .chartForegroundStyleScale(domain: bands, range: bands.map { SplitBands.color($0, colours: s.colours) })
         .chartYAxisLabel(s.chart.unit == "%" ? "% of the window" : "$ at API rates")
         .chartLegend(position: .bottom, alignment: .leading)
     }
@@ -186,11 +186,11 @@ struct UsageSplitSheet: View {
     func list(_ s: UsageSplit) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(s.groups) { g in
-                row(g.name, share(g.pct, g.dollars), color: SplitBands.color(g.name, layout: s.layout), depth: 0,
+                row(g.name, share(g.pct, g.dollars), color: SplitBands.color(g.name, colours: s.colours), depth: 0,
                     key: g.name, opens: true)
                 if open.contains(g.name) {
                     ForEach(g.subgroups) { sub in
-                        row(sub.name, share(sub.pct, sub.dollars), color: TimeColors.subgroup(sub.name, of: g.name, layout: s.layout),
+                        row(sub.name, share(sub.pct, sub.dollars), color: s.colours.subgroup(sub.name, of: g.name),
                             depth: 1, key: g.name + "/" + sub.name, opens: true)
                         if open.contains(g.name + "/" + sub.name) {
                             ForEach(sub.agents) { agentRow($0, depth: 2) }
@@ -259,7 +259,9 @@ enum UsageSplitTest {
          "other_pct": 1.0, "groups": [{"name": "Admin", "dollars": 200, "pct": 6.7, "agents": [], "subgroups": []}],
          "chart": {"start": 1000, "step": 3600, "unit": "%", "groups": [{"name": "Admin", "values": [1, 2]},
                    {"name": "Work", "values": [0.5, 0.5]}], "other": [0, 0.5]},
-         "layout": [{"name": "Work", "subgroups": ["Alpha"]}, {"name": "Admin", "subgroups": []}], "notes": []}
+         "colours": {"groups": [{"name": "Work", "colour": "#0E8A84", "shades": [{"name": "Alpha", "colour": "#006A65"}]},
+                                {"name": "Admin", "colour": "#6A5ACD", "shades": []}], "ungrouped": "#8C877F"},
+         "notes": []}
         """
         var failures: [String] = []
         func check(_ ok: Bool, _ what: String) { if !ok { failures.append(what) } }
@@ -271,9 +273,9 @@ enum UsageSplitTest {
         check(pts.map(\.band) == ["Admin", "Admin", "Work", "Work", "Other", "Other"], "bands in order, Other last")
         check(pts.first?.date == Date(timeIntervalSince1970: 4600), "a point sits at the end of its step")
         check(s.scale?.points == 50 && s.resetsAt == 605800, "snake-case fields decode")
-        check(SplitBands.color("Other", layout: s.layout) == SplitBands.otherColor, "Other has its own colour")
-        check(SplitBands.color("Admin", layout: s.layout) == TimeColors.group("Admin", layout: s.layout),
-              "a group has its Time page colour")
+        check(SplitBands.color("Other", colours: s.colours) == SplitBands.otherColor, "Other has its own colour")
+        check(SplitBands.color("Admin", colours: s.colours) == Color(hex: 0x6A5ACD), "a group has the desktop's colour")
+        check(SplitBands.color("Unsorted", colours: s.colours) == Color(hex: 0x8C877F), "Unsorted has Ungrouped's")
         let window = try? JSON.decoder.decode(UsageWindow.self, from: Data(#"{"kind": "model_weekly", "model": "fable", "key": "model:fable"}"#.utf8))
         check(window?.key == "model:fable", "a meter's window carries the desktop's key, which a click asks for")
         failures.forEach { print("FAIL: " + $0) }

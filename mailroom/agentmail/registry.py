@@ -3,7 +3,7 @@
   Claude Code  ~/.claude/sessions/<pid>.json   (name, sessionId, cwd, status, inbox socket), and the same
                under every other login's config dir (config usage.claude_accounts, CLAUDE_CONFIG_DIR)
   Codex        ~/.codex/thread-writer-locks/    (live thread ids)
-               ~/.codex/state_5.sqlite          (title, cwd, updated_at, rollout log per thread)
+               ~/.codex/state_5.sqlite          (title, cwd, updated_at, rollout log per thread; codex_db)
                ~/.codex/session_index.jsonl     (thread names from /rename)
 """
 import json
@@ -13,14 +13,17 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
-from . import accounts, config, jsonfile
+from . import accounts, commands, config, jsonfile, procs
 
 DEFAULT_CLAUDE_HOME = config.HOME / ".claude"
 CLAUDE_JSON = config.HOME / ".claude.json"   # the default login's .claude.json sits beside ~/.claude, not in it
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", DEFAULT_CLAUDE_HOME))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", config.HOME / ".codex"))
+SQLITE_HOME = "CODEX_SQLITE_HOME"   # Codex's setting for where its SQLite databases are, over CODEX_HOME
+STATE_DB = "state_5.sqlite"
 HOST = socket.gethostname().split(".")[0]
 
 
@@ -88,9 +91,8 @@ def claude_homes():
     ~/.claude, and each account in config usage.claude_accounts. A session's registry entry and transcript live in
     the home it was started with; config_dir is the CLAUDE_CONFIG_DIR that reaches it again (None: the default).
     Reads config.json; raises when it does not parse."""
-    from . import usage   # usage imports registry: imported here, when called
     named = {}
-    for name, a in usage.settings(config.load())["claude_accounts"].items():
+    for name, a in accounts.current_settings()["claude_accounts"].items():
         d = accounts.expand((a or {}).get("config_dir")) or str(DEFAULT_CLAUDE_HOME.resolve())
         named.setdefault(d, name)
     out, seen = [], set()
@@ -169,6 +171,7 @@ def _claude_sessions_in(sessions_dir, account, config_dir):
             "tmux": d.get("tmux"),
             "updated_at": (d.get("statusUpdatedAt") or d.get("updatedAt") or 0) / 1000.0,
             "waiting_for": d.get("waitingFor") or "",
+            "version": d.get("version") or "",
             "account": account,
             "config_dir": config_dir,
         })
@@ -186,12 +189,13 @@ def codex_names():
     return {d["id"]: d.get("thread_name") or "" for d in named}
 
 
-def codex_held_locks(lock_dir, proc="/proc"):
-    """Thread ids whose lock file a codex process has open, or None where that cannot be seen (no /proc).
-    A codex that was killed leaves its lock file behind; only an open one means the thread is live."""
+def codex_lock_holders(lock_dir, proc="/proc"):
+    """{thread id: [pid, ...]}: the codex processes that have each thread's lock file in lock_dir open, or None where
+    that cannot be seen (no /proc). A codex that was killed leaves its lock file behind; only an open one means the
+    thread is live, and its holder is the codex running it."""
     if not os.path.isdir(proc):
         return None
-    held, prefix = set(), str(lock_dir) + os.sep
+    holders, prefix = {}, str(lock_dir) + os.sep
     for d in os.listdir(proc):
         if not d.isdigit():
             continue
@@ -203,10 +207,39 @@ def codex_held_locks(lock_dir, proc="/proc"):
             for fd in os.listdir(os.path.join(proc, d, "fd")):
                 target = os.readlink(os.path.join(proc, d, "fd", fd))
                 if target.startswith(prefix) and target.endswith(".lock"):
-                    held.add(os.path.basename(target)[:-len(".lock")])
+                    tid = os.path.basename(target)[:-len(".lock")]
+                    if int(d) not in holders.setdefault(tid, []):
+                        holders[tid].append(int(d))
         except OSError:
             continue
-    return held
+    return holders
+
+
+def codex_held_locks(lock_dir, proc="/proc"):
+    """Thread ids whose lock file a codex process has open (codex_lock_holders), or None where that cannot be
+    seen."""
+    holders = codex_lock_holders(lock_dir, proc)
+    return None if holders is None else set(holders)
+
+
+def codex_pane(tid):
+    """(pane id, codex pid, "") for Codex thread tid: the one codex process that holds its lock file
+    (codex_lock_holders), in the one tmux pane, among all the panes of the server commands.tmux reaches, whose shell
+    started it (agent-spawn's layout); else (None, None, why not). Pane and process are found by the thread, never by
+    a session's name, which another pane may share."""
+    holders = (codex_lock_holders((CODEX_HOME / "thread-writer-locks").resolve()) or {}).get(tid, [])
+    if len(holders) != 1:
+        return None, None, ("no codex process holds its thread's lock" if not holders else
+                            "%d codex processes hold its thread's lock" % len(holders))
+    parent = procs.ppid(holders[0])
+    r = commands.tmux("list-panes", "-a", "-F", "#{pane_id} #{pane_pid}", check=False)
+    if r.returncode != 0:
+        return None, None, "tmux could not list its panes: %s" % ((r.stderr or "").strip() or "no answer")
+    panes = [p[0] for p in (line.split() for line in r.stdout.split("\n")) if len(p) == 2 and p[1] == str(parent)]
+    if len(panes) != 1:
+        return None, None, ("no tmux pane's shell started the codex that holds its thread's lock" if not panes else
+                            "%d tmux panes run the codex that holds its thread's lock" % len(panes))
+    return panes[0], holders[0], ""
 
 
 def codex_live_ids():
@@ -222,17 +255,24 @@ def codex_live_ids():
     return live
 
 
-def codex_query(sql, args):
-    """The rows of one query on Codex's state database (its threads: title, folder, rollout log), or [] when
-    Codex has none. It is opened plainly with query_only, which never writes: mode=ro fails on macOS for a WAL
-    database. The existence check keeps the open from creating one. Raises sqlite3.Error, of the type sqlite
-    raised, naming the database: a lock Codex holds past 2 s, a damaged file, or a schema this query no longer
-    fits. Every session lookup fails until it can be read; the operator checks Codex, or updates the query."""
-    db = CODEX_HOME / "state_5.sqlite"
-    if not db.exists():
-        return []
+def codex_db(name):
+    """Codex's SQLite database name (STATE_DB, its queue's codexqueue.QUEUE_DB) where Codex keeps it: in
+    CODEX_SQLITE_HOME when that is set, else in CODEX_HOME. (Codex's config key sqlite_home, over both, is not read:
+    it is not set here.)"""
+    home = os.environ.get(SQLITE_HOME, "").strip()
+    return (Path(home).expanduser() if home else CODEX_HOME) / name
+
+
+def codex_read(name, sql, args, read_only):
+    """The rows of one query on Codex's database name (codex_db), which is never written: with read_only, opened
+    mode=ro, so that a missing database is an error too (Codex's queue, whose rows agent-send must never change);
+    else opened plainly with query_only, as mode=ro fails on macOS for a WAL database (the state database, which every
+    session lookup reads). Raises sqlite3.Error, of the type sqlite raised, naming the database: a lock Codex holds
+    past 2 s, a damaged file, or a schema the query no longer fits."""
+    db = codex_db(name)
     try:
-        con = sqlite3.connect(str(db), timeout=2)
+        con = (sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(db)), uri=True, timeout=2) if read_only
+               else sqlite3.connect(str(db), timeout=2))
         try:
             con.execute("pragma query_only=1")
             con.row_factory = sqlite3.Row
@@ -241,6 +281,16 @@ def codex_query(sql, args):
             con.close()
     except sqlite3.Error as e:
         raise type(e)("%s: %s" % (db, e)) from e
+
+
+def codex_query(sql, args):
+    """The rows of one query on Codex's state database (its threads: title, folder, rollout log), or [] when
+    Codex has none (codex_read; the existence check keeps the plain open from creating one). Raises sqlite3.Error
+    naming the database (codex_read). Every session lookup fails until it can be read; the operator checks Codex,
+    or updates the query."""
+    if not codex_db(STATE_DB).exists():
+        return []
+    return codex_read(STATE_DB, sql, args, read_only=False)
 
 
 def codex_threads(limit=400):
@@ -280,10 +330,11 @@ def codex_sessions():
 
 
 def all_sessions(cli=None):
-    s = claude_sessions() + codex_sessions()
-    if cli:
-        s = [x for x in s if x["cli"] == cli]
-    return s
+    """Every session in both CLIs' registries (cli None), or in cli's alone, the other's not read ([] for a cli that
+    is neither)."""
+    if cli is None:
+        return claude_sessions() + codex_sessions()
+    return {"claude": claude_sessions, "codex": codex_sessions}.get(cli, list)()
 
 
 def live_sessions():

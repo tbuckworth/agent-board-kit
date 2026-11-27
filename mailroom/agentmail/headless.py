@@ -1,4 +1,4 @@
-"""Headless `claude -p` runs, shared by the orchestrator and the pre-send reviewer.
+"""Headless `claude -p` runs, shared by the orchestrator, the pre-send reviewer and the reMarkable preflight.
 
 claude_command() builds the command: JSON output and no MCP server, on the caller's model and effort with its own
 options. logins() lists the ways to run it, in order: each Claude login in usage.order that is set up, Codex where
@@ -68,19 +68,22 @@ def run(cmd, prompt, cwd, env, timeout, parse):
 
 def logins(cfg, cmd, base, codex):
     """(name, command, env) for each way to run `cmd`, a claude command, in order: each Claude login in usage.order
-    that is set up, on its own config dir; `codex` (a command, or None to leave Codex out) where the order puts
-    Codex; then the API key (named API_KEY) when api_key_available. Each env is `base` through accounts.claude_env.
-    The API-key entry reads the Bitwarden token and project-id files."""
+    that is set up (never a manual one: usage.ranked), on its own config dir, with the options that login takes
+    (accounts.login_flags); `codex` (a command, or None to leave Codex out) where the order puts Codex; then the API
+    key (named API_KEY) when api_key_available. Each env is `base` through accounts.claude_env. The API-key entry
+    reads the Bitwarden token and project-id files."""
     s, out = usage.settings(cfg), []
     for t in usage.ranked(s):
         cli, name = usage.parse_target(t, s)
+        acct = accounts.account(s, name) if cli != usage.CODEX else {}
         if cli == usage.CODEX:
             if codex:
-                out.append(("codex", codex, accounts.claude_env({}, base)))
-        elif accounts.account_ready(accounts.account(s, name))[0]:
-            out.append((name, cmd, accounts.claude_env(accounts.account(s, name), base)))
+                out.append(("codex", codex, accounts.claude_env({}, base, s)))
+        elif accounts.account_ready(acct)[0]:
+            d = accounts.expand(acct.get("config_dir"))
+            out.append((name, cmd[:1] + accounts.login_flags(s, d, cmd[1:]), accounts.claude_env(acct, base, s)))
     if api_key_available(cfg):
-        env = accounts.claude_env({}, base)
+        env = accounts.claude_env({}, base, s)
         env["BWS_ACCESS_TOKEN"] = _path(cfg["bws_token_file"]).read_text().strip()   # in memory, passed to bws only
         out.append((API_KEY, api_key_command(cfg, cmd), env))
     return out

@@ -50,13 +50,15 @@ class Request(unittest.TestCase):
     def ask(self, method, path, **kw):
         return webapi.request(method, self.base + path, "Example API", webapi.ApiError, **kw)
 
-    def test_a_form_goes_url_encoded_and_a_body_as_json(self):
+    def test_a_form_goes_url_encoded_a_body_as_json_and_raw_bytes_as_they_are(self):
         got = self.ask("POST", "/echo", form={"a": "1 2", "b": "é"})
         self.assertEqual((got["method"], got["body"], got["type"]), ("POST", "a=1+2&b=%C3%A9", "application/x-www-form-urlencoded"))
         got = self.ask("PATCH", "/echo?x=1", body={"location": "Room 2"}, headers={"Authorization": "Bearer T"})
         self.assertEqual(got, {"method": "PATCH", "path": "/echo?x=1", "body": '{"location": "Room 2"}',
                                "type": "application/json", "auth": "Bearer T"})
         self.assertEqual(self.ask("GET", "/echo")["body"], "")
+        got = self.ask("POST", "/echo", raw=b"Subject: E6\r\n\r\ndone", headers={"Content-Type": "message/rfc822"})
+        self.assertEqual((got["body"], got["type"]), ("Subject: E6\r\n\r\ndone", "message/rfc822"))
 
     def test_an_empty_answer_is_an_empty_object(self):
         self.assertEqual(self.ask("DELETE", "/empty"), {})
@@ -78,6 +80,8 @@ class Request(unittest.TestCase):
             google.http("GET", self.base + "/refused")
         self.assertEqual((str(e.exception), e.exception.status), ("Google API answered HTTP 403", 403))
         self.assertEqual(google.http("POST", self.base + "/echo", body={"a": 1})["body"], '{"a": 1}')
+        self.assertEqual(google.http("POST", self.base + "/echo", raw=b"x", headers={"Content-Type": "text/plain"})["body"],
+                         "x")
 
 
 if __name__ == "__main__":

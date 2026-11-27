@@ -236,7 +236,7 @@ class Ladder:
         stop_at = (self.now + wait) if self.will_stop(res, crash) else None
         subject, md = messages.escalation(inc, res, findings, self.now, reason,
                                           self.recommendation(res, findings, crash), stop_at)
-        if self.n.email(subject, md, key=res["key"], incident_id=inc["id"]) == "failed":
+        if self.n.email(subject, md, alert="cloud-idle", key=res["key"], incident_id=inc["id"]) == "failed":
             return
         upd = {"state": "asked" if resumed else "escalated", "email_count": (inc["email_count"] or 0) + 1,
                "last_email_at": self.now, "last_email_sig": signature(findings)}
@@ -264,7 +264,7 @@ class Ladder:
             return False
         stopped, detail = self.n.stop(res, "watchdog", inc["id"])
         subject, md = messages.auto_stopped(inc, res, self.now, stopped, detail)
-        self.n.email(subject, md, key=res["key"], incident_id=inc["id"])
+        self.n.email(subject, md, alert="cloud-stop", key=res["key"], incident_id=inc["id"])
         if stopped:
             self.db.close_incident(inc["id"], "auto-stopped", self.now)
         return stopped
@@ -275,7 +275,8 @@ class Ladder:
             return
         inc = self.db.open_incident(res["key"])
         subject, md = messages.cost_email(inc["id"] if inc else None, res, f, self.now)
-        if self.n.email(subject, md, key=res["key"], incident_id=inc["id"] if inc else None) != "failed":
+        if self.n.email(subject, md, alert="cloud-cost", key=res["key"],
+                        incident_id=inc["id"] if inc else None) != "failed":
             self.db.update_resource(res["key"], cost_email_tier=f["tier"])
 
     def foreign_crash(self, res):
@@ -285,5 +286,5 @@ class Ladder:
         if self.now - last < self.cfg["ladder"]["reemail_hours"] * 3600:
             return
         subject, md = messages.foreign_crash(res, self.now)
-        if self.n.email(subject, md, key=res["key"]) != "failed":
+        if self.n.email(subject, md, alert="cloud-colleague", key=res["key"]) != "failed":
             self.db.set_meta(k, self.now)

@@ -12,7 +12,7 @@
 
 <!-- header -->
 <tr><td style="padding:28px 32px 20px 32px;border-bottom:3px solid #2f6f62;">
-  <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#2f6f62;font-weight:600;">Setup kit &middot; updated 19 November 2026</div>
+  <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#2f6f62;font-weight:600;">Setup kit &middot; updated 27 November 2026</div>
   <div style="font-size:26px;font-weight:700;margin:4px 0 6px 0;color:#111827;">agent-board-kit</div>
   <div style="font-size:16px;color:#4b5563;">Run a team of Claude Code and Codex agents on an always-on Linux machine, and manage them from your inbox, a Mac menu-bar board and a GitHub to-do list.</div>
 </td></tr>
@@ -20,13 +20,13 @@
 <!-- intro -->
 <tr><td style="padding:22px 32px 6px 32px;">
   <p style="margin:0 0 12px 0;">This is a self-contained, installable copy of an agent setup that is in daily use. Everything specific to the original owner (names, addresses, accounts, machines, paths) has been taken out and replaced by <b>one config file you fill in</b>. The repository holds the code, an installer with a health check, templates for the agents' instructions, and step-by-step setup guides.</p>
-  <p style="margin:0 0 12px 0;"><b>New in this update:</b> group chats between agents, a Mail tab on the board for your mail with the agents, clickable options and interactive plots in agent mail, where your plan usage and your own time went, meeting alerts, and one login-and-model order for agents on several Claude logins. The full list is in <b>CHANGELOG.md</b>.</p>
+  <p style="margin:0 0 12px 0;"><b>New in this update:</b> a one-page <b>Getting started</b> guide with a check after every step; a Mail tab that can be the only place agent mail goes, with Forward, comments, undo, pop-out windows and drafts kept on the Linux machine; a fast mode for quick back-and-forths; topics in group chats; files and screenshots in messages to agents. The full list is in <b>CHANGELOG.md</b>.</p>
   <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:16px 0 8px 0;"><tr>
     <td style="background:#2f6f62;border-radius:6px;">
       <a href="https://github.com/tbuckworth/agent-board-kit" style="display:inline-block;padding:11px 20px;color:#ffffff;text-decoration:none;font-weight:600;">Open the repository &rarr;</a>
     </td>
   </tr></table>
-  <p style="margin:6px 0 0 0;font-size:13px;color:#6b7280;">github.com/tbuckworth/agent-board-kit &middot; start with <b>README.md</b>, then <b>docs/</b> in order.</p>
+  <p style="margin:6px 0 0 0;font-size:13px;color:#6b7280;">github.com/tbuckworth/agent-board-kit &middot; start with <b>docs/GETTING-STARTED.md</b>.</p>
 </td></tr>
 
 <!-- what you get -->
@@ -42,7 +42,7 @@
     <tr><td valign="top" style="padding:6px 10px 6px 0;color:#2f6f62;font-weight:700;">&#9881;</td>
         <td style="padding:6px 0;"><b>One branch, one worktree, one tmux session per agent.</b> <code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#f3f4f6;padding:1px 5px;border-radius:4px;">agent-spawn</code> sets it all up (with a memory cap) and launches Claude Code or Codex with a brief; <code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#f3f4f6;padding:1px 5px;border-radius:4px;">agent-close</code> cleans up, but only once the work is landed.</td></tr>
     <tr><td valign="top" style="padding:6px 10px 6px 0;color:#2f6f62;font-weight:700;">&#9638;</td>
-        <td style="padding:6px 0;"><b>The agent board.</b> A Mac menu-bar app: every session as a tile coloured by state (busy, waiting on you, blocked, idle, offline), git progress toward main, plan usage, machine load, and right-click actions (message, close, resume, switch model or login). A tile turning red posts a notification. Its <b>Mail tab</b> holds your mail with the agents (threads, search, snooze, replies with files, optional sync with your Gmail), <b>Chats</b> holds the group chats, and <b>Sent</b> lists what you asked for and what the agents say is done.</td></tr>
+        <td style="padding:6px 0;"><b>The agent board.</b> A Mac menu-bar app: every session as a tile coloured by state (busy, waiting on you, blocked, idle, offline), git progress toward main, plan usage, machine load, and right-click actions (message, close, resume, switch model or login). A tile turning red posts a notification. Its <b>Mail tab</b> holds your mail with the agents (threads, search, snooze, replies with files, Forward through your Gmail), <b>Chats</b> holds the group chats, and <b>Sent</b> lists what you asked for and what the agents say is done.</td></tr>
     <tr><td valign="top" style="padding:6px 10px 6px 0;color:#2f6f62;font-weight:700;">&#9684;</td>
         <td style="padding:6px 0;"><b>Where the usage and the time went.</b> Click a plan-usage meter to see that window's usage by board group and agent. The <b>Time</b> page shows where your own time went, per day and group, from your prompts and messages to agents, plus your calendar, documents, mail, to-dos and Mac screen time if you connect them.</td></tr>
     <tr><td valign="top" style="padding:6px 10px 6px 0;color:#2f6f62;font-weight:700;">&#8645;</td>
@@ -129,7 +129,7 @@ kit doctor --online              <span style="color:#9ca3af;"># all green?</span
   <h2 style="font-size:18px;margin:0 0 10px 0;color:#111827;">Core and optional parts</h2>
   <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;font-size:14px;">
     <tr style="background:#f9fafb;"><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;font-weight:600;">Core</td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">mailroom and agent commands, orchestrator, group chats, global agent instructions and hooks, agent board with the Mail tab, plan usage and Time page, to-do list with Triage and Assign to agent</td></tr>
-    <tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;font-weight:600;">Optional</td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">several Claude logins with usage routing and failover; per-agent memory caps and RAM warnings; restart-and-resume after OS updates; an hourly backup of the agents' mail; your own Gmail on the board (read state, Sync with Gmail); your Google Calendar for <b>meeting alerts</b> and the Time page; Mac screen time from ActivityWatch; collaborators' agents as a second, guarded sender tier; Mac sessions mailing through the Linux machine; <b>cloud-watchdog</b> for paid GPU/cloud resources agents launch</td></tr>
+    <tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;font-weight:600;">Optional</td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;">several Claude logins with usage routing and failover; per-agent memory caps and RAM warnings; restart-and-resume after OS updates; an hourly backup of the agents' mail; your own Gmail on the board (read state, Forward); agent mail kept off Gmail for the Mail tab; your Google Calendar for <b>meeting alerts</b> and the Time page; Mac screen time from ActivityWatch; collaborators' agents as a second, guarded sender tier; Mac sessions mailing through the Linux machine; <b>cloud-watchdog</b> for paid GPU/cloud resources agents launch</td></tr>
     <tr><td style="padding:7px 10px;font-weight:600;">Linux only</td><td style="padding:7px 10px;">the server side uses systemd and /proc. The Mac is a client; running the mailroom on macOS is untested.</td></tr>
   </table>
 </td></tr>

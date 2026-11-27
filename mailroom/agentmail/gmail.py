@@ -1,13 +1,14 @@
 """Thin Gmail API layer. Only gmail.modify is ever requested. Google's client is imported where it is used, not
 here: it is slow to load, and commands that never talk to Gmail, such as `agent-mail mailbox show`, import this
-module."""
+module. With Gmail off in config ("gmail": false) the daemon and agent-mail hold OFF in place of the service, so
+nothing loads a token or reaches Google."""
 import base64
 import html
 import re
 import urllib.parse
 from email.utils import getaddresses
 
-from .config import SCOPES, TOKEN_PATH
+from .config import CONFIG_PATH, SCOPES, TOKEN_PATH
 
 RECIPIENT_HEADERS = ("to", "cc", "delivered-to", "x-original-to")
 
@@ -31,10 +32,32 @@ class NoToken(RuntimeError):
     """The agents account has not been authorised on this machine yet."""
 
 
+class GmailOff(RuntimeError):
+    """Gmail is off in config ("gmail": false), and something needed it."""
+
+
+class _Off:
+    """The Gmail service while Gmail is off in config (OFF): any use of it raises GmailOff, so a path that would call
+    Gmail stops with a clear message instead of reaching Google."""
+
+    def __getattr__(self, name):
+        if name.startswith("__"):   # copy, pickle and the like probe for these: not a Gmail call
+            raise AttributeError(name)
+        raise GmailOff('Gmail is off in config ("gmail": false in %s): nothing is sent through or read from Gmail'
+                       % CONFIG_PATH)
+
+    def __repr__(self):
+        return "gmail.OFF"
+
+
+OFF = _Off()
+
+
 def service():
     if not TOKEN_PATH.exists():
         raise NoToken("no Gmail token at %s: run `agent-mail-auth` (mailroom/agent_mail_auth.py) once, "
-                           "signed in as the agents account" % TOKEN_PATH)
+                      'signed in as the agents account, or set "gmail": false in %s to run without Gmail'
+                      % (TOKEN_PATH, CONFIG_PATH))
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build

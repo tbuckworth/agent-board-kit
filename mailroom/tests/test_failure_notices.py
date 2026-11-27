@@ -42,6 +42,25 @@ class NoticeRoutes(Base):
         self.assertIsNone(row['recovery_json'])
         self.assertEqual(self.sent, [])
 
+    def test_mail_codex_holds_in_its_queue_is_recorded_queued_with_why_never_failed(self):
+        """agent-send exits HELD: the message is in the agent's queue (accepted, its receipt written), so the mail is
+        neither held nor alerted on, which would have it delivered twice, nor recorded as delivered: it is queued,
+        and its detail says why it waits."""
+        sess = self.st.session_for('codex', SID, 'coder', origin_host=HOST)
+        self.message(sess)
+        held = ("held in Codex's queue for codex coder [12345678] live (Queued message i for thread t.)\n"
+                "its last turn was interrupted, so Codex holds it until another turn starts")
+        def accept_and_hold(cmd, **kwargs):
+            deliver.write_receipt(cmd[cmd.index('--receipt')+1], SID, kwargs['input'])
+            return Mock(returncode=deliver.HELD, stdout=held, stderr='')
+        with patch.object(deliver.subprocess, 'run', side_effect=accept_and_hold):
+            self.room.process(self.fake, self.st, CFG, 'in', False)
+        row = self.st.list_inbound()[0]
+        self.assertEqual(row['action'], 'queued')
+        self.assertIn('its last turn was interrupted, so Codex holds it', row['detail'])
+        self.assertIsNone(row['recovery_json'])
+        self.assertEqual(self.sent, [])
+
     def test_reply_and_forward_subject_variants(self):
         sess = self.st.session_for('claude', SID, origin_host=HOST)
         for prefix in ('', 'Re: ', 'Fwd: ', 'FW: ', 'Re: Fwd: RE: ', '  re :  fWd: '):
@@ -52,7 +71,7 @@ class NoticeRoutes(Base):
                     (None, 'mailroom-notice'))
 
     def test_alert_header_tells_an_alert_from_a_routed_mail(self):
-        recovery.alerts.send_alert(self.fake, self.st, CFG, 'kind', 'key', 'what happened', 'body')
+        recovery.alerts.send_alert(self.fake, self.st, CFG, 'quota', 'key', 'what happened', 'body')
         routed = outbound.compose(CFG, 'session', 'owner@example.com', None, 'results', 'text', reply_to_tag='ab34cd9k')
         alert, = [m for m, _thread in self.sent]
         self.assertEqual(alert['Subject'], '[mailroom] what happened')
@@ -696,6 +715,16 @@ class Receipts(unittest.TestCase):
                 return Mock(returncode=1, stdout='', stderr='failed')
             with self.subTest(data=data), patch.object(deliver.subprocess, 'run', side_effect=run):
                 self.assertEqual(deliver.deliver('claude', SID, 'reply', False, False), (1, 'failed'))
+
+    def test_a_message_held_in_codex_s_queue_keeps_its_exit_code_beside_its_receipt(self):
+        """A held message was accepted (its receipt is written), and its exit code must still say it is held: the
+        receipt stands in for an answer only when agent-send was cut off or failed."""
+        def run(cmd, **kwargs):
+            deliver.write_receipt(cmd[cmd.index('--receipt')+1], SID, kwargs['input'])
+            return Mock(returncode=deliver.HELD, stdout='held in Codex\'s queue\nwhy', stderr='')
+        with patch.object(deliver.subprocess, 'run', side_effect=run):
+            self.assertEqual(deliver.deliver('codex', SID, 'reply', False, False),
+                             (deliver.HELD, "held in Codex's queue\nwhy"))
 
     def test_successful_send_without_receipt_still_succeeds(self):
         with patch.object(deliver.subprocess, 'run', return_value=Mock(returncode=0, stdout='sent', stderr='')):

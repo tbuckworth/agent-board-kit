@@ -1,4 +1,5 @@
 """Collector rules with fixture data: python3 -m unittest discover -s tests"""
+import base64
 import contextlib
 import io
 import json
@@ -15,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import fixtures  # noqa: E402  (first: a scratch config with an example owner, _kitenv)
 import stand_ins  # noqa: E402
-from agentboard import (actions, classify, cli, collect, config, credits, gmailstate, relaunch, restart,  # noqa: E402
-                        sent, sources)
+from agentboard import (actions, classify, cli, collect, config, credits, gmailstate, mailbox, relaunch,  # noqa: E402
+                        restart, sent, sources)
 
 _scratch = Path(tempfile.mkdtemp())          # no test writes the owner's real record of what was sent, its marks, or
 sent.PATH, sent.MARKS = _scratch / "sent.jsonl", _scratch / "sent-marks.jsonl"     # the actions log (and its locks)
@@ -242,7 +243,7 @@ class ReadInGmailTest(unittest.TestCase):
     def fake_gmail(self, me=OWNER):
         """fixtures.gmail_of for two mails, g2 unread (self.unread, which a test may change)."""
         self.unread = {"g2"}
-        return fixtures.gmail_of(me, {"g1": "g1@mail.gmail.com", "g2": "g2@mail.gmail.com"}, set(), self.unread)
+        return fixtures.gmail_of(me, {"g1": "g1@mail.gmail.com", "g2": "g2@mail.gmail.com"}, self.unread)
 
     def test_gmail_read_state(self):
         g, calls = self.fake_gmail()
@@ -263,6 +264,21 @@ class ReadInGmailTest(unittest.TestCase):
         self.assertEqual(len([u for _, u, _, _ in calls if "rfc822msgid" in u]), lookups + 1)   # only the undelivered one again
         self.assertTrue(all("AT-secret" not in u for _, u, _, _ in calls))                     # token never in a URL
         self.assertTrue(any("from%3Aagents%40example.com" in u for _, u, _, _ in calls))
+
+    def test_mail_in_the_tab_alone_is_never_looked_up_in_gmail(self):
+        # The mailroom keeps mail to the owner for the Mail tab alone under its own domain: a search for it would find
+        # nothing, every minute, for as long as the mail stayed an agent's latest.
+        g, calls = self.fake_gmail()
+        kept = "<177.1.2@Agent-Mailroom.Local>"
+        self.assertIsNone(g.is_read("<G1@mail.gmail.com>"))                          # wanted: looked up at the next poll
+        for _ in range(3):
+            self.assertIsNone(g.is_read(kept))                                      # asked each poll, as the board does
+            g.maybe_refresh(force=True)
+        self.assertTrue(g.status["ok"], g.status)
+        self.assertIsNone(g.thread_of(kept))
+        lookup, = [u for _, u, _, _ in calls if "rfc822msgid" in u]                  # G1's alone, once
+        self.assertIn("rfc822msgid%3Ag1%40mail.gmail.com", lookup)
+        self.assertIs(g.is_read("<G1@mail.gmail.com>"), True)
 
     def test_refuses_someone_elses_login_and_degrades(self):
         g, _ = self.fake_gmail(me="agents@example.com")
@@ -458,31 +474,6 @@ class GitStageTest(unittest.TestCase):
             self.assertIn("o/r: RuntimeError: gh pr list exit 4: To get started", prs.error)
 
 
-def codex_home(home, threads, held=()):
-    """A Codex home in folder `home`: state_5.sqlite with a threads table holding `threads` (dicts of its columns; the
-    rest default to a user's thread in /x), and a locked writer lock file for each thread id in `held`, as a running
-    Codex keeps one. Returns the open lock files: closing them is that Codex exiting."""
-    import fcntl
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "thread-writer-locks").mkdir()
-    con = sqlite3.connect(str(home / "state_5.sqlite"))
-    con.execute("create table threads(id, name, title, cwd, git_branch, rollout_path, updated_at, model, "
-                "reasoning_effort, created_at, archived, source, thread_source, agent_nickname)")
-    for t in threads:
-        row = dict({"name": "", "title": "", "cwd": "/x", "git_branch": "", "rollout_path": "", "model": "m",
-                    "reasoning_effort": "x", "archived": 0, "source": "cli", "thread_source": "user",
-                    "agent_nickname": None}, **t)
-        con.execute("insert into threads(%s) values(%s)" % (", ".join(row), ", ".join("?" * len(row))), list(row.values()))
-    con.commit()
-    con.close()
-    handles = []
-    for tid in held:
-        fh = open(home / "thread-writer-locks" / (tid + ".lock"), "w")
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        handles.append(fh)
-    return handles
-
-
 class GitRepoTest(unittest.TestCase):
     def git(self, d, *a):
         fixtures.git("-C", str(d), *a)
@@ -560,10 +551,10 @@ class GitRepoTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
             parent, sub = "0190bbbb-0000-7000-8000-00000000b001", "0190bbbb-1111-7000-8000-00000000b002"
-            handles = codex_home(home, [{"id": parent, "name": "garden", "updated_at": int(NOW), "created_at": int(NOW)},
-                                        {"id": sub, "updated_at": int(NOW), "created_at": int(NOW),
-                                         "source": '{"subagent": "review"}', "thread_source": "subagent",
-                                         "agent_nickname": "Darwin"}], held=(parent, sub))
+            handles = fixtures.codex_home(home, [
+                {"id": parent, "name": "garden", "updated_at": int(NOW), "created_at": int(NOW)},
+                {"id": sub, "updated_at": int(NOW), "created_at": int(NOW), "source": '{"subagent": "review"}',
+                 "thread_source": "subagent", "agent_nickname": "Darwin"}], held=(parent, sub))
             try:
                 rows = {r["id"]: r for r in sources.CodexReader(home).sessions(now=NOW)}
             finally:
@@ -887,6 +878,29 @@ class MailStoreTest(unittest.TestCase):
             self.assertEqual([r["subject"] for r in classify.mail_state(a["sent"], a["inbound"], NOW,
                                                                         reviews=a["reviews"])["revise"]], ["Alpha v2"])
 
+    def test_thread_sessions_names_the_board_s_agents_that_wrote_in_each_thread(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "mailroom.sqlite"
+            sid_a, sid_b = mail_fixture(db)
+            con = sqlite3.connect(str(db))
+            con.executemany("insert into sent(tag, thread_id, to_addr, subject, sent_at) values(?,?,?,?,?)", [
+                ("taga", "t2", OWNER, "Re: Beta report", NOW - 200),
+                ("tagb", "t2", OWNER, "Re: Beta report", NOW - 100),
+                ("tagx", "t1", OWNER, "a tag with no session", NOW - 5)])
+            con.commit()
+            con.close()
+            store = sources.MailStore(db, owners=[OWNER], host_id="desktop")
+            alpha, beta = {"cli": "claude", "id": sid_a}, {"cli": "codex", "id": sid_b}
+            self.assertEqual(store.thread_sessions(["t2", "t1", "t3", "t9", "nope", "t1"]),
+                             {"t1": [alpha], "t2": [beta, alpha],     # in the order of their first mail, once each
+                              "t9": [beta]})                          # mail to anyone; t3 is the Mac session's only
+            self.assertEqual(store.thread_sessions([]), {})
+            many = ["x%04d" % i for i in range(1200)] + ["t2"]        # more ids than one query binds
+            self.assertEqual(store.thread_sessions(many), {"t2": [beta, alpha]})
+        with self.assertRaisesRegex(FileNotFoundError, "no database at /nonexistent/mailroom.sqlite"):
+            sources.MailStore(Path("/nonexistent/mailroom.sqlite"), owners=[OWNER], host_id="desktop").thread_sessions(["t1"])
+        self.assertFalse(Path("/nonexistent/mailroom.sqlite").exists())
+
     def test_missing_store_is_not_an_error(self):
         got = sources.MailStore(Path("/nonexistent/mailroom.sqlite"), owners=[OWNER]).read(NOW)
         self.assertFalse(got["ok"])
@@ -934,7 +948,7 @@ class CollectorTest(unittest.TestCase):
             # Codex: garden and its subagent Beauvoir running (their lock files held), nova exited
             parent = "0190bbbb-0000-7000-8000-00000000b001"
             thread = {"cwd": str(d), "created_at": int(NOW - 900), "updated_at": int(NOW - 100)}
-            locks = codex_home(d / "codex", [
+            locks = fixtures.codex_home(d / "codex", [
                 dict(thread, id=parent, name="garden"),
                 dict(thread, id="0190cccc-0000-7000-8000-00000000c001", thread_source="subagent",
                      agent_nickname="Beauvoir", source=json.dumps({"subagent": {"thread_spawn": {
@@ -974,6 +988,75 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(by["alpha"]["failover"]["account"], "work")
             self.assertIn("tests pass", [t["text"] for t in snap["timeline"]])
             json.dumps(snap)                                        # serialisable
+
+    def test_the_snapshot_lists_the_logins_a_new_agent_can_be_started_on(self):
+        """spawn_logins, the start dialog's logins besides Automatic (the collector's `logins`); a reader that fails
+        leaves it out and says why in problems."""
+        with tempfile.TemporaryDirectory() as d:
+            logins = [{"name": "gemini", "label": "Gemini Neon (OpenRouter)"}]
+            snap = fixtures.collector(d, logins=lambda: logins).snapshot(NOW)
+            self.assertEqual((snap["spawn_logins"], snap["problems"]), (logins, []))
+
+            def damaged():
+                raise ValueError("config.json is not valid JSON")
+            snap = fixtures.collector(d, logins=damaged).snapshot(NOW)
+            self.assertNotIn("spawn_logins", snap)
+            self.assertEqual(snap["problems"], [{"source": "the mailroom's logins",
+                                                 "error": "ValueError: config.json is not valid JSON"}])
+            self.assertNotIn("spawn_logins", fixtures.collector(d).snapshot(NOW))     # none given: none sent
+
+    def test_the_keyring_s_state_reaches_the_snapshot_only_when_turned_on(self):
+        """The collector's keyring (keyring.make: None while the board config's keyring_unlock is off) is the
+        snapshot's "keyring", and a keyring it could not read is a problem."""
+        from agentboard import config as board_config, keyring
+        self.assertFalse(board_config.keyring_unlock({}))
+        self.assertIsNone(keyring.make(sync=True))                        # off by default: nothing read
+        cols = stand_ins.collections(True, False)
+        cols["login"] = dict(cols["login"], locked=None, error="busctl: no such object")
+        state = {"state": "locked", "locked": True, "error": None, "boot_id": "b", "collections": cols}
+
+        class Reading:                     # a sources.Periodic of keyring.status, read already
+            error = None
+
+            def maybe_refresh(self, now=None):
+                return state
+        with tempfile.TemporaryDirectory() as d:
+            snap = fixtures.collector(d, keyring=Reading()).snapshot(NOW)
+            self.assertEqual(snap["keyring"], state)
+            self.assertIn({"source": "keyring (login)", "error": "busctl: no such object"}, snap["problems"])
+            self.assertNotIn("keyring", fixtures.collector(d).snapshot(NOW))
+
+    def test_the_mailroom_s_security_alerts_reach_the_snapshot(self):
+        """For the Mac's notifications (README, "Security alerts on the Mac"): the last 7 days' alerts, oldest first, a
+        new one sent at once (the stream's fingerprint); a line that is not an alert is counted under problems, and a
+        file that cannot be read leaves the section out and says why."""
+        import importlib.machinery
+        import importlib.util
+        path = str(Path(__file__).resolve().parent.parent / "bin" / "agent-board")
+        spec = importlib.util.spec_from_loader("agent_board_cli", importlib.machinery.SourceFileLoader("agent_board_cli", path))
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        alert = {"at": NOW - 60, "kind": "phone-enrolment", "subject": "Phone mail: a passkey was enrolled",
+                 "thread_id": "L0123456789abcdef"}
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            self.assertEqual(fixtures.collector(d).snapshot(NOW)["security_alerts"], [])   # the mailroom's: none yet
+            alerts = d / "security-alerts.jsonl"
+            col = fixtures.collector(d, security_alerts=lambda now: sources.security_alerts(now, alerts))
+            before = cli.fingerprint(col.snapshot(NOW))
+            alerts.write_text(json.dumps(alert) + "\n" + "garbled\n")
+            snap = col.snapshot(NOW)
+            self.assertEqual(snap["security_alerts"], [alert])
+            self.assertIn({"source": "security alerts", "error": "1 line(s) of security-alerts.jsonl are not alerts"},
+                          snap["problems"])
+            self.assertNotEqual(cli.fingerprint(snap), before)
+            alerts.unlink()
+            alerts.mkdir()
+            snap = col.snapshot(NOW)
+            self.assertNotIn("security_alerts", snap)
+            self.assertTrue([p for p in snap["problems"] if p["source"] == "security alerts"
+                             and p["error"].startswith("IsADirectoryError")], snap["problems"])
+            self.assertNotIn("security_alerts", fixtures.collector(d, security_alerts=None).snapshot(NOW))
 
     def test_the_star_reaches_the_snapshot(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1282,6 +1365,11 @@ class SourceReadTest(unittest.TestCase):
 
 
 class LeakedEnvTest(unittest.TestCase):
+    def setUp(self):
+        real = sources.mailroom
+        sources.mailroom = stand_ins.mailroom()   # the keys lock launch_in_tmux takes
+        self.addCleanup(setattr, sources, "mailroom", real)
+
     def test_an_sdk_cli_session_in_a_tmux_pane_is_an_agent(self):
         # a tmux server an orchestrator run started gives every agent CLAUDE_CODE_ENTRYPOINT=sdk-cli
         with tempfile.TemporaryDirectory() as d:
@@ -1343,10 +1431,12 @@ class LeakedEnvTest(unittest.TestCase):
         """launch_in_tmux of a Codex resume whose pane shows first_screen until a key is sent, then Codex's prompt.
         tmux is a live server holding the machine's agents, and the session registry reads it: both answer here.
         Returns (launch_in_tmux's result, the keys sent after the launch line and its Enter)."""
-        calls, screens = [], [first_screen]
+        calls, screens, self.locked = [], [first_screen], []
 
         def run(cmd, stdin=None, timeout=60):
             calls.append(cmd)
+            if cmd[1] == "send-keys":
+                self.locked.append(stand_ins.keys_taken())
             if cmd[1] == "capture-pane":
                 return 0, screens[-1]
             if cmd[1] == "send-keys" and len([c for c in calls if c[1] == "send-keys"]) > 2:
@@ -1356,6 +1446,23 @@ class LeakedEnvTest(unittest.TestCase):
                                       live=lambda a: "Ask Codex" in screens[-1], wait=5, cap=lambda *a: "capped",
                                       tmux="tmux")
         return got, [c[4:] for c in calls if c[1] == "send-keys"][2:]
+
+    def test_the_launch_line_and_each_dialog_answer_are_typed_under_the_mailroom_s_keys_lock(self):
+        (up, memory, err, note), keys = self.launch_on(fixtures.CODEX_HOOK_REVIEW)
+        self.assertTrue(up)
+        self.assertEqual(self.locked, [True] * 3)   # the line, its Enter, the answer
+        self.assertFalse(stand_ins.keys_taken())
+
+    def test_a_mailroom_without_the_keys_lock_starts_nothing(self):
+        import types
+        sources.mailroom = stand_ins.mailroom(commands=types.SimpleNamespace())   # a mailroom older than the lock
+        calls = []
+        got = relaunch.launch_in_tmux({"id": "x", "cli": "codex", "cwd": "/w"}, "codex resume x", "tutor",
+                                      run=lambda cmd, stdin=None, timeout=60: calls.append(cmd) or (0, ""),
+                                      live=lambda a: True, wait=1, cap=lambda *a: "capped", tmux="tmux")
+        self.assertEqual(got[:2], (False, ""))
+        self.assertIn("the mailroom's keys lock is not there (AttributeError: ", got[2])
+        self.assertEqual(calls, [])   # no session, no keys
 
     def test_codex_hook_review_is_answered_without_trusting_and_reported(self):
         review = fixtures.CODEX_HOOK_REVIEW
@@ -1443,6 +1550,61 @@ class ActionsTest(unittest.TestCase):
         self.assertEqual(actions.send_footer(), "\n\n(Sent from the agent board, not by email. If you need to answer, "
                                                 "use agent-mail send to Alex.)")
 
+    def own_records(self):
+        """sent.py's record and actions.jsonl are this test's own, new and empty, until it ends."""
+        d = Path(tempfile.mkdtemp())
+        real = (sent.PATH, actions.AUDIT)
+        sent.PATH, actions.AUDIT = d / "sent.jsonl", d / "actions.jsonl"
+        self.addCleanup(lambda: (setattr(sent, "PATH", real[0]), setattr(actions, "AUDIT", real[1])))
+
+    def test_files_go_to_agent_send_with_the_message_as_the_owner_s(self):
+        """A message's files go with it to agent-send as {"text", "files"} on stdin (--input-json), which saves them for
+        the agent and ends the message with their paths; the owner sent them (--from). The records keep their names, and
+        actions.jsonl their sizes, never their data."""
+        self.own_records()
+        sid = self.rows[0]["id"]
+        files = [{"name": "shot.png", "data": base64.b64encode(b"PNG").decode()}]
+        res, calls = self.run_act({"action": "send", "id": sid, "text": " look at this ", "files": files})
+        self.assertTrue(res["ok"], res)
+        ((cmd, stdin),) = calls
+        self.assertEqual(cmd, ["/bin/agent-send", "--raw", "--cli", "claude", sid, "--from", "Alex", "--input-json"])
+        got = json.loads(stdin)
+        self.assertEqual(got["files"], files)
+        self.assertTrue(got["text"].startswith(actions.header() + "\nlook at this\n"), got["text"])
+        self.assertTrue(got["text"].splitlines()[-1].strip().startswith(sent.DONE_CMD + " "))   # marked done as any
+        res, calls = self.run_act({"action": "send", "id": sid, "files": files})       # files alone make a message
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(json.loads(calls[0][1])["text"].startswith(actions.header() + "\n\n"))
+        self.assertEqual([(r["text"], r["files"]) for r in sent.messages()], [("look at this", ["shot.png"]),
+                                                                              ("", ["shot.png"])])
+        self.assertEqual([e["files"] for e in map(json.loads, actions.AUDIT.read_text().splitlines())],
+                         [[{"name": "shot.png", "bytes": 3}]] * 2)
+        self.assertNotIn(files[0]["data"], sent.PATH.read_text() + actions.AUDIT.read_text())
+
+    def test_a_message_without_files_goes_as_before(self):
+        res, calls = self.run_act({"action": "send", "id": self.rows[0]["id"], "text": "hi", "files": []})
+        self.assertTrue(res["ok"])
+        self.assertEqual(calls[0][0], ["/bin/agent-send", "--raw", "--cli", "claude", self.rows[0]["id"]])
+        self.assertTrue(calls[0][1].startswith(actions.header() + "\nhi"))
+
+    def test_files_that_will_not_do_send_nothing(self):
+        sid, one = self.rows[0]["id"], {"name": "a.png", "data": base64.b64encode(b"x").decode()}
+        for files, said in (([{"name": "a.png", "data": "not base64!"}], "the data of a.png is not base64"),
+                            ([one] * (mailbox.MAX_FILES + 1), "at most %d files" % mailbox.MAX_FILES),
+                            ([{"name": "", "data": one["data"]}], "each file must be {name, data}"),
+                            (one, "files must be a list")):
+            with self.subTest(said=said):
+                res, calls = self.run_act({"action": "send", "id": sid, "text": "hi", "files": files})
+                self.assertFalse(res["ok"])
+                self.assertIn(said, res["error"])
+                self.assertEqual(calls, [])
+        real = mailbox.MAX_FILE_BYTES
+        mailbox.MAX_FILE_BYTES = 1
+        self.addCleanup(setattr, mailbox, "MAX_FILE_BYTES", real)
+        res, calls = self.run_act({"action": "send", "id": sid, "text": "hi", "files": [one, one]})
+        self.assertEqual((res["ok"], calls), (False, []))
+        self.assertIn("the files come to 2 bytes", res["error"])
+
     def test_rejections(self):
         bad = [
             {"action": "close", "id": "alpha"},                                   # names are not accepted
@@ -1503,7 +1665,7 @@ class ActionsTest(unittest.TestCase):
             refuse = lambda cmd, **k: (2, json.dumps({"ok": False, "refused": True, "detail": "not agent-spawn's tmux layout"}))
             res = act({"action": "switch_options", "id": sid}, self.rows, run=refuse)
             self.assertEqual((res["ok"], res["error"]), (False, "not agent-spawn's tmux layout"))
-            for bad in ({"to": "claude:work; rm -rf ~"}, {"to": "gemini"}, {"model": "--help"}, {"effort": "x y"}, {},
+            for bad in ({"to": "claude:work; rm -rf ~"}, {"to": "elsewhere"}, {"model": "--help"}, {"effort": "x y"}, {},
                         {"to": "codex", "force": "yes"}):
                 n = len(calls)
                 self.assertFalse(act(dict(bad, action="switch", id=sid), self.rows, run=fake)["ok"], bad)
@@ -1619,6 +1781,46 @@ class WorktreeTest(unittest.TestCase):
         busy = [{"id": "x", "live": True, "cwd": "/w/feed-fix"}]
         self.assertIn("working in", ok({"action": "wt_cleanup", "path": "/w/feed-fix"}, busy)["error"])
 
+    def test_an_agent_can_be_started_on_a_manual_login_by_name(self):
+        """The start dialog's login: one of the mailroom's manual logins (the snapshot's spawn_logins), passed to
+        agent-spawn as --account; any other name is refused before anything runs."""
+        calls = []
+        spawn = {"run": lambda cmd, **k: (calls.append(cmd) or (0, "{}")), "state": "clean"}
+        d = Path(tempfile.mkdtemp())
+        real = (sources.MAIL_CONFIG, actions.AUDIT, sent.PATH, sources.mailroom)
+        sources.MAIL_CONFIG, actions.AUDIT, sent.PATH = d / "config.json", d / "actions.jsonl", d / "sent.jsonl"
+        sources.MAIL_CONFIG.write_text(json.dumps({"usage": {"claude_accounts": {
+            "default": {"config_dir": None, "label": "Claude (Max plan)"},
+            "gemini": {"config_dir": "~/.claude-gemini", "label": "Gemini Neon (OpenRouter)", "manual": 1,
+                       "weekly_budget_usd": 500}}}}))
+        # the mailroom says which logins are manual (accounts.manual: any true value); it stands in here
+        stand_ins.use(self)
+        sources.mailroom = stand_ins.mailroom(accounts=stand_ins.MailroomAccounts)
+        try:
+            self.assertEqual(sources.manual_logins(), [{"name": "gemini", "label": "Gemini Neon (OpenRouter)"}])
+            req = {"action": "wt_spawn", "path": "/w/feed-fix", "text": "tidy and close"}
+            self.assertTrue(act(dict(req, account="gemini"), [], self.wts, **spawn)["ok"])
+            self.assertEqual(calls[-1][1:5], ["--dir", "/w/feed-fix", "--account", "gemini"])
+            self.assertTrue(act(req, [], self.wts, **spawn)["ok"])                      # Automatic: usage picks
+            self.assertNotIn("--account", calls[-1])
+            n = len(calls)
+            for bad in ("default", "nobody", "gemini; rm -rf ~", "--help", "", 7, ["gemini"]):
+                res = act(dict(req, account=bad), [], self.wts, **spawn)
+                self.assertFalse(res["ok"], bad)
+            self.assertIn("not a login the board can start an agent on (the mailroom's manual logins: gemini)",
+                          act(dict(req, account="default"), [], self.wts, **spawn)["error"])
+            self.assertEqual(len(calls), n)
+            self.assertEqual(sources.read_jsonl(actions.AUDIT)[0]["account"], "gemini")       # on the record
+        finally:
+            sources.MAIL_CONFIG, actions.AUDIT, sent.PATH, sources.mailroom = real
+
+    def test_without_a_mailroom_no_login_is_offered_and_none_can_be_named(self):
+        """A mailroom that is not installed (or older than manual logins) offers no login, and a named one is refused."""
+        self.assertEqual(sources.manual_logins(), [])
+        res = act({"action": "wt_spawn", "path": "/w/feed-fix", "text": "go", "account": "gemini"}, [], self.wts,
+                  run=lambda cmd, **k: self.fail("agent-spawn ran"), state="clean")
+        self.assertIn("not a login the board can start an agent on (the mailroom's manual logins: none)", res["error"])
+
     def test_bulk_landed_cleanup(self):
         wts = self.wts + [{"path": "/w/feed-old", "repo": "feed", "main": "/w/feed", "branch": "old", "detached": False,
                            "locked": False}]
@@ -1672,16 +1874,6 @@ class WorktreeTest(unittest.TestCase):
 
 class ResumeTest(unittest.TestCase):
     @staticmethod
-    def fake_mailroom(**modules):
-        """sources.mailroom over these modules, any other one missing as in a mailroom older than it: the mailroom is
-        another repo's install, with its own tests."""
-        def mailroom(module):
-            if module not in modules:
-                raise ModuleNotFoundError("No module named 'agentmail.%s'" % module, name="agentmail." + module)
-            return modules[module]
-        return mailroom
-
-    @staticmethod
     def config(cfg):
         import types
         return types.SimpleNamespace(load=lambda: cfg)
@@ -1709,7 +1901,7 @@ class ResumeTest(unittest.TestCase):
         sources.tmux_sessions = lambda: {"nova": {"/x"}}       # the live tmux server, nova taken: it must pick nova-2
         sources.codex_settings = lambda tid: ("gpt-6-astra", "xhigh")     # the thread's settings in the live ~/.codex
         actions.stranded_mail = lambda a: [311]                            # the live mailroom database
-        sources.mailroom = self.fake_mailroom(config=self.config({}))
+        sources.mailroom = stand_ins.mailroom(config=self.config({}))
         try:
             # already running again, or a process already carries the id: refuse, start nothing. live, busy and cap
             # stand in for the live session registry, /proc and the mailroom's memory cap on a live tmux pane
@@ -1757,7 +1949,7 @@ class ResumeTest(unittest.TestCase):
         sources.tmux_sessions = lambda: {}                                 # the live tmux server
         sources.codex_settings = lambda tid: ("gpt-6-astra", "xhigh")     # the thread's settings in the live ~/.codex
         actions.stranded_mail = lambda a: []                               # the live mailroom database
-        sources.mailroom = self.fake_mailroom(config=self.config({}))
+        sources.mailroom = stand_ins.mailroom(config=self.config({}))
         try:
             state = {"n": 0}
 
@@ -1809,7 +2001,7 @@ class ResumeTest(unittest.TestCase):
             read_tail=lambda path, nbytes: Path(path).read_text().splitlines(), settings=lambda cfg: {"tail_bytes": 1},
             transcript_flags=lambda lines: list(recorded))
 
-    def resume_claude(self, home, agent, failover, cfg, taken=()):
+    def resume_claude(self, home, agent, failover, cfg, taken=(), modules=None):
         """actions.resume on an exited Claude agent, with this mailroom and these tmux sessions already there:
         (result, the line typed into tmux)."""
         typed = []
@@ -1829,7 +2021,7 @@ class ResumeTest(unittest.TestCase):
         sources.DEFAULT_CLAUDE_HOME = home
         stand_ins.use(self)
         sources.tmux_sessions = lambda: {t: {"/x"} for t in taken}         # the live tmux server
-        sources.mailroom = self.fake_mailroom(config=self.config(cfg), failover=failover)
+        sources.mailroom = stand_ins.mailroom(config=self.config(cfg), failover=failover, **(modules or {}))
         relaunch.spawn_trust = lambda: None                                # it would write a login's .claude.json
         actions.stranded_mail = lambda a: []                               # the live mailroom database
         try:                # busy and cap: the live /proc and the mailroom's memory cap on a live tmux pane
@@ -1838,6 +2030,30 @@ class ResumeTest(unittest.TestCase):
             (sources.claude_logins, sources.DEFAULT_CLAUDE_HOME, sources.find_bin, sources.tmux_sessions,
              sources.mailroom, relaunch.spawn_trust, actions.stranded_mail) = real
         return res, typed
+
+    def test_a_per_token_agent_resumes_on_its_login_with_its_logins_model(self):
+        """The login's --settings and model (the mailroom's accounts.login_flags), never the Claude model its transcript
+        names: on OpenRouter's endpoint that model fails every request."""
+        home, agent = self.claude_login()
+        gemini = home.parent / ".claude-gemini"
+        (gemini / "projects" / "p").mkdir(parents=True)
+        (gemini / "projects" / "p" / (self.SID + ".jsonl")).write_text("{}\n")
+        cfg = {"spawn_claude_model": "claude-opus-5-5", "usage": {"claude_accounts": {
+            "default": {"config_dir": None},
+            "gemini": {"config_dir": str(gemini), "settings": str(home.parent / "gemini.json"),
+                       "model": "google/gemini-4-neon", "manual": True}}}}
+        place = lambda sess, cfg, trust, dry_run: (str(gemini), "on login gemini: a manual login, which nothing moves "
+                                                                "it off")
+        res, typed = self.resume_claude(home, agent, self.failover(home, ["--model", "claude-opus-5-5", "--effort",
+                                                                          "high"], place), cfg,
+                                        modules={"accounts": stand_ins.MailroomAccounts,
+                                                 "usage": stand_ins.MailroomUsage})
+        self.assertTrue(res["ok"], res)
+        self.assertIn(" CLAUDE_CONFIG_DIR=%s " % gemini, typed[0])
+        self.assertTrue(typed[0].endswith("--effort high --name fab --settings %s --model google/gemini-4-neon"
+                                          % (home.parent / "gemini.json")), typed[0])
+        self.assertNotIn("claude-opus-5-5", typed[0])
+        self.assertIn("claude · google/gemini-4-neon · high; on login gemini", res["output"])
 
     def test_claude_resumes_at_its_own_model_and_effort_and_name(self):
         home, agent = self.claude_login()
@@ -1869,16 +2085,16 @@ class ResumeTest(unittest.TestCase):
         real = (sources.claude_logins, sources.mailroom, relaunch.spawn_trust, sources.codex_settings)
         stand_ins.use(self)                                                # a mailroom checkout is there
         sources.claude_logins = lambda: [("default", home)]               # not the live ~/.claude logins
-        sources.mailroom = self.fake_mailroom(failover=self.failover(home, []))
+        sources.mailroom = stand_ins.mailroom(failover=self.failover(home, []))
         relaunch.spawn_trust = lambda: None                                # it would write a login's .claude.json
         sources.codex_settings = lambda tid: (None, None)                 # the live ~/.codex: no thread settings
         try:
             claude = relaunch.resume_settings(agent, cfg)
             codex = relaunch.resume_settings(dict(agent, cli="codex"), cfg)
             null = relaunch.resume_settings(agent, dict(cfg, spawn_claude_model=None))
-            sources.mailroom = self.fake_mailroom(failover=types.SimpleNamespace())     # older than place_resume
+            sources.mailroom = stand_ins.mailroom(failover=types.SimpleNamespace())     # older than place_resume
             unplaced = relaunch.resume_settings(agent, cfg)
-            sources.mailroom = self.fake_mailroom()                                       # older than failover
+            sources.mailroom = stand_ins.mailroom()                                       # older than failover
             self.assertEqual(relaunch.resume_settings(agent, cfg), unplaced)
         finally:
             sources.claude_logins, sources.mailroom, relaunch.spawn_trust, sources.codex_settings = real
@@ -1964,38 +2180,175 @@ class ResumeTest(unittest.TestCase):
 
 
 class OrchestrateTest(unittest.TestCase):
-    def test_runs_one_event_in_the_background_with_the_header(self):
-        got = {}
+    KEY = "k3yK3yk3yK3yk3yK3yk3yA"           # a message's idempotency key, as the Mac makes them
 
-        class FakeProc:     # agent-orchestrate would run a paid `claude -p` event: this Popen keeps what it was given
-            def __init__(self, cmd, **kw):
-                got["cmd"], got["kw"] = cmd, kw
-                self.stdin = self
-
-            def write(self, data):
-                got["stdin"] = data
-
-            def close(self):
-                pass
-        real_find, real_logs, real_config = sources.find_bin, actions.ORCH_LOGS, sources.MAIL_CONFIG
+    def setUp(self):
+        self.real = (actions.ORCH_LOGS, sources.MAIL_CONFIG, sent.PATH, actions.AUDIT)
         stand_ins.use(self)
-        actions.ORCH_LOGS = Path(tempfile.mkdtemp())
-        sources.MAIL_CONFIG = actions.ORCH_LOGS / "config.json"
+        d = actions.ORCH_LOGS = Path(tempfile.mkdtemp())              # each test's own logs, records and config
+        sent.PATH, actions.AUDIT, sources.MAIL_CONFIG = d / "sent.jsonl", d / "actions.jsonl", d / "config.json"
         sources.MAIL_CONFIG.write_text(json.dumps({"allowlist": ["owner@example.com"]}))
-        try:
-            res = act({"action": "orchestrate", "text": "spin up an agent on proj --help $(x)"}, popen=FakeProc)
-            self.assertTrue(res["ok"])
-            self.assertEqual(got["cmd"], ["/bin/agent-orchestrate", "--source", "board"])     # text never in argv
-            self.assertTrue(got["kw"]["start_new_session"])
-            body = got["stdin"].decode()
-            self.assertTrue(body.startswith("[message from Alex via the agent board"))
-            self.assertIn("`agent-mail send --to owner --subject", body)          # the mailroom's alias for the owner
-            self.assertIn("\n\nspin up an agent on proj --help $(x)\n\nThis is message ", body)
-            self.assertTrue(body.splitlines()[-1].strip().startswith(sent.DONE_CMD + " "))
-            for bad in ({"text": "  "}, {"text": 5}, {}, {"text": "x" * 9000}):
-                self.assertFalse(act(dict(bad, action="orchestrate"), popen=FakeProc)["ok"])
-        finally:
-            sources.find_bin, actions.ORCH_LOGS, sources.MAIL_CONFIG = real_find, real_logs, real_config
+        self.popen = stand_ins.Popen()      # agent-orchestrate would run a paid `claude -p` event
+        self.systemctl = stand_ins.Command((0, "", ""))     # the run seam: systemctl acts on the live user manager
+
+    def tearDown(self):
+        actions.ORCH_LOGS, sources.MAIL_CONFIG, sent.PATH, actions.AUDIT = self.real
+
+    def orchestrate(self, text="start an agent", source="mac", key=KEY, popen=None):
+        return act({"action": "orchestrate", "text": text, "source": source, "key": key}, popen=popen or self.popen,
+                   run=self.systemctl)
+
+    def audited(self):
+        return [json.loads(x) for x in actions.AUDIT.read_text().splitlines()] if actions.AUDIT.exists() else []
+
+    def test_runs_one_event_in_the_background_in_a_scope_of_its_own_with_the_header(self):
+        res = self.orchestrate("spin up an agent on proj --help $(x)")
+        (got,) = self.popen.calls
+        unit = got["cmd"][5]
+        self.assertRegex(unit, r"^agent-orchestrate-[0-9]+-[0-9a-f]{6}$")
+        self.assertEqual(res, {"ok": True, "output": actions.ORCH_STARTED, "unit": unit,
+                               "log": str(actions.ORCH_LOGS / ("orchestrate-%s.log" % unit[len("agent-orchestrate-"):]))})
+        self.assertEqual(got["cmd"], ["/bin/systemd-run", "--user", "--scope", "--collect", "--unit", unit, "--",
+                                      "/bin/agent-orchestrate", "--source", "board"])     # text never in argv
+        self.assertTrue(got["kw"]["start_new_session"])
+        body = got["stdin"].decode()
+        self.assertTrue(body.startswith("[message from Alex via the agent board (the Mac app, over SSH), not by "
+                                        "email."))
+        self.assertIn("`agent-mail send --to owner --subject", body)          # the mailroom's alias for the owner
+        self.assertIn("\n\nspin up an agent on proj --help $(x)\n\nThis is message ", body)
+        self.assertTrue(body.splitlines()[-1].strip().startswith(sent.DONE_CMD + " "))
+        (entry,) = self.audited()
+        self.assertEqual((entry["key"], entry["unit"], entry["started"]), (self.KEY, unit, True))
+        for bad in ({"text": "  "}, {"text": 5}, {}, {"text": "x" * 9000}):
+            self.assertFalse(act(dict(bad, action="orchestrate", source="mac", key=self.KEY), popen=self.popen)["ok"])
+        self.assertEqual(len(self.popen.calls), 1)
+
+    def test_files_go_to_the_orchestrator_with_the_message(self):
+        """The owner's files go with the message as {"text", "files"} on the run's stdin (agent-orchestrate --input-json,
+        which saves them and ends the event with their paths); with files the text may be empty. The records keep their
+        names and sizes, never their data; files that will not do run nothing."""
+        files = [{"name": "shot.png", "data": base64.b64encode(b"PNG").decode()}]
+        res = act({"action": "orchestrate", "text": "start an agent on this", "source": "mac", "key": self.KEY,
+                   "files": files}, popen=self.popen, run=self.systemctl)
+        self.assertTrue(res["ok"], res)
+        (got,) = self.popen.calls
+        self.assertEqual(got["cmd"][-3:], ["--source", "board", "--input-json"])
+        sent_in = json.loads(got["stdin"].decode())
+        self.assertEqual(sent_in["files"], files)
+        self.assertTrue(sent_in["text"].startswith("[message from Alex via the agent board"))
+        self.assertIn("\n\nstart an agent on this\n\nThis is message ", sent_in["text"])
+        self.assertTrue(act({"action": "orchestrate", "source": "mac", "key": "n3wK3yn3wK3yn3wK3yn3wK", "files": files},
+                            popen=self.popen, run=self.systemctl)["ok"])
+        self.assertEqual([e["files"] for e in self.audited()], [[{"name": "shot.png", "bytes": 3}]] * 2)
+        self.assertEqual([(r["text"], r["files"]) for r in sent.messages()],
+                         [("start an agent on this", ["shot.png"]), ("", ["shot.png"])])
+        self.assertNotIn(files[0]["data"], sent.PATH.read_text() + actions.AUDIT.read_text())
+        res = act({"action": "orchestrate", "text": "x", "source": "mac", "key": "b4dK3yb4dK3yb4dK3yb4dK",
+                   "files": [{"name": "a", "data": "not base64!"}]}, popen=self.popen, run=self.systemctl)
+        self.assertEqual((res["ok"], len(self.popen.calls)), (False, 2))
+        self.assertIn("the data of a is not base64", res["error"])
+
+    def test_a_run_that_cannot_get_its_scope_is_refused_with_the_reason(self):
+        no_bus = stand_ins.Popen(exits=1, says=b"Failed to connect to bus: No such file or directory\n")
+        res = self.orchestrate(popen=no_bus)
+        self.assertEqual((res["ok"], res["error"]), (False, "the orchestrator did not start (exit 1): Failed to "
+                                                            "connect to bus: No such file or directory"))
+        self.assertEqual([(e["started"], e["error"]) for e in self.audited()], [(False, res["error"])])
+        self.assertEqual([(r["ok"], r["error"]) for r in sent.messages()], [(False, res["error"])])   # kept, failed
+        self.assertTrue(self.orchestrate()["ok"])           # its key started nothing, so sending it again starts it
+        real = sources.find_bin
+        sources.find_bin = lambda name: None if name == "systemd-run" else real(name)
+        self.assertEqual(self.orchestrate(key="n3wK3yn3wK3yn3wK3yn3wK"),
+                         {"ok": False, "error": "systemd-run is not on the desktop, so the orchestrator has no scope "
+                                                "to run in"})
+        self.assertEqual((len(no_bus.calls), len(self.popen.calls)), (1, 1))
+
+    def test_a_run_that_does_not_take_the_whole_message_is_refused_and_its_key_can_be_sent_again(self):
+        """A run that closed its stdin before the end has part of the message or none: never reported as started, and
+        one still running is stopped, so it cannot act on it, or named loudly when it cannot be."""
+        ended = stand_ins.Popen(exits=2, says=b"agent-orchestrate: no event text\n", closes_input=True)
+        res = self.orchestrate(popen=ended)
+        self.assertEqual((res["ok"], res["error"]),
+                         (False, "the orchestrator did not start (exit 2): agent-orchestrate: no event text"))
+        self.assertEqual(self.systemctl.calls, [])                    # it has ended: nothing to stop
+        going = stand_ins.Popen(closes_input=True)                     # it reads no more, and runs on
+        res = self.orchestrate(popen=going)
+        unit = going.calls[0]["cmd"][5]
+        self.assertEqual(self.systemctl.calls, [(["systemctl", "--user", "stop", unit + ".scope"], None)])
+        self.assertEqual((res["ok"], res["error"]), (False, "the orchestrator did not take the message: it stopped "
+                                                            "reading it before the end, so its run %s was stopped"
+                                                            % unit))
+        self.systemctl = stand_ins.Command((1, "", "Failed to stop the scope: Access denied\n"))
+        stuck = stand_ins.Popen(closes_input=True)
+        res = self.orchestrate(popen=stuck)
+        unit = stuck.calls[0]["cmd"][5]
+        self.assertEqual(self.systemctl.calls, [(["systemctl", "--user", "stop", unit + ".scope"], None)])
+        self.assertEqual(res["error"], "the orchestrator did not take the message: it stopped reading it before the "
+                                       "end, and its run %s, which may act on part of it, COULD NOT BE STOPPED "
+                                       "(systemctl exit 1: Failed to stop the scope: Access denied); stop it with: "
+                                       "systemctl --user stop %s.scope" % (unit, unit))
+        self.systemctl = stand_ins.Command((0, "", ""))
+        finished = stand_ins.Popen(exits=0, says=b"nothing to do\n", closes_input=True)
+        self.assertEqual(self.orchestrate(popen=finished)["error"], "the orchestrator did not take the message: it "
+                                                                    "stopped reading it before the end, and ended: "
+                                                                    "nothing to do")
+        self.assertEqual(self.systemctl.calls, [])
+        self.assertEqual([(e["started"], e.get("stopped")) for e in self.audited()],
+                         [(False, None), (False, True), (False, False), (False, None)])
+        self.assertEqual([r["ok"] for r in sent.messages()], [False] * 4)              # kept, as not delivered
+        self.assertEqual(self.orchestrate()["output"], actions.ORCH_STARTED)          # the same key starts it now
+        self.assertEqual([e["started"] for e in self.audited()], [False, False, False, False, True])
+
+    def test_a_message_s_key_starts_one_run_however_often_it_is_sent(self):
+        """A lost answer, then the same message sent again: answered from the first run, which is recorded once."""
+        first = self.orchestrate()
+        again = self.orchestrate()
+        self.assertEqual(again, {"ok": True, "already": True, "log": first["log"],
+                                 "output": "This message started the orchestrator already; it will email you."})
+        self.assertEqual(len(self.popen.calls), 1)
+        self.assertEqual(len(sent.messages()), 1)
+        self.assertTrue(self.orchestrate(key="n3wK3yn3wK3yn3wK3yn3wK")["ok"])       # another message: another run
+        self.assertEqual(len(self.popen.calls), 2)
+        for key in (None, "short", "-" + "k" * 21, 5, "k" * 65):
+            self.assertEqual(self.orchestrate(key=key), {"ok": False, "error": "key must be a new message key"}, key)
+        self.assertEqual(len(self.popen.calls), 2)
+
+    def test_a_message_with_invisible_characters_is_refused_and_runs_nothing(self):
+        """Format characters and the tag block, which text pasted from agent mail can carry, can hide words from the
+        owner that the orchestrator reads; it is refused, not changed after the owner approved it."""
+        for text, said in (("start\u200b an agent", "U+200B"), ("start an agent\U000E0041\U000E0042", "U+E0041, U+E0042"),
+                           ("\u202eevil", "U+202E"), ("soft\u00adhyphen\ufeff", "U+00AD, U+FEFF")):
+            self.assertEqual(self.orchestrate(text), {"ok": False, "error": "the message holds invisible characters "
+                                                      "(%s), likely from pasted text; take them out and send it again"
+                                                      % said}, text)
+        many = "".join(chr(0xE0061 + i) for i in range(8))
+        self.assertIn("(U+E0061, U+E0062, U+E0063, U+E0064, U+E0065, and 3 more)", self.orchestrate(many)["error"])
+        self.assertEqual(self.popen.calls, [])
+        self.assertTrue(self.orchestrate("café ❤️ — «ok»\tdone\nnext line")["ok"])     # visible text of any script
+        zwj = "fire it up ❤️\u200d🔥 👩\u200d💻"            # emoji joined by U+200D: allowed
+        self.assertTrue(self.orchestrate(zwj, key="zwjK3yzwjK3yzwjK3yzwjK")["ok"])
+        self.assertIn("(U+200B)", self.orchestrate("a lone \u200b space", key="zwspK3yzwspK3yzwspK3y")["error"])
+
+    def test_the_header_names_where_the_owner_wrote_it_from_one_template(self):
+        """The phone's message says it came from the phone app, the Mac's from the Mac app; nothing else differs."""
+        bodies = {}
+        for source, key in (("mac", "macK3ymacK3ymacK3ymacK3y"), ("phone", "phoneK3yphoneK3yphoneK3y")):
+            self.assertTrue(self.orchestrate(source=source, key=key)["ok"])
+            bodies[source] = self.popen.calls[-1]["stdin"].decode().split("\n\nThis is message ")[0]
+        self.assertEqual(bodies["mac"], actions.orch_header(source="mac") + "\n\nstart an agent")
+        for source, via in actions.ORCH_SOURCES.items():
+            self.assertEqual(bodies[source], actions.ORCH_HEADER_FMT.format(owner="Alex", source=via)
+                             + "\n\nstart an agent")
+        self.assertIn("(the Mac app, over SSH)", bodies["mac"])
+        self.assertIn("(the phone app, Agent Mail, over the tailnet)", bodies["phone"])
+        self.assertEqual([(a["source"], a["chars"]) for a in self.audited()], [("mac", 14), ("phone", 14)])
+
+    def test_a_message_from_nowhere_it_knows_is_refused_and_runs_nothing(self):
+        for source in (None, "email", 5, ["mac"], ""):
+            self.assertEqual(self.orchestrate(source=source),
+                             {"ok": False, "error": "source must be one of mac, phone"}, source)
+        self.assertEqual(self.popen.calls, [])
+        self.assertEqual([r["ok"] for r in sent.messages()], [False] * 5)        # each kept, as not delivered
 
 
 class SentRecordTest(unittest.TestCase):
@@ -2060,21 +2413,31 @@ class SentRecordTest(unittest.TestCase):
         self.assertEqual(sent.PATH.stat().st_mode & 0o777, 0o600)
         self.assertIn("café ✓", sent.PATH.read_text(encoding="utf-8"))       # readable, not \u-escaped
 
+    def test_a_message_a_codex_agent_holds_in_its_queue_says_it_waits_there_and_why(self):
+        """agent-send exits AGENT_SEND_HELD when a Codex agent took the message into its queue but holds it there: not
+        shown as sent; the Mac's answer and the record (not delivered) say it waits there, and why (agent-send's last
+        line)."""
+        why = "its last turn was interrupted, so Codex holds it until another turn starts"
+        res = act({"action": "send", "id": self.rows[0]["id"], "text": "carry on"}, self.rows,
+                  run=lambda cmd, stdin=None, timeout=0: (actions.AGENT_SEND_HELD,
+                                                          "held in Codex's queue for codex alpha [11111111] live "
+                                                          "(Queued message x for thread y.)\n" + why + "\n"))
+        self.assertEqual((res["ok"], res["code"]), (False, 7))
+        self.assertEqual(res["error"], "waiting in Codex's queue: " + why)
+        (got,) = sent.messages()
+        self.assertEqual((got["ok"], got["error"]), (False, "waiting in Codex's queue: " + why))
+        self.assertEqual(actions.AGENT_SEND_HELD, 7)     # the mailroom's deliver.HELD
+        res = act({"action": "send", "id": self.rows[0]["id"], "text": "and this"}, self.rows,
+                  run=lambda cmd, stdin=None, timeout=0: (actions.AGENT_SEND_HELD, "  \n"))
+        self.assertEqual(res["error"], "waiting in Codex's queue: agent-send gave no reason")
+
     def test_orchestrator_spawn_and_resume_requests(self):
-        class Proc:         # agent-orchestrate would run a paid `claude -p` event: this Popen takes it and does nothing
-            def __init__(self, cmd, **kw):
-                self.stdin = self
-
-            def write(self, data):
-                pass
-
-            def close(self):
-                pass
+        popen = stand_ins.Popen()       # agent-orchestrate would run a paid `claude -p` event
         real_logs = actions.ORCH_LOGS
         actions.ORCH_LOGS = Path(tempfile.mkdtemp())
         try:
-            act({"action": "orchestrate", "text": "start a proj agent"}, popen=Proc)
-            act({"action": "orchestrate", "text": "x" * 9000}, popen=Proc)
+            act({"action": "orchestrate", "text": "start a proj agent", "source": "mac", "key": "k" * 22}, popen=popen)
+            act({"action": "orchestrate", "text": "x" * 9000, "source": "mac", "key": "j" * 22}, popen=popen)
         finally:
             actions.ORCH_LOGS = real_logs
         wts = WorktreeTest.wts
@@ -2130,12 +2493,14 @@ class SentRecordTest(unittest.TestCase):
         cli = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cli)
         sent.record("send", "alpha", "do the thing", True, ref="k3f9")
+        sent.record("send", "alpha", "", True, files=["shot.png", "notes.txt"])    # files alone
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             self.assertEqual(cli.main(["done", "k3f9", "-m", "did the thing"]), 0)
             self.assertEqual(cli.main(["done", "zzzz"]), 1)                         # not on record
             self.assertEqual(cli.main(["done", "K3F9;rm"]), 2)                      # not a ref at all
             self.assertEqual(cli.main(["sent"]), 0)
+        self.assertIn("  send -> alpha  [waiting]\n    -- files: shot.png, notes.txt\n", out.getvalue())
         self.assertIn("marked k3f9 done", out.getvalue())
         self.assertIn("[done]", out.getvalue())
         self.assertIn("-- done ", out.getvalue())

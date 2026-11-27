@@ -8,10 +8,12 @@ is said in the output (the check then uses the last fetched refs), and a stale w
 not prune is an error. Git-ignored files (downloads, PDFs) go with the worktree.
 """
 import os
+import re
+import shlex
 import subprocess
 import time
 
-from . import commands, registry, statuslog
+from . import commands, procs, registry, statuslog
 
 
 def git(repo, *args, timeout=60):
@@ -23,27 +25,54 @@ def gitd(common, *args, timeout=60):
     return commands.run(["git", "--git-dir", common] + list(args), timeout=timeout)
 
 
+PANE_ID = re.compile(r"^%\d+$")   # a tmux pane id, as $TMUX_PANE holds it
+
+
 def tmux_self():
-    """The tmux session this process runs in, or None."""
-    if not os.environ.get("TMUX"):
-        return None
-    r = commands.run(["tmux", "display-message", "-p", "-t", os.environ.get("TMUX_PANE", ""), "#S"], timeout=10)
-    return r.stdout.strip() or None
+    """(the tmux session this process runs in, "") or (None, why it cannot be named): outside tmux; with a config that
+    does not say which server agent-close ends sessions on (commands.tmux_socket); in a pane of another server ($TMUX's
+    socket, its first field, is not that one), where pane ids restart at %0 so that $TMUX_PANE there would name another
+    agent's pane here; with no pane id in $TMUX_PANE (tmux would answer for the session used last, perhaps another
+    agent's); in a pane whose shell is not among this process's ancestors; or when tmux names none."""
+    env = os.environ.get("TMUX")
+    if not env:
+        return None, "this session is not running in tmux"
+    try:
+        ours = commands.tmux_socket()
+    except ValueError as e:
+        return None, "the tmux server agent-close ends sessions on is not known: %s" % e
+    sock = env.split(",")[0]
+    if os.path.realpath(sock) != os.path.realpath(ours):
+        return None, "this session runs in a pane of the tmux server at %s, not the one agent-close ends sessions on " \
+                     "(%s)" % (sock, ours)
+    pane = os.environ.get("TMUX_PANE", "")
+    if not PANE_ID.match(pane):
+        return None, "$TMUX_PANE is %s, not a pane id such as %%3, so this session's pane is not known" % (
+            repr(pane) if pane else "not set")
+    r = commands.tmux("display-message", "-p", "-t", pane, "#{pane_pid}\t#S", check=False)
+    shell, _, name = r.stdout.strip("\n").partition("\t")
+    if r.returncode != 0 or not name:
+        return None, "tmux could not name this pane's session: %s" % ((r.stderr or "").strip() or "no answer")
+    if not shell.isdigit() or int(shell) not in procs.ancestors(os.getpid()):
+        return None, "the shell of pane %s (pid %s) did not start this process, so it is not this session's pane" % (
+            pane, shell or "unknown")
+    return name, ""
 
 
 def tmux_cwd(name):
     # "=name:" (session, current window); a bare "=name" is read as a pane and matches nothing
-    r = commands.run(["tmux", "display-message", "-p", "-t", "=%s:" % name, "#{pane_current_path}"], timeout=10)
+    r = commands.tmux("display-message", "-p", "-t", "=%s:" % name, "#{pane_current_path}", check=False)
     return r.stdout.strip() or None
 
 
 def find(target=None, self_=False):
-    """(info, error). info: name, tmux (session name or None), cli, session_id, cwd.
+    """(info, error). info: name, tmux (session name or None), cli, session_id, cwd; for self_, also tmux_why (why
+    tmux is None: tmux_self).
     A NAME must match exactly (session name, session id or tmux name): this command deletes."""
     if self_:
         sess = registry.current_session() or {}
-        tm = tmux_self()
-        return {"name": sess.get("name") or tm or "", "tmux": tm, "cli": sess.get("cli", "?"),
+        tm, why = tmux_self()
+        return {"name": sess.get("name") or tm or "", "tmux": tm, "tmux_why": why, "cli": sess.get("cli", "?"),
                 "session_id": sess.get("id", ""), "cwd": os.getcwd()}, None
     sess, code, cands = registry.resolve(target)
     exact_tmux = commands.tmux_has(target)
@@ -176,10 +205,12 @@ def end_session(info, delay=0):
     if not info.get("tmux"):
         return "no tmux session to end"
     if delay:
-        subprocess.Popen(["sh", "-c", "sleep %d; tmux kill-session -t '=%s'" % (delay, info["tmux"].replace("'", ""))],
-                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["sh", "-c", "sleep %d; tmux -S %s kill-session -t '=%s'"
+                          % (delay, shlex.quote(commands.tmux_socket()), info["tmux"].replace("'", ""))],
+                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env={k: v for k, v in os.environ.items() if k != "TMUX"})
         return "tmux session %s ends in %ds" % (info["tmux"], delay)
-    commands.run(["tmux", "kill-session", "-t", "=" + info["tmux"]], timeout=10)
+    commands.tmux("kill-session", "-t", "=" + info["tmux"], check=False)
     for _ in range(20):
         if not commands.tmux_has(info["tmux"]):
             return "ended tmux session %s" % info["tmux"]
@@ -208,9 +239,9 @@ def close(info, force=False, dry_run=False, self_=False, fetch=True):
     """Returns (code, lines). code 0 closed, 2 refused, 1 error."""
     who = info.get("name") or info.get("tmux")
     if self_ and not info.get("tmux") and not force:
-        return 2, ["not closing: this session is not running in tmux, so agent-close cannot end it, and removing "
-                   "the worktree would leave you running in a deleted directory. Exit the session yourself, or "
-                   "pass --force to remove the worktree anyway."]
+        return 2, ["not closing: %s, so agent-close cannot end it, and removing the worktree would leave you running "
+                   "in a deleted directory. Exit the session yourself, or pass --force to remove the worktree anyway."
+                   % (info.get("tmux_why") or "this session is not running in tmux")]
     wt = worktree(info.get("cwd"))
     lines, stale = [], None
     if wt["kind"] == "linked":

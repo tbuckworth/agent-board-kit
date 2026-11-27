@@ -27,8 +27,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import (accounts, cli, config, launch, memcap, piped, registry, reviewgate, statuslog,  # noqa: E402
-                       usage, worktree)
+from agentmail import (accounts, cli, config, deliver, launch, memcap, piped, registry, reviewgate,  # noqa: E402
+                       statuslog, usage, worktree)
 from agentmail.commands import CommandError, checked, repo_root, run, tmux_has  # noqa: E402
 from agentmail.trust import claude_json_for, ensure_trust  # noqa: E402
 
@@ -164,12 +164,20 @@ def plan_place(a, root):
 def plan_agent(a, cfg, plan):
     """Which CLI, login, model and effort (choose_route, then config): the plan's cli, account, config_dir, model,
     effort and, when usage or --account chose, route. The model is --model, else the one usage routing chose, else
-    config spawn_<cli>_model. Runs git for the repo's owner; raises CommandError if it fails."""
+    config spawn_<cli>_model; on a Claude login, accounts.move_model has the last word (a login with its own model
+    runs it, and a --model it refuses stops agent-spawn). Runs git for the repo's owner; raises CommandError if it
+    fails."""
     owner = a.org if a.new_repo else accounts.repo_owner(plan.get("repo") or plan["path"])
     route = choose_route(a, cfg, owner)
     cli = route["cli"]
-    out = dict(cli=cli, account=route["account"], config_dir=route["config_dir"],
-               model=a.model or route.get("model") or cfg[config.SPAWN_KEYS[cli]["model"]],
+    fresh = cfg[config.SPAWN_KEYS[cli]["model"]]
+    model = a.model or route.get("model") or fresh
+    if cli == "claude" and route["account"]:
+        try:
+            model = accounts.move_model(usage.settings(cfg), None, route["account"], a.model, model, fresh)
+        except ValueError as e:
+            die(str(e))
+    out = dict(cli=cli, account=route["account"], config_dir=route["config_dir"], model=model,
                effort=a.effort or cfg[config.SPAWN_KEYS[cli]["effort"]])
     if route["routed"] or route["why"]:
         out["route"] = route["why"]
@@ -240,7 +248,10 @@ def start_agent(plan, brief_path, props):
               "(--model/--effort not applied)" % plan["name"], file=sys.stderr)
         r = run([AGENT_SEND, "--from", "agent-spawn", plan["name"], brief_path.read_text()], 120)
         plan["delivery"] = (r.stdout + r.stderr).strip()
-        if r.returncode != 0:
+        if r.returncode == deliver.HELD:   # in the agent's queue, arriving at its next turn: sent, never to go again
+            plan.setdefault("notes", []).append("the brief waits in Codex's queue: " +
+                                                (plan["delivery"].splitlines() or ["agent-send gave no reason"])[-1])
+        elif r.returncode != 0:
             plan["error"] = "agent-send could not deliver the brief to %r (exit %d): %s" % (
                 plan["name"], r.returncode, plan["delivery"][:300])
         return

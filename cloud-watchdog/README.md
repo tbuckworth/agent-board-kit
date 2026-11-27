@@ -72,8 +72,14 @@ brief ([docs/orchestrator-section.md](docs/orchestrator-section.md)).
 ## For you (or the orchestrator relaying your reply)
 
 Every watchdog email is sent with `agent-mail send --unrouted`, so your reply lands at the orchestrator.
-Each email ends with the exact command a reply maps to; reply "close it", "keep it 48h", "stay in
-shadow", "turn it off" or "go live now" and the orchestrator runs it:
+An alert also names its kind with `--alert`, so that, if you keep agent mail off Gmail for the board's Mail
+tab (mailroom config `mailbox.owner_delivery = "local"`), the mailroom's `mailbox.gmail_alerts` decides which
+kinds still go through Gmail: `cloud-idle` (an incident's escalation: idle, crash-looping or unowned, owner
+not reached), `cloud-stop` (stopped, or failed to stop, a crash-looping app), `cloud-cost` (a cost threshold
+passed), `cloud-colleague` (someone else's app crash-looping), `cloud-blind` (an account it cannot see),
+`cloud-heartbeat` ("Not running") and `cloud-check` ("Check failed"). The digest and "Now live" are not
+alerts and name no kind. Each email ends with the exact command a reply maps to; reply "close it", "keep it
+48h", "stay in shadow", "turn it off" or "go live now" and the orchestrator runs it:
 
 ```
 cloud-watch mode                                   # shadow / shadow until <date> / live / off

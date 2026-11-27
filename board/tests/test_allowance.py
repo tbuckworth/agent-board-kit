@@ -1,9 +1,12 @@
 """Where a plan window's allowance went (agentboard/allowance.py): replies read from Claude and Codex transcripts,
 the moves between logins, each reply counted once on its login, the fitted factor, and the split by group with
 Other, and the usage readings the board keeps for the fit. Every file goes to a temporary folder."""
+import datetime
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -11,13 +14,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fixtures import iso, parse_file, repo_with_worktree, write_jsonl  # noqa: E402
-from agentboard import actions, allowance  # noqa: E402
+from agentboard import actions, allowance, sources  # noqa: E402
 
 T0 = 1793000000.0
 WEEK = 7 * 86400
 A, B, C, D = (str(uuid.UUID(int=n)) for n in (1, 2, 3, 4))      # session ids
 CFG = dict(allowance.DEFAULTS, prices={"claude-opus-5-5": [4, 20, 0.2], "claude-fable-5-1": [10, 50, 0.25],
                                        "gpt-6.1-sol": [1, 8, 0.1]}, min_fit_points=3)
+PALETTE = {"groups": {"Work": "#0E8A84"}, "reserve": ["#6A5ACD"], "ungrouped": "#8C877F",      # colours.json's form
+           "shades": {"lightness": 0.1, "chroma": 0.92}}
 
 
 def reply(sid, mid, ts, out=1000, model="claude-opus-5-5", cw=0, cr=0, cwd="/w/repo", breakdown=True):
@@ -184,6 +189,17 @@ class Ledger(unittest.TestCase):
                          [("codex", A, T0 + 10), ("codex", A, T0 + 30), ("codex", A, T0 + 50)])
         self.assertEqual(cwd[A], "/w/web")
 
+    def test_a_codex_review_thread_counts_on_the_thread_that_asked_for_it(self):
+        # a review thread names its kind as text, {"subagent": "review"}, and its parent at the top of its meta
+        day = self.codex / "sessions" / "2026" / "11" / "25"
+        write_jsonl(day / "rollout-a.jsonl", [codex_meta(A, T0), turn("gpt-6.1-sol"), tokens(T0 + 10, 100, 0, 10)])
+        review = codex_meta(B, T0 + 20)
+        review["payload"].update(source={"subagent": "review"}, parent_thread_id=A)
+        write_jsonl(day / "rollout-b.jsonl", [review, turn("gpt-6.1-sol"), tokens(T0 + 30, 100, 0, 10)])
+        rows, _, notes = self.ledger()
+        self.assertEqual(sorted((r[0], r[1], r[2]) for r in rows), [("codex", A, T0 + 10), ("codex", A, T0 + 30)])
+        self.assertEqual(notes, [])
+
     def test_lines_and_threads_that_cannot_be_read_are_named(self):
         p = write_jsonl(self.default / "projects" / "p" / (A + ".jsonl"), [reply(A, "m1", T0)])
         with open(p, "a") as fh:
@@ -245,7 +261,8 @@ class Split(unittest.TestCase):
     def split(self, rows, samples, key="weekly", accounts=None):
         cwd = {A: str(self.d / "proj"), B: "/w/admin", C: str(self.d / "proj-todo-1"), D: "/w/orchestrator"}
         return allowance.split("claude:default", key, accounts or self.accounts(), rows, cwd, samples, CFG,
-                               T0 + 48 * 3600, self.HISTORY, self.LAYOUT, {A: "todo-1", B: "board"}, "/w/orchestrator")
+                               T0 + 48 * 3600, self.HISTORY, self.LAYOUT, {A: "todo-1", B: "board"}, "/w/orchestrator",
+                               PALETTE)
 
     def rows(self):
         # the fit's stretches: $10 an hour across all agents, at 3% of the window per $100
@@ -275,7 +292,10 @@ class Split(unittest.TestCase):
         self.assertEqual([x["name"] for x in admin["agents"]], ["board"])
         self.assertEqual((unsorted["name"], [x["name"] for x in unsorted["agents"]]),
                          (allowance.timeuse.UNSORTED, [allowance.ORCHESTRATOR]))
-        self.assertEqual(s["layout"], self.LAYOUT)
+        self.assertEqual(s["colours"], {"groups": [
+            {"name": "Work", "colour": "#0E8A84", "shades": [{"name": "Proj", "colour": "#006A65"}]},  # the darker end
+            {"name": "Admin", "colour": "#6A5ACD", "shades": []}],                    # Admin: the reserve's first
+            "ungrouped": "#8C877F"})
 
     def test_the_chart_stacks_the_groups_and_other_on_top(self):
         s = self.split(self.rows(), self.samples())
@@ -371,6 +391,174 @@ def load_agent_board():
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
+
+
+def gemini_reply(sid, mid, ts, inp, cached, out, model="google/gemini-4-neon"):
+    """A reply as Claude Code writes one from OpenRouter: no cache writes, and their breakdown at zero."""
+    usage = {"input_tokens": inp, "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached,
+             "output_tokens": out, "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}}
+    return {"type": "assistant", "sessionId": sid, "cwd": "/w/repo", "timestamp": iso(ts),
+            "message": {"id": mid, "model": model, "usage": usage}}
+
+
+def utc(*args):
+    return datetime.datetime(*args, tzinfo=datetime.timezone.utc).timestamp()
+
+
+GEMINI = {"config_dir": None, "label": "Gemini Neon (OpenRouter)", "settings": "~/openrouter-claude-settings.json",
+          "model": "google/gemini-4-neon", "manual": True, "weekly_budget_usd": 500}
+
+
+class Spend(unittest.TestCase):
+    """A per-token login's dollars this week, against its budget (allowance.weekly_spend)."""
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp())
+        self.home, self.default = root / "claude-gemini", root / "claude"
+        self.log, self.cache = root / "events.jsonl", root / "spend-cache.json"
+        self.log.write_text("")
+        self.accounts = {"default": {"config_dir": str(self.default)},
+                         "gemini": dict(GEMINI, config_dir=str(self.home))}
+        saved = allowance.CONFIG
+        allowance.CONFIG = root / "allowance.json"           # the week in UTC, whatever this machine's zone
+        allowance.CONFIG.write_text(json.dumps({"week_zone": "UTC"}))
+        self.addCleanup(setattr, allowance, "CONFIG", saved)
+
+    def spend(self, now):
+        return allowance.weekly_spend(now, self.accounts, self.log, self.cache)
+
+    def test_gemini_prices_charge_nothing_for_cache_writes(self):
+        prices = allowance.DEFAULTS["prices"]
+        row = [T0, "google/gemini-4-neon", 10 ** 6, 10 ** 6, 10 ** 6, 10 ** 6, 10 ** 6]
+        self.assertAlmostEqual(allowance.price(row, prices), 3 + 0 + 0 + 0.15 + 15)
+        self.assertAlmostEqual(allowance.price([T0, "google/gemini-4-hydrogen"] + [10 ** 6] * 5, prices),
+                               1.5 + 0.075 + 7.5)
+        saved = allowance.CONFIG
+        allowance.CONFIG = Path(tempfile.mkdtemp()) / "allowance.json"
+        try:
+            allowance.CONFIG.write_text(json.dumps({"prices": {"x/y": [1, 2, 0.1, 0.5]}}))
+            self.assertEqual(allowance.config()["prices"], {"x/y": [1, 2, 0.1, 0.5]})
+            allowance.CONFIG.write_text(json.dumps({"prices": {"x/y": [1, 2, 0.1, 0.5, 9]}}))
+            with self.assertRaisesRegex(ValueError, "prices must map each model"):
+                allowance.config()
+        finally:
+            allowance.CONFIG = saved
+
+    def test_a_sessions_spend_is_priced_as_openrouter_charges(self):
+        # one per-token session's replies, (input, cache read, output), and its sub-agent's, at the model's prices
+        # ([3, 15, 0.15] dollars per million): 34,000 input, 40,000 cache read and 1,300 output tokens, $0.1275.
+        # Claude Code writes each reply's usage on every line of its content, so ids repeat
+        t = utc(2026, 11, 27, 10, 52)
+        main = [(10000, 0, 300), (2000, 9000, 100), (2000, 10000, 200), (2000, 10000, 200), (2000, 11000, 200)]
+        lines = []
+        for i, (inp, cached, out) in enumerate(main):
+            lines += [gemini_reply(A, "msg_%d" % i, t + 10 * i, inp, cached, out)] * (2 if i % 2 else 3)
+        write_jsonl(self.home / "projects" / "-w-repo" / (A + ".jsonl"), lines)
+        write_jsonl(self.home / "projects" / "-w-repo" / A / "subagents" / "agent-a1.jsonl",
+                    [gemini_reply(A, "msg_s1", t + 3, 8000, 0, 200)] * 2
+                    + [gemini_reply(A, "msg_s2", t + 6, 8000, 0, 100)])
+        got = self.spend(t + 3600)["gemini"]
+        self.assertAlmostEqual(got["dollars"], 0.1275, places=10)
+        self.assertEqual((got["budget"], got["since"], got["notes"]), (500.0, utc(2026, 11, 23), []))
+        self.assertAlmostEqual(self.spend(t + 3600)["gemini"]["dollars"], 0.1275, places=10)      # from its cache
+        self.assertEqual(allowance.weekly_spend(t, {"default": {}}, self.log, self.cache), {})     # no budget, no spend
+
+    def test_the_week_starts_on_monday_at_midnight_in_its_zone_across_a_clock_change(self):
+        # Central European clocks went forward on Sunday 29 March 2026 and back on Sunday 25 October 2026
+        paris = "Europe/Paris"
+        self.assertEqual(allowance.week_start(utc(2026, 3, 29, 21, 30), paris), utc(2026, 3, 22, 23))   # Monday 00:00 CET
+        self.assertEqual(allowance.week_start(utc(2026, 3, 29, 22, 30), paris), utc(2026, 3, 29, 22))   # Monday 00:00 CEST
+        self.assertEqual(utc(2026, 3, 29, 22) - utc(2026, 3, 22, 23), WEEK - 3600)               # an hour short
+        self.assertEqual(utc(2026, 10, 25, 23) - utc(2026, 10, 18, 22), WEEK + 3600)             # an hour long
+        self.assertEqual(allowance.week_start(utc(2026, 10, 25, 22, 30), paris), utc(2026, 10, 18, 22))  # Sunday 23:30
+        self.assertEqual(allowance.week_start(utc(2026, 10, 25, 23, 30), paris), utc(2026, 10, 25, 23))  # Monday 00:30
+        allowance.CONFIG.write_text(json.dumps({"week_zone": paris}))
+        write_jsonl(self.home / "projects" / "p" / (A + ".jsonl"), [
+            gemini_reply(A, "m1", utc(2026, 3, 29, 21, 30), 10 ** 6, 0, 0),      # Sunday 23:30 CEST: last week's
+            gemini_reply(A, "m2", utc(2026, 3, 29, 22, 30), 0, 0, 10 ** 6)])     # Monday 00:30 CEST: this week's
+        got = self.spend(utc(2026, 3, 30, 12))["gemini"]
+        self.assertEqual((got["dollars"], got["since"]), (15.0, utc(2026, 3, 29, 22)))
+
+    def test_with_no_week_zone_the_week_is_this_machine_s_local_one(self):
+        saved = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            self.assertEqual(allowance.week_start(utc(2026, 11, 24), None), utc(2026, 11, 23, 5))    # 00:00 EST
+            self.assertIsNone(allowance.DEFAULTS["week_zone"])
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+
+    def test_a_budget_or_model_that_is_not_one_is_refused_and_the_week_zone_is_a_setting(self):
+        for bad in ("500", 0, -5, None, True):
+            with self.assertRaisesRegex(ValueError, r"usage.claude_accounts.gemini.weekly_budget_usd is .*, not a "
+                                                    r"positive number of dollars"):
+                allowance.budgets({"gemini": dict(GEMINI, weekly_budget_usd=bad)})
+        for bad in (7, "", ["google/gemini-4-neon"]):
+            with self.assertRaisesRegex(ValueError, "usage.claude_accounts.gemini.model is .*, not a model's name"):
+                allowance.budgets({"gemini": dict(GEMINI, model=bad)})
+        self.assertEqual([b[0] for b in allowance.budgets(self.accounts)], ["gemini"])     # default: no budget key
+        allowance.CONFIG.write_text(json.dumps({"week_zone": "America/New_York"}))
+        self.assertEqual(self.spend(utc(2026, 11, 24))["gemini"]["since"], utc(2026, 11, 23, 5))   # 00:00 EST
+        allowance.CONFIG.write_text(json.dumps({"week_zone": "Mars/Olympus"}))
+        with self.assertRaisesRegex(ValueError, "no time zone 'Mars/Olympus' \\(week_zone\\)"):
+            allowance.config()
+
+    def test_only_what_ran_on_the_login_counts_and_the_rest_is_named(self):
+        moved = utc(2026, 11, 24, 12)
+        # switched from the default login: its copied history ran there, on Opus; then Gemini, and a sub-agent's Hydrogen
+        write_jsonl(self.home / "projects" / "p" / (A + ".jsonl"), [
+            gemini_reply(A, "m1", moved - 60, 10 ** 6, 0, 0, model="claude-opus-5-5"),
+            gemini_reply(A, "m2", moved + 60, 10 ** 6, 0, 0),
+            gemini_reply(A, "m3", moved + 120, 10 ** 6, 0, 0, model="google/gemini-4-hydrogen"),
+            gemini_reply(A, "m4", moved + 180, 0, 0, 1234, model="google/gemini-9")])
+        # never moved, yet a Claude model in the Gemini login's folder: credited to it by mistake
+        write_jsonl(self.home / "projects" / "p" / (B + ".jsonl"), [
+            gemini_reply(B, "b1", moved, 10 ** 6, 0, 0, model="claude-opus-5-5")])
+        write_jsonl(self.log, [status_event(A, "switch", "Claude Code (default login), claude-opus-5-5 at effort high "
+                                                         "-> Claude Code (gemini login), google/gemini-4-neon: moved",
+                                            moved)])
+        got = self.spend(moved + 3600)["gemini"]
+        self.assertAlmostEqual(got["dollars"], 3 + 1.5)
+        self.assertEqual(len(got["notes"]), 2)
+        self.assertIn("google/gemini-9 (1234 tokens)", got["notes"][0])
+        self.assertEqual(got["notes"][1], "left out, not a model this login runs: claude-opus-5-5 (1 reply, $4.00 at "
+                                          "its price)")
+
+    def test_the_usage_reading_carries_it_on_the_logins_account(self):
+        """bin/agent-board's annotate_usage, as the collector's usage reading runs it: the spend on the per-token
+        login's account alone."""
+        board = load_agent_board()
+        d = Path(tempfile.mkdtemp())
+        (d / "config.json").write_text(json.dumps({"usage": {"claude_accounts": self.accounts}}))
+        write_jsonl(self.home / "projects" / "p" / (A + ".jsonl"),
+                    [gemini_reply(A, "m1", utc(2026, 11, 26), 0, 0, 10 ** 6)])
+        reading = {"generated_at": T0, "accounts": [
+            {"target": "claude:default", "windows": [{"kind": "weekly", "remaining_pct": 40, "resets_at": T0}]},
+            {"target": "claude:gemini", "billing": "per_token", "windows": [], "weekly_budget_usd": 500}]}
+        saved = (sources.MAIL_CONFIG, sources.STATUS_LOG, sources.claude_logins, allowance.SPEND_CACHE,
+                 allowance.SPEND_LOCK, allowance.time.time, allowance.SAMPLES)
+        sources.MAIL_CONFIG, sources.STATUS_LOG = d / "config.json", self.log
+        sources.claude_logins = lambda path=None: []         # mark_shared_logins: the live logins' .claude.json
+        allowance.SPEND_CACHE, allowance.SPEND_LOCK = d / "spend-cache.json", d / "spend.lock"
+        allowance.SAMPLES = d / "usage-samples.jsonl"
+        allowance.time.time = lambda: utc(2026, 11, 27, 12)
+        try:
+            usage = sources.Usage(cache_path=d / "usage-cache.json", runner=lambda force: reading,
+                                  annotate=board.annotate_usage, sync=True)
+            accounts = usage.maybe_refresh(force=True)["accounts"]
+        finally:
+            (sources.MAIL_CONFIG, sources.STATUS_LOG, sources.claude_logins, allowance.SPEND_CACHE,
+             allowance.SPEND_LOCK, allowance.time.time, allowance.SAMPLES) = saved
+        self.assertIsNone(usage.error)
+        self.assertNotIn("spend", accounts[0])
+        self.assertEqual(accounts[1]["spend"], {"dollars": 15.0, "budget": 500.0, "since": utc(2026, 11, 23),
+                                                "notes": []})
+        self.assertTrue((d / "spend-cache.json").exists())
 
 
 class Action(unittest.TestCase):

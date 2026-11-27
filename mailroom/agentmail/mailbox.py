@@ -3,25 +3,30 @@
 archived, snoozed: the store's mailbox_threads) and the rules that make a thread's box and unread state of them
 (state), and the commands: list, mark, sync (the tab and the owner's Gmail brought into step), answer (a reply they
 write in the tab, with any files they attach, which the daemon routes as it routes their mail; answer_input reads it),
-show (a thread and its page, mailview.document), part (one part of a stored message, theirs or an agent's), summary
-(the counts and what the board's tiles count as read), and the backfill of mail sent before the message store. Each
-command returns what agent-mail prints as JSON, and raises outbound.MailError where it stops.
+fast (fast mode on a thread, for quick back-and-forths with its agent: agentmail/fastmode.py), researcher (the routed
+agent's Researcher preference: agentmail/researchermode.py), show (a thread and its page, mailview.document), part
+(one part of a stored message, theirs or an agent's), summary (the counts and what the board's tiles count as read),
+and the backfill of mail sent before the message store. Each command returns what agent-mail prints as JSON, and
+raises outbound.MailError where it stops.
 
-A thread is a Gmail thread id. It is in the mailbox when agent mail in it went to or cc an owner address (config
-allowlist), or mail in it came from one. Its messages are all its agent mail (sent rows, to anyone) and the owner's
-mail (inbound rows from an owner address); not the mail of anyone else. A message's key is "s<sent.id>" or
-"i<inbound.id>". Flags hold sent.ids ("read up to agent mail 123"), so a mark never races a mail that arrives while
-the tab shows the thread."""
+A thread is a Gmail thread id, or the mailroom's own for mail kept for the tab alone (outbound.local_thread_id). It
+is in the mailbox when agent mail in it went to or cc an owner address (config allowlist), or mail in it came from
+one. Its messages are all its agent mail (sent rows, to anyone) and the owner's mail (inbound rows from an owner
+address); not the mail of anyone else. A message's key is "s<sent.id>" or "i<inbound.id>". Flags hold sent.ids
+("read up to agent mail 123"), so a mark never races a mail that arrives while the tab shows the thread."""
 import base64
 import binascii
 import json
 import re
+import sqlite3
 from email.message import EmailMessage
 from email.utils import formataddr, getaddresses
 from typing import NamedTuple, Optional
 
-from . import compose, config, gmail, mailroom, mailview, messages, outbound, replyfiles, routing
+from . import (compose, config, fastmode, gmail, mailroom, mailview, messages, outbound, piped, replyfiles,
+               researcher_payload, researchermode, routing)
 from .outbound import MailError, session_label
+from .store import Store
 
 BOXES = ("inbox", "snoozed", "archived")
 OPS = ("read", "unread", "archive", "inbox", "snooze")
@@ -29,11 +34,18 @@ UPTO_OPS = ("read", "archive", "snooze")   # the marks that take --upto
 LIST_LIMIT_MAX = 500
 SNIPPET_CHARS = 160   # a thread's snippet: its newest message's words as the reader sees them (snippet)
 SNIPPET_SOURCE_CHARS = 1200   # how much of that message's text is rendered to make it
+# agent-board's Collector.is_read (collect.py) relies on this being longer than the week of mail sources.MailStore.read
+# reads: change both together.
 SUMMARY_READ_DAYS = 8   # how far back summary lists the agent mail the tab counts as read
 KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")   # a Mail-tab reply's key, made by the tab
 MAX_ANSWER_CHARS = 20000
 MAX_ANSWER_FILES = 20                 # files in one reply; the board and the Mac app check the same two limits
 MAX_ANSWER_FILE_BYTES = 25 << 20      # their bytes together, decoded
+# The exit code of `mailbox answer` when it refuses the reply for something the owner can change by editing it (empty,
+# too long, too many or too large files, files for a group), before it records anything: the board then says the
+# draft was refused and can be edited and sent again. Every other error keeps its own code: 1 (as a crash), 2 (usage,
+# or a run inside an agent session), 4 (a thread not in the mailbox); a timeout kills it with a signal.
+ANSWER_REFUSED = 6
 # What became of a reply of the owner's, by its inbound row's action, as the tab shows it; held mail adds why.
 STATUSES = {"local": "sending", "pending": "sending", "delivered": "delivered", "queued": "queued",
             "orchestrating": "with the orchestrator"}
@@ -140,17 +152,33 @@ def message_texts(st, msgs):
     return {m.key: (mine if m.mine else sent)[m.row["id"]] for m in msgs}
 
 
-def items(st, all_threads, by_thread, ids):
-    """The list objects of threads ids (in that order): what `mailbox list` gives for each."""
+def items(st, cfg, all_threads, by_thread, ids):
+    """The list objects of threads ids (in that order): what `mailbox list` gives for each, its fast mode
+    (fastmode.item) and the Researcher switch of its routed agent (researcher_owner; null for a thread without one)
+    among them."""
     newest = message_texts(st, [all_threads[t][-1] for t in ids])
+    fast = st.fast_rows()
+    modes = st.researcher_modes()
     out = []
     for t in ids:
         msgs, s = all_threads[t], by_thread[t]
+        owner = researcher_owner(st, cfg, t, msgs)
+        mode = modes.get(owner["tag"]) if owner else None
+        delivery = None
+        delivery_detail = None
+        if mode is not None:
+            delivery = "applied" if researchermode.is_applied(mode) else mode["status"]
+            if delivery == "unavailable" and (mode["detail"] or "").startswith(researcher_payload.FAILURE_PREFIX):
+                delivery_detail = mode["detail"]
         out.append({"id": t, "subject": routing.bare_subject(msgs[0].row["subject"] or ""),
                     "agents": list(dict.fromkeys(m.sender for m in msgs if not m.mine)),
                     "snippet": snippet(newest[msgs[-1].key] or ""), "last": s.last, "count": len(msgs),
                     "unread": s.unread, "box": s.box, "snooze_until": s.snooze_until, "newest": s.newest,
-                    "attachments": any(bool(m.row["eml"] if m.mine else m.row["attachments"]) for m in msgs)})
+                    "attachments": any(bool(m.row["eml"] if m.mine else m.row["attachments"]) for m in msgs),
+                    "fast": fastmode.item(st, cfg, fast.get(t)),
+                    "researcher": {"on": bool(mode and mode["enabled"]),
+                                   "agent": session_label(dict(owner), cfg["host_id"]), "tag": owner["tag"],
+                                   "delivery": delivery, "delivery_detail": delivery_detail} if owner else None})
     return out
 
 
@@ -183,7 +211,7 @@ def list_threads(st, cfg, box, query, limit, now):
     if query is not None:
         ids = matching(st, all_threads, ids, query)
     ids = sorted(ids, key=lambda t: by_thread[t].last, reverse=True)[:limit]
-    return {"threads": items(st, all_threads, by_thread, ids), "counts": counts(by_thread)}
+    return {"threads": items(st, cfg, all_threads, by_thread, ids), "counts": counts(by_thread)}
 
 
 def flag_changes(op, flags, upto, until, now):
@@ -224,7 +252,7 @@ def mark(st, cfg, thread_ids, op, upto, until, now):
     st.set_mailbox_flags({t: flag_changes(op, flags.get(t), upto, until, now) for t in wanted})
     flags = st.mailbox_flags()
     by_thread = {t: state(all_threads[t], flags.get(t), now) for t in wanted}
-    return {"ok": True, "threads": items(st, all_threads, by_thread, wanted)}
+    return {"ok": True, "threads": items(st, cfg, all_threads, by_thread, wanted)}
 
 
 def norm_id(message_id):
@@ -238,7 +266,10 @@ def sync(st, cfg, gmail_state, now):
     unread there. Each thread not snoozed in the tab stays in the inbox only when it is there in the tab and some of its
     agent mail is in the owner's Gmail inbox, else is archived up to its newest; and stays unread only when it is unread in the
     tab and some of its agent mail is unread in Gmail, else is read up to its newest. A thread of the owner's own mail alone is
-    archived and read; a snoozed thread is left as it is, here and in Gmail. Writes only the threads that change.
+    archived and read; a snoozed thread is left as it is, here and in Gmail. Gmail never had agent mail kept for the tab
+    alone (no Gmail id; config mailbox.owner_delivery "local"), so it archives no thread with kept mail the tab has not
+    archived, and marks read no thread with kept mail unread in the tab; Gmail still follows the tab for the mail of it
+    that Gmail holds, which is all it is asked to change. Writes only the threads that change.
     Returns {"ok": true, "archived": N, "read": N} (the threads it archived and marked read in the tab) with "gmail":
     {"archive": [...], "read": [...]}, the Message-IDs (as given) that Gmail must archive and mark read to match: those
     in its inbox of the threads now archived, and those unread there of the threads now read."""
@@ -262,11 +293,14 @@ def sync(st, cfg, gmail_state, now):
         was = state(msgs, before, now)
         if was.box == "snoozed":
             continue
-        agent = {norm_id(m.row["message_id"]) for m in msgs if not m.mine}
+        agent = {norm_id(m.row["message_id"]) for m in msgs if not m.mine and m.row["gmail_id"]}   # what Gmail holds
+        kept = [m for m in msgs if not m.mine and not m.row["gmail_id"]]
         cols = {}
-        if was.box == "inbox" and not agent & inbox:
+        if (was.box == "inbox" and not agent & inbox
+                and all(m.row["id"] <= (before.get("archived_id") or 0) for m in kept)):
             cols.update(flag_changes("archive", before, was.newest, None, now))
-        if state(msgs, dict(before, **cols), now).unread and not agent & unread:   # an archive can end a woken snooze
+        unread_now = state(msgs, dict(before, **cols), now)   # an archive can end a woken snooze
+        if unread_now.unread and not agent & unread and not any(m.key in unread_now.unread_keys for m in kept):
             cols.update(flag_changes("read", dict(before, **cols), was.newest, None, now))
         now_is = state(msgs, dict(before, **cols), now)
         if now_is.box == "archived":
@@ -288,8 +322,8 @@ def show(st, cfg, thread_id, now):
     """`mailbox show`: thread thread_id's list object, its messages, and the thread as one sanitized HTML page
     (mailview.document), headed by its subject and who wrote in it, open at its unread agent mail and its last
     message. Agent mail comes from the message
-    store; mail sent before it and not backfilled shows its text when the store has it, and a link to it in the
-    agents account's Gmail. Each agent message lists the widgets it kept ({"id": KEY-N, "kind", "spec"};
+    store; mail sent before it and not backfilled shows its text when the store has it, and, with Gmail on, a link to
+    it in the agents account's Gmail. Each agent message lists the widgets it kept ({"id": KEY-N, "kind", "spec"};
     agentmail/widgets.py), whose places the page marks <div class="widget" data-widget=ID>. Marks nothing read.
     Raises ValueError for a stored message that is damaged."""
     all_threads = threads(st, cfg)
@@ -321,10 +355,11 @@ def show(st, cfg, thread_id, now):
                                       for n, w in enumerate(kept)]})
             entry.update(recipients=", ".join(a for a in (m.row["to_addr"], m.row["cc_addr"]) if a), raw=raw,
                          widgets=len(kept))
-            if raw is None:
-                entry.update(text=texts[m.key] or "", gmail_url=gmail.web_url(cfg["account"], "all/" + m.row["gmail_id"]))
+            if raw is None:   # a link to it in Gmail only while the mailroom uses Gmail
+                url = gmail.web_url(cfg["account"], "all/" + m.row["gmail_id"]) if config.gmail_on(cfg) else None
+                entry.update(text=texts[m.key] or "", gmail_url=url)
         entries.append(entry)
-    thread = items(st, all_threads, {thread_id: s}, [thread_id])[0]
+    thread = items(st, cfg, all_threads, {thread_id: s}, [thread_id])[0]
     return {"thread": thread, "messages": shown,
             "document": mailview.document(thread["subject"], thread["agents"], entries)}
 
@@ -356,17 +391,18 @@ def status(row):
     raise ValueError("inbound mail #%d has action %r, which the mailbox does not know" % (row["id"], row["action"]))
 
 
-def answer_input(obj):
-    """What `mailbox answer --json` reads, {"text": str, "files": [{"name": str, "data": base64}, ...]}, as (text,
-    [(name, bytes)]), the names as replyfiles.unique makes them. "files" may be left out. Raises MailError for any
-    other shape, data that is not base64, more than MAX_ANSWER_FILES files, or more than MAX_ANSWER_FILE_BYTES in
-    all."""
+def answer_input(obj, what):
+    """A text with files, {"text": str, "files": [{"name": str, "data": base64}, ...]}, as (text, [(name, bytes)]), the
+    names as replyfiles.unique makes them: what `mailbox answer --json` reads (`what` "the reply"), and agent-send's and
+    agent-orchestrate's --input-json ("the message"); `what` names it in errors. "files" may be left out. Raises
+    MailError for any other shape or data that is not base64 (exit code 1), and for more than MAX_ANSWER_FILES files
+    or more than MAX_ANSWER_FILE_BYTES in all (ANSWER_REFUSED)."""
     files = obj.get("files", []) if isinstance(obj, dict) else None
     if not isinstance(obj, dict) or not isinstance(obj.get("text"), str) or not isinstance(files, list) or not all(
             isinstance(f, dict) and isinstance(f.get("name"), str) and isinstance(f.get("data"), str) for f in files):
-        raise MailError('the reply is not {"text": TEXT, "files": [{"name": NAME, "data": BASE64}, ...]}', 1)
+        raise MailError('%s is not {"text": TEXT, "files": [{"name": NAME, "data": BASE64}, ...]}' % what, 1)
     if len(files) > MAX_ANSWER_FILES:
-        raise MailError("the reply has %d files; the most is %d" % (len(files), MAX_ANSWER_FILES), 1)
+        raise MailError("%s has %d files; the most is %d" % (what, len(files), MAX_ANSWER_FILES), ANSWER_REFUSED)
     datas = []
     for f in files:
         try:
@@ -375,9 +411,20 @@ def answer_input(obj):
             raise MailError("file %r: its data is not base64" % f["name"], 1)
     total = sum(map(len, datas))
     if total > MAX_ANSWER_FILE_BYTES:
-        raise MailError("the reply's files are %s; the most is %s" % (mailview.size(total),
-                                                                       mailview.size(MAX_ANSWER_FILE_BYTES)), 1)
+        raise MailError("%s's files are %s; the most is %s"
+                        % (what, mailview.size(total), mailview.size(MAX_ANSWER_FILE_BYTES)), ANSWER_REFUSED)
     return obj["text"], list(zip(replyfiles.unique([f["name"] for f in files]), datas))
+
+
+def piped_input(what):
+    """answer_input of the JSON piped in (piped.piped_text): agent-send's and agent-orchestrate's --input-json, `what`
+    naming it in errors. Raises MailError (exit code 1) when what was piped in is not JSON or nothing was, and as
+    answer_input does; TimeoutError as piped_text does."""
+    try:
+        obj = json.loads(piped.piped_text() or "null")
+    except ValueError as e:
+        raise MailError("%s is not JSON: %s" % (what, e), 1)
+    return answer_input(obj, what)
 
 
 def reply_message(cfg, owner, subject, key, in_reply_to, text, files):
@@ -395,6 +442,27 @@ def reply_message(cfg, owner, subject, key, in_reply_to, text, files):
     return msg.as_bytes()
 
 
+def owner_session(st, cfg, thread_id):
+    """(the newest agent mail in thread thread_id, the sessions row the routing slip finds for a reply to it or None,
+    the routing rule): who gets what the owner writes in the thread (mailroom.claim, as for their email). Raises MailError
+    when the thread holds no agent mail."""
+    answered = st.sent_in_thread(thread_id)
+    if answered is None:
+        raise MailError("thread %s holds no agent mail to answer" % thread_id, 1)
+    session, rule = mailroom.claim(st, {"subject": routing.answer_subject(answered["subject"] or ""),
+                                        "in-reply-to": answered["message_id"] or ""}, thread_id, cfg["account"])
+    return answered, session, rule
+
+
+def researcher_owner(st: Store, cfg: dict, thread_id: str, msgs: list[Message]) -> Optional[sqlite3.Row]:
+    """Use the reply route only when every outgoing message belongs to the same supported routing tag."""
+    tags = {m.row["tag"] for m in msgs if not m.mine}
+    if len(tags) != 1 or not next(iter(tags)):
+        return None
+    _answered, session, _rule = owner_session(st, cfg, thread_id)
+    return session if researchermode.supported(session) and session["tag"] in tags else None
+
+
 def answer(st, cfg, thread_id, key, text, files):
     """`mailbox answer`: record text, and files ([(name, bytes)] as answer_input gives them), as the owner's reply in
     thread thread_id to its newest agent mail, as an inbound row the daemon routes as it routes the owner's mail (action
@@ -402,40 +470,83 @@ def answer(st, cfg, thread_id, key, text, files):
     local_message_id), the subject an answer to that mail's, and the session the routing slip finds for a reply to it
     (mailroom.claim). A reply with files is kept whole in the message store (reply_message; the row's eml), and the
     daemon gives the session the files (replyfiles); a group takes no files. The text may be empty only when there
-    are files. A key used already gives the reply it made, not a second one. Writes the store."""
+    are files. A key used already gives the reply it made, not a second one. Writes the store. Raises MailError, with
+    exit code ANSWER_REFUSED for a reply the owner can edit to pass (empty, too long, files for a group), before recording
+    anything."""
     if not KEY_RE.fullmatch(key):
         raise MailError("--key is 16 to 64 letters, digits, _ and -", 1)
     old = st.inbound_by_gmail_id(routing.local_gmail_id(key))
     if old is None:
-        if thread_id not in threads(st, cfg):
-            raise MailError("thread %s is not in the mailbox" % thread_id, 4)
-        answered = st.sent_in_thread(thread_id)
-        if answered is None:
-            raise MailError("thread %s holds no agent mail to answer" % thread_id, 1)
-        text = text.strip()
-        if not text and not files:
-            raise MailError("the reply is empty", 1)
-        if len(text) > MAX_ANSWER_CHARS:
-            raise MailError("the reply is %d characters; the most is %d" % (len(text), MAX_ANSWER_CHARS), 1)
-        owner = config.owner_address(cfg)
+        owner = config.owner_address(cfg)     # first: with none, no thread is in the mailbox (threads)
         if not owner:
             raise MailError("config has no owner address (owner_email or allowlist)", 1)
+        if thread_id not in threads(st, cfg):
+            raise MailError("thread %s is not in the mailbox" % thread_id, 4)
+        answered, session, rule = owner_session(st, cfg, thread_id)
+        text = text.strip()
+        if not text and not files:
+            raise MailError("the reply is empty", ANSWER_REFUSED)
+        if len(text) > MAX_ANSWER_CHARS:
+            raise MailError("the reply is %d characters; the most is %d" % (len(text), MAX_ANSWER_CHARS),
+                            ANSWER_REFUSED)
         subject = routing.answer_subject(answered["subject"] or "")
-        session, rule = mailroom.claim(st, {"subject": subject, "in-reply-to": answered["message_id"] or ""},
-                                       thread_id, cfg["account"])
         if files and session is not None and session["cli"] == routing.GROUP_CLI:
             raise MailError("thread %s goes to group %r, which takes text only: send the files to one agent, by mail "
-                            "or in a thread of its own" % (thread_id, session["session_name"]), 1)
+                            "or in a thread of its own" % (thread_id, session["session_name"]), ANSWER_REFUSED)
         eml = messages.keep(reply_message(cfg, owner, subject, key, answered["message_id"], text, files)) \
             if files else None
         old, _made = st.record_inbound_once(
             gmail_id=routing.local_gmail_id(key), thread_id=thread_id, message_id=routing.local_message_id(key),
             from_addr=owner, from_name=cfg["owner_name"], subject=subject,
             matched_tag=session["tag"] if session else None, match_rule=rule, action="local",
-            detail="written in the Mail tab", body=text, eml=eml)
+            detail="written in the Mail tab", body=text, eml=eml, in_reply_to=answered["message_id"])
     if old["thread_id"] != thread_id:
         raise MailError("key %s answered thread %s, not %s" % (key, old["thread_id"], thread_id), 1)
     return {"ok": True, "key": "i%d" % old["id"], "status": status(old)}
+
+
+def fast(ctx, thread_id, on, now):
+    """`mailbox fast`: switch fast mode on (on True) or off in thread thread_id (fastmode.start, end), for the agent
+    that gets what the owner writes there (owner_session). It records the switch and returns: the daemon's next pass
+    (fastmode.tick) lowers the agent's effort with its keys, or tells the agent fast mode is over and, when no fast
+    thread of its own is left, puts its effort back, alerting the owner (kind fast-mode) once a restore is given up.
+    Returns {"ok": true, "thread": its list object, with "fast"} and the lines to log. Raises MailError
+    when the thread is not in the mailbox (exit code 4), and, to switch it on, when it holds no agent mail or no single
+    agent gets the owner's replies there: the orchestrator's, or a group's."""
+    st, cfg = ctx.st, ctx.cfg
+    all_threads = threads(st, cfg)
+    if thread_id not in all_threads:
+        raise MailError("thread %s is not in the mailbox" % thread_id, 4)
+    if on:
+        _answered, session, _rule = owner_session(st, cfg, thread_id)
+        if session is None:
+            raise MailError("no agent gets the replies in thread %s (they go to the orchestrator): fast mode is for a "
+                            "thread with one agent" % thread_id, 1)
+        if session["cli"] == routing.GROUP_CLI:
+            raise MailError("thread %s goes to group %r: fast mode is for a thread with one agent"
+                            % (thread_id, session["session_name"]), 1)
+        lines = fastmode.start(ctx, thread_id, session, now)
+    else:
+        lines = fastmode.end(ctx, thread_id, "off")
+    s = state(all_threads[thread_id], st.mailbox_flags().get(thread_id), now)
+    return {"ok": True, "thread": items(st, cfg, all_threads, {thread_id: s}, [thread_id])[0]}, lines
+
+
+def researcher(st: Store, cfg: dict, thread_id: str, on: bool, now: float, *, expected_tag: str) -> dict:
+    """Resolve and compare the thread's tag, then save its setting in one store transaction."""
+    if not isinstance(expected_tag, str) or not re.fullmatch(routing.TAG_RE, expected_tag):
+        raise MailError("--expect-tag must be a mail routing tag", 2)
+    with st.transaction():
+        all_threads = threads(st, cfg)
+        if thread_id not in all_threads:
+            raise MailError("thread %s is not in the mailbox" % thread_id, 4)
+        owner = researcher_owner(st, cfg, thread_id, all_threads[thread_id])
+        if owner is None or owner["tag"] != expected_tag:
+            raise MailError("Researcher owner changed for thread %s. Refresh the thread." % thread_id, 1)
+        st.set_researcher_mode(owner["tag"], on, now)
+        s = state(all_threads[thread_id], st.mailbox_flags().get(thread_id), now)
+        thread = items(st, cfg, all_threads, {thread_id: s}, [thread_id])[0]
+    return {"ok": True, "thread": thread}
 
 
 def summary(st, cfg, now):
@@ -449,6 +560,17 @@ def summary(st, cfg, now):
             and m.key not in by_thread[t].unread_keys]
     c = counts(by_thread)
     return {"unread": c["unread"], "inbox": c["inbox"], "read": read}
+
+
+def unread_kept(st, cfg, after_id, now):
+    """(how many of the agent mails kept for the Mail tab alone, no Gmail id, after sent row after_id are unread in a
+    thread in the inbox, the highest id of all those kept after it or None): what the nudge (alerts.nudge) tells of."""
+    all_threads = threads(st, cfg)
+    by_thread = states(all_threads, st.mailbox_flags(), now)
+    kept = [(t, m) for t, msgs in all_threads.items() for m in msgs
+            if not m.mine and m.row["gmail_id"] is None and m.row["id"] > after_id]
+    return (sum(by_thread[t].box == "inbox" and m.key in by_thread[t].unread_keys for t, m in kept),
+            max((m.row["id"] for _, m in kept), default=None))
 
 
 def backfill(st, svc, limit, say):

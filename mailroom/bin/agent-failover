@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""agent-failover: move a Claude agent to another login when its own hits a usage limit mid-task, and back
-once that login has reset.
+"""agent-failover: move a Claude agent to another login when its own hits a usage limit mid-task, or while it is
+idle once its login is used up for it, and up again, once idle, when a better login has headroom.
 
     agent-failover                                   # watch forever (systemd/agent-failover.service), and mail
                                                      # the owner while agents bill a login's extra usage
@@ -18,11 +18,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import (alerts, claude_session, config, failover, jsonfile, outbound, registry,  # noqa: E402
-                       statuslog, usage, watch)
+from agentmail import (accounts, alerts, claude_session, commands, config, failover, jsonfile,  # noqa: E402
+                       outbound, registry, statuslog, usage, watch)
 from agentmail.trust import claude_json_for, ensure_trust  # noqa: E402
 
-REBALANCE_SECONDS = 600
+IDLE_LOOK_SECONDS = 600   # between looks at the idle agents for a move (one_pass)
 
 
 def trust():
@@ -55,6 +55,20 @@ def sample(f):
     return live, agents, limits, skipped
 
 
+def with_owners(agents):
+    """Each agent with its repo's GitHub owner (accounts.folder_owner), for the logins' owner rules. One whose owner
+    git cannot tell is logged and left out of this pass, so no rule is skipped."""
+    out = []
+    for a in agents:
+        try:
+            owner = accounts.folder_owner(a.get("cwd"))
+        except commands.CommandError as e:
+            watch.log("%s (%s) not moved in this pass: %s" % (a.get("name") or "-", a["id"][:8], e))
+            continue
+        out.append(dict(a, owner=owner))
+    return out
+
+
 def log_move(sess, to, reason, ok, detail):
     """The failover event in the status log for a move that was tried (not a dry run), a failed one too."""
     statuslog.append({"cli": "claude", "session_id": sess["id"], "name": sess.get("name") or "",
@@ -81,11 +95,12 @@ def act(moves, notes, state, cfg, dry_run, now):
         log_move(sess, m["to"], m["reason"], ok, detail)
         if ok:
             state = failover.record(state, m, now)
-    for sid, resets, text in notes:
+    for sid, key, text, event in notes:
         watch.log("waiting: " + text)
         if not dry_run:
-            statuslog.append({"cli": "claude", "session_id": sid, "event": "limit-wait", "text": text[:300]})
-            state.setdefault("sessions", {}).setdefault(sid, {})["stuck_until"] = resets
+            if event:
+                statuslog.append({"cli": "claude", "session_id": sid, "event": event, "text": text[:300]})
+            state.setdefault("sessions", {}).setdefault(sid, {})["stuck_until"] = key
     return state, moved
 
 
@@ -118,8 +133,11 @@ def report_spend(live, snaps, state, cfg, dry_run, now):
 
 
 def one_pass(cfg, state, dry_run, last, now):
-    """One watch pass. last: when the rebalance and the spend check last ran ({"rebalance": epoch, "spend": epoch}).
-    Usage is read only when an agent is limited, or one of those is due. Returns (state, moves, last)."""
+    """One watch pass. last: when the idle agents were last looked at for a move (up, back, off a used-up login) and
+    the spend check last ran ({"idle": epoch, "spend": epoch}). Usage is read only when an agent is limited, or one
+    of those is due. A pass makes at most failover.idle_moves_per_pass idle moves (failover.pace)
+    and, with some left and one of its own working, makes the idle agents' look due again at the next pass. Returns
+    (state, moves, last)."""
     f = failover.settings(cfg)
     live, agents, limits, skipped = sample(f)
     for sid, (s, why, hit) in skipped.items():
@@ -128,24 +146,32 @@ def one_pass(cfg, state, dry_run, last, now):
             if not dry_run:
                 state.setdefault("unmovable", {})[sid] = failover.stuck_key(hit)
     idle = [a for a in agents if a.get("status") == "idle"]
-    rebalance = bool(f["switch_back"] and idle and now - last["rebalance"] >= REBALANCE_SECONDS)
+    look = bool(f["switch_back"] and idle and now - last["idle"] >= IDLE_LOOK_SECONDS)
     spend = bool(f["spend_mail"] and (live or state.get("spend")) and now - last["spend"] >= f["spend_check_seconds"])
-    if not (limits or rebalance or spend):
+    if not (limits or look or spend):
         return state, [], last
     snaps = usage.snapshots(cfg)
-    moves, notes = failover.decide(agents, limits, snaps, state, cfg, now)
+    moves, notes = failover.decide(with_owners(agents), limits, snaps, state, cfg, now)
+    moves, later = failover.pace(moves, f)
+    if later:
+        names = ["%s -> %s" % (m["session"].get("name") or m["session"]["id"][:8], m["to"]) for m in later]
+        watch.log("%d idle move(s) left for the next pass (failover.idle_moves_per_pass: %d): %s" % (
+            len(later), f["idle_moves_per_pass"], ", ".join(names)))
     state, moved = act(moves, notes, state, cfg, dry_run, now)
     if spend:   # each agent where this pass's moves left it
         live = [dict(x, account=moved.get(x["id"], x.get("account"))) for x in live]
         state = report_spend(live, snaps, state, cfg, dry_run, now)
-    return state, moves, {"rebalance": now if rebalance else last["rebalance"],
+    # with idle moves left, and one of this pass's working (not one failing again and again, and not a dry run, which
+    # moves nothing), look again next pass
+    again = later and not dry_run and any(m["session"]["id"] in moved for m in moves if m.get("idle"))
+    return state, moves, {"idle": now - IDLE_LOOK_SECONDS if again else now if look else last["idle"],
                           "spend": now if spend else last["spend"]}
 
 
 def cmd_watch(a):
     once = watch.once(a)
     f = failover.settings(config.load())
-    last = {"rebalance": 0.0 if once else time.time() - REBALANCE_SECONDS + 60, "spend": 0.0}
+    last = {"idle": 0.0 if once else time.time() - IDLE_LOOK_SECONDS + 60, "spend": 0.0}
     if not f["enabled"] and not once:
         watch.log("disabled (config failover.enabled); idling")
 

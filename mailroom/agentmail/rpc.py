@@ -12,11 +12,12 @@ so requests and results keep their exact format: an older agent-mail on either s
 import base64
 import hashlib
 import json
+import time
 import uuid
 from pathlib import Path
 
-from . import (config, deliver, groupcmd, groups, listing, outbound, recovery, registry, remote, replyfiles, review,
-               widgets)
+from . import (config, deliver, groupcmd, groups, listing, outbound, recovery, registry, remote, replyfiles,
+               researcher_payload, researchermode, review, widgets)
 
 # The mail commands a machine with config mail_proxy runs on the central mailroom, and the flags each passes on
 # (as "args"; a send's or reply's request_id travels beside them).
@@ -27,11 +28,13 @@ PROXY_ACTIONS = {
     "inbox": ("limit", "held"),
     "show": ("inbound_id",),
     "receipt": ("request_id",),
+    "researcher-state": ("tag", "applied", "payload"),
+    "researcher-request": ("tag", "thread"),
     "withdraw": (),
 }
 # Flags added to PROXY_ACTIONS since its first format: passed only when given, so that a request without one keeps
 # that format and a mailroom that does not know the flag yet still takes it.
-LATER_FLAGS = {"reply": ("subject",)}
+LATER_FLAGS = {"reply": ("subject",), "researcher-state": ("applied", "payload")}
 
 
 def flags(action, parsed):
@@ -60,7 +63,8 @@ def serve(ctx, wire):
     answered, and only the configured central mailroom may deliver to a session here or set its group notice flags.
     What a request does: a mail command (mail), a delivery without resume or permission bypass (agent-send, a
     subprocess) to a session by its id or, for a group post, its name, a registry lookup by id or name, a transcript
-    search (recovery.search), a group command (groupcmd.serve), raising group notice flags (groups.raise_flags), and
+    search (recovery.search), the installed Researcher payload for a session (central mailroom only), a group
+    command (groupcmd.serve), raising group notice flags (groups.raise_flags), and
     writing the files of a Mail-tab reply (replyfiles.write, under this machine's replyfiles.FILES_DIR; only from the
     central mailroom), which answers with their paths here."""
     cfg = ctx.cfg
@@ -89,6 +93,16 @@ def serve(ctx, wire):
                     raise ValueError("invalid CLI")
                 rc, detail = deliver.deliver(req["cli"], sid, req["text"], resume=False, dangerous=False, timeout=20)
             result = {"code": rc, "detail": detail}
+        elif op == "researcher-payload":
+            if cfg.get("mail_proxy") != req["source_host"]:
+                raise ValueError("only the configured central mailroom may verify the installed Researcher payload")
+            sid = str(uuid.UUID(req["session_id"]))
+            if req["cli"] not in config.CLIS:
+                raise ValueError("invalid CLI")
+            try:
+                result = researcher_payload.local(cfg, req["cli"], sid)._asdict()
+            except researcher_payload.Unavailable as e:
+                result = {"error": str(e), "missing_interpreter": isinstance(e, researcher_payload.NoInterpreter)}
         elif op == "files":
             if cfg.get("mail_proxy") != req["source_host"]:
                 raise ValueError("only the configured central mailroom may write a reply's files")
@@ -144,9 +158,17 @@ def mail(ctx, request):
         return listing.show(st, args["inbound_id"])
     if action == "receipt":
         return listing.receipt(st, args["request_id"], cfg["host_id"])
+    if action == "researcher-state" and args.get("applied") is None:
+        return json.dumps(researchermode.state(st, args["tag"], request["source_host"]))
+    if action == "researcher-request":
+        return json.dumps(researchermode.request_receipt(st, cfg, args["tag"], args["thread"], request["source_host"]))
     origin = remote.identity(request.get("origin"))
     if origin["host"] != request["source_host"]:
         raise ValueError("origin host does not match source host")
+    if action == "researcher-state":
+        return json.dumps(researchermode.acknowledge(st, cfg, args["tag"],
+                                                     (origin["host"], origin["cli"], origin["id"]),
+                                                     args["applied"], args.get("payload"), time.time()))
     if action == "withdraw":
         return outbound.withdraw(st, outbound.sender_row(ctx, origin)["tag"])
     rid = str(uuid.UUID(request["request_id"]))
@@ -168,20 +190,21 @@ def mail(ctx, request):
                                                                                  origin["id"]):
             raise ValueError("reply is not owned by this origin session; ask %s for an explicit handoff"
                              % cfg["owner_name"])
-        out = outbound.reply_mail(ctx, row, inb, content, args.get("no_review"), args.get("subject"))
+        out = outbound.reply_mail(ctx, row, inb, content, args.get("no_review"), args.get("subject"),
+                                  (origin["host"], origin["cli"], origin["id"]))
     result = out.text()
     st.complete_proxy_request(rid, result)
     return result
 
 
 def _proxied_mail(request):
-    """The mail a proxied send or reply carries. HTML travels as content, never a remote file name; images are
-    checked as agent-mail checks its own (outbound.check_image, which raises MailError), an attachment keeps only its
-    file name, the text comes from the HTML when it is blank, and its widgets are checked again, or its blocks
+    """The mail a proxied send or reply carries. HTML travels as content, never a remote file name; an attachment
+    keeps only its file name, and the text comes from the HTML when it is blank. It is checked as agent-mail checks its
+    own (outbound.check_image and check_mail, which raise MailError), and its widgets are checked again, or its blocks
     prepared when an older agent-mail sent them as they were typed (widgets.prepare)."""
     m = outbound.Mail.from_json(request)
     for name, data in m.images:
         outbound.check_image(name, data)
-    outbound.check_size(m)
-    return widgets.prepare(m._replace(text=outbound.plain_text(m.text, m.html),
-                                      files=[(Path(n).name, d) for n, d in m.files]))
+    m = m._replace(text=outbound.plain_text(m.text, m.html), files=[(Path(n).name, d) for n, d in m.files])
+    outbound.check_mail(m)
+    return widgets.prepare(m)

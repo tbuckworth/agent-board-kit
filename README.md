@@ -1,12 +1,14 @@
 # agent-board-kit
 
-Run a fleet of Claude Code and Codex agents on an always-on Linux machine and manage them from
-your inbox, a Mac menu-bar board and a GitHub-Issues to-do list.
+Run a fleet of Claude Code and Codex agents on an always-on Linux machine, and manage them from a Mac
+menu-bar board, a phone app and a GitHub-Issues to-do list. No email account is needed.
 
-- **Email your agents.** Every agent mails you from one shared Gmail account. Your reply lands back
-  in the exact session that wrote to you, even hours later. Mail that no agent owns, or that answers
-  an agent that has closed, goes to an **orchestrator** (one fresh `claude -p` run per email), which
-  starts, relays to, and closes agents for you.
+- **Talk to your agents from the board and your phone.** Agents write to you in the board's **Mail** tab
+  and the **Agent Mail** phone app (on your own Tailscale network, signed in with a passkey). Your reply
+  lands back in the exact session that wrote to you, within a second or two, even hours later. The
+  **Orchestrator** button sends a request to an orchestrator (one fresh `claude -p` run per request), which
+  starts, relays to, and closes agents for you. Gmail is optional: with it on, you can also do all of this
+  by email.
 - **Mail you can act on.** Before an agent's mail leaves, a cheap model with no context reads it as
   you will. If it would leave you asking "what does this mean?" or "where's the plot?", it goes back to
   the agent once, with concrete fixes. Replies answer your questions first, commands to run come in
@@ -22,8 +24,8 @@ your inbox, a Mac menu-bar board and a GitHub-Issues to-do list.
   a tile coloured by state (busy, waiting on you, blocked, idle, offline), with git progress
   toward main, plan usage, and right-click actions (message, close, resume, switch model/login). A
   tile turning red posts a notification. It also has a **Mail tab** (your mail with the agents:
-  threads, snooze, replies with files, the options and plots agents send, optional sync with your
-  Gmail), **Chats**, **Sent** (what you asked for and what is done), **where your plan usage went**
+  threads, snooze, undo, replies with files and screenshots, the options and plots agents send,
+  Forward to anyone through your Gmail, optionally the only place agent mail goes), **Chats** (with topics), **Sent** (what you asked for and what is done), **where your plan usage went**
   by group and agent, a **Time** page (where your time went, per day and group) and optional
   **meeting alerts** from your Google Calendar.
 - **Several logins, one order.** With more than one Claude login, new agents go where there is
@@ -38,32 +40,16 @@ your inbox, a Mac menu-bar board and a GitHub-Issues to-do list.
 Everything personal (names, addresses, GitHub names, paths, hosts) lives in one file,
 `~/.config/agent-kit/kit.env`. The kit contains no one's data or credentials.
 
-```
- you (phone / laptop mail)                        Mac (optional)
-   │  ▲                                            AgentBoard.app ── ssh ──┐   ToDo.app ── ssh ──┐
-   │  │ replies                                                            │                     │
-   ▼  │                                                                    ▼                     ▼
- Gmail: agents account ◄──── agent-mail send ───┐          Linux machine (always on)
-   │                                            │  ┌─────────────────────────────────────────────────────┐
-   └── polled every 30 s by agent-mailroom ─────┼─►│ routing slip: thread / tag / allowlist + DKIM        │
-                                                │  │   ├─► agent-send ─► the session that sent the mail   │
-                                                │  │   └─► agent-orchestrate ─► claude -p (orchestrator)  │
-                                                │  │           └─► agent-spawn ─► worktree + tmux + agent │
-                                                └──┤ agents: Claude Code / Codex in tmux, one per worktree │
-                                                   │ hooks ─► agent-status events ─► board, reports       │
-                                                   │ agent-board stream (read-only collector)             │
-                                                   │ todo-desk (gh) ◄──► GitHub Issues (your tasks repo)   │
-                                                   └─────────────────────────────────────────────────────┘
-```
+![How the pieces talk to each other](docs/images/overview.png)
 
 ## What is in the box
 
 | Directory | What | Status |
 |---|---|---|
-| [`mailroom/`](mailroom/README.md) | `agent-mail` (with the Mail tab's mailbox and an optional hourly backup), `agent-mailroom` (daemon), `agent-send`, `agent-group` (group chats), `agent-status`, `agent-spawn`, `agent-close`, `agent-orchestrate`; optional `agent-usage`, `agent-failover`, `agent-switch` (several Claude logins), `agent-memwatch` + memory caps | core |
+| [`mailroom/`](mailroom/README.md) | `agent-mail` (agent mail kept for the Mail tab and phone app; Gmail optional; the pre-send review; an optional hourly backup), `agent-mailroom` (daemon), `agent-send`, `agent-group` (group chats), `agent-status`, `agent-spawn`, `agent-close`, `agent-orchestrate`; fast mode; the Researcher switch; optional `agent-usage`, `agent-failover`, `agent-switch` (several Claude logins, a per-token login), `agent-memwatch` + memory caps; the reMarkable route (with Gmail) | core |
 | [`orchestrator/`](orchestrator/AGENTS.md) | The orchestrator's brief, memory file and status-report skill (rendered into `ORCHESTRATOR_DIR`) | core |
 | [`templates/`](templates/) | Global agent instructions, Claude Code and Codex hook settings | core |
-| [`board/`](board/README.md) | The agent board: Linux collector + macOS menu-bar app with the Mail tab, Chats, Sent, plan usage, the Time page and optional meeting alerts; `agent-restart` (reboot and resume every agent), `agent-cli-update` | core (the app needs a Mac) |
+| [`board/`](board/README.md) | The agent board: Linux collector + macOS menu-bar app with the Mail tab, Orchestrator, Chats, Sent, plan usage, the Time page and optional meeting alerts; the Agent Mail phone app; optional: the ask box, the desk, the voice page, the desktop keyring unlock, the transcript archive; `agent-restart` (reboot and resume every agent), `agent-cli-update` | core (the app needs a Mac) |
 | [`todo/`](todo/README.md) | To-do on GitHub Issues: label setup, `todo-desk` helper, web app, Mac app (both with Triage), Assign to agent | core |
 | [`cloud-watchdog/`](cloud-watchdog/README.md) | Watches paid cloud resources agents launch (Modal, Lambda, Slurm, HF...) and chases the owner | optional |
 | [`bin/kit`](bin/kit), [`install.sh`](install.sh) | Installer (`kit install`), health check (`kit doctor`), `kit uninstall` | |
@@ -71,41 +57,42 @@ Everything personal (names, addresses, GitHub names, paths, hosts) lives in one 
 
 ## Quick start
 
+**New here? Follow [Getting started](docs/GETTING-STARTED.md)**: the whole setup in one ordered
+walk-through, with a check after every step. What follows is the short version.
+
 Read [the security model](docs/08-security.md) first: agents run without permission prompts, and
-email can start them.
+the board and the phone app can start them.
 
 **Before you install** (about 30 minutes, once):
 
 1. On the Linux machine (Ubuntu 22.04 or 24.04): `git`, `tmux`, `python3-venv`, the GitHub CLI
    (`gh auth login`) and Claude Code (logged in). See [prerequisites](docs/01-prerequisites.md).
-2. A new Gmail account for the agents, a Google Cloud project with the Gmail API, and its OAuth client
-   saved as `~/.config/agent-mail/credentials.json` ([agents' Gmail, steps 1-3](docs/02-agent-gmail.md)).
+2. Tailscale on the Linux machine, your Mac and your phone, logged in to one account.
 3. A private GitHub repo for your to-do list: `gh repo create <you>/tasks --private`.
 
 **Install** on the Linux machine:
 
 ```bash
-git clone <this repo> ~/code/agent-board-kit && cd ~/code/agent-board-kit
+git clone https://github.com/tbuckworth/agent-board-kit ~/code/agent-board-kit && cd ~/code/agent-board-kit
 ./install.sh                          # 1. creates ~/.config/agent-kit/kit.env
-$EDITOR ~/.config/agent-kit/kit.env   # 2. your name, your email, the agents' Gmail, GitHub names, paths
-./install.sh                          # 3. installs: venv, commands in ~/.local/bin, configs, hooks,
-                                      #    agent instructions, orchestrator, systemd units (not started)
+$EDITOR ~/.config/agent-kit/kit.env   # 2. your name, your identity address, GitHub names, paths, switches
+./install.sh --start --labels         # 3. installs and starts: venv, commands in ~/.local/bin, configs,
+                                      #    hooks, agent instructions, orchestrator, services, to-do labels
+loginctl enable-linger "$USER"        # 4. keep the services running while you are logged out
 export PATH="$HOME/.local/bin:$PATH"  #    (new shells get this from ~/.profile)
-agent-mail-auth                       # 4. one-time Gmail consent, signed in as the agents' account
-./install.sh --start --labels         # 5. start the mailroom and timers, create the to-do labels
-loginctl enable-linger "$USER"        # 6. keep the services running while you are logged out
-kit doctor --online                   # 7. everything green?
+kit doctor --online                   # 5. everything green?
 ```
 
-Restart any Claude Code or Codex session that was already running, so it picks up the hooks and
-instructions. Then send an email from your own address to the agents' address: "start an agent
-in my general repo that lists the five largest files in it and emails me the result". The
-orchestrator starts it; the agent mails you; reply to that mail and the agent gets your reply.
+Then build the board on your Mac ([07-mac.md](docs/07-mac.md)), press **Orchestrator…** and send "start an
+agent in my general repo that lists the five largest files in it and writes me the result". The agent's
+message arrives in the Mail tab; reply there and the agent gets your reply. Restart any Claude Code or Codex
+session that was already running, so it picks up the hooks and instructions.
 
 ## Setup guides
 
+0. [Getting started](docs/GETTING-STARTED.md): everything below in order, from nothing to a working setup
 1. [Prerequisites](docs/01-prerequisites.md): machine, packages, accounts
-2. [The agents' Gmail account](docs/02-agent-gmail.md): account, Google Cloud project, OAuth client, consent
+2. [The agents' Gmail account](docs/02-agent-gmail.md) (optional): account, Google Cloud project, OAuth client, consent
 3. [Install and check](docs/03-install.md): `kit.env`, `install.sh`, services, `kit doctor`
 4. [Claude Code and Codex](docs/04-claude-and-codex.md): logins, hooks, permissions, a second login
 5. [Daily use](docs/05-daily-use.md): email commands, `agent-spawn`, tmux and worktree conventions, closing agents

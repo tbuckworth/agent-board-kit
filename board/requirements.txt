@@ -1,0 +1,4 @@
+# The board needs only the Python standard library, except the phone page's server (`agent-board mail-web`,
+# agentboard/mailweb.py), whose passkey checks (agentboard/webauthn.py) verify signatures with this package.
+# On Ubuntu it is also packaged as python3-cryptography.
+cryptography>=3.4                 # cryptography.hazmat: ECDSA P-256 public keys and signature checks

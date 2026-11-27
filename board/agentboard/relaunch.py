@@ -1,7 +1,9 @@
 """Starting an exited agent again, shared by the board's Resume (actions) and the post-reboot restore (restart): the
 login, model and effort to resume it with, the shell line that resumes it, a tmux session for it with the leaked
-per-process variables scrubbed, and a memory cap as agent-spawn gives its agents. The mailroom's own modules are
-loaded from its checkout (sources.mailroom_root: the kit's mailroom/, or AGENT_MAILROOM_DIR)."""
+per-process variables scrubbed, and a memory cap as agent-spawn gives its agents; and the environment and arguments of
+any claude the board starts on a login (claude_env, login_flags), and the logins such a claude falls back through
+(headless_logins). The mailroom's own modules are loaded from its checkout (sources.mailroom_root: the kit's
+mailroom/, or AGENT_MAILROOM_DIR)."""
 import os
 import re
 import shlex
@@ -31,10 +33,112 @@ def agent_env():
     return dict(env, PATH=sources.LOGIN_PATH)
 
 
+# ------------------------------------------------------------------ a claude on a login
+# A claude started from inside the shell of an agent on a per-token login (a model on OpenRouter) inherits that login's
+# settings (Claude Code puts its
+# --settings file's env in every command the agent runs: ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, ...), and one started
+# under another login's CLAUDE_CONFIG_DIR would run on that login. The mailroom's accounts.claude_env is the one rule
+# for what a child claude must not inherit; the board asks it rather than keeping a copy.
+
+def is_default_login(home):
+    """Whether the Claude login folder `home` is the default login's (None counts as the default)."""
+    return not home or Path(home).resolve() == sources.DEFAULT_CLAUDE_HOME.resolve()
+
+
+def claude_env(home, base=None):
+    """The environment for a claude the board starts on the login whose folder is `home` (None: the default login):
+    `base` (agent_env()'s when None) through the mailroom's scrub (accounts.claude_env), then CLAUDE_CONFIG_DIR for a
+    login other than the default. Without a mailroom installed, `base` without CLAUDE_CONFIG_DIR. A mailroom that
+    fails to load raises (sources.optional_mailroom)."""
+    base = agent_env() if base is None else base
+    accounts = sources.optional_mailroom("accounts")
+    env = dict(accounts.claude_env({}, base)) if accounts is not None else dict(base)
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if not is_default_login(home):
+        env["CLAUDE_CONFIG_DIR"] = str(home)
+    return env
+
+
+def scrubbed_names(names):
+    """The names among `names`, the plain names the mailroom's scrub lists itself (accounts.CLAUDE_ENV_DROP without
+    its patterns) and those the logins' settings files set (accounts.settings_env), that the scrub keeps from a
+    claude, sorted; never CLAUDE_CONFIG_DIR, which each caller sets or removes. A shell line cannot unset by pattern,
+    so the names it must unset are asked of accounts.claude_env one by one. [] without a mailroom installed."""
+    accounts = sources.optional_mailroom("accounts")
+    if accounts is None:
+        return []
+    listed = [n for n in getattr(accounts, "CLAUDE_ENV_DROP", ()) if not any(c in n for c in "*?[")]
+    if hasattr(accounts, "settings_env"):          # what the logins' settings files set: in an agent's every command
+        listed += accounts.settings_env(accounts.current_settings())
+    asked = set(names) | set(listed)
+    kept = accounts.claude_env({}, {n: "" for n in asked})
+    return sorted(n for n in asked if n not in kept and n != "CLAUDE_CONFIG_DIR")
+
+
+def logins():
+    """(the mailroom's accounts module, its usage settings as config.json has them now: accounts.current_settings()),
+    for the options a claude takes on each login, or None for a mailroom that isn't installed or predates them
+    (accounts.login_flags). Raises what loading them raises (sources.optional_mailroom, current_settings)."""
+    accounts = sources.optional_mailroom("accounts")
+    if accounts is None or not hasattr(accounts, "login_flags"):
+        return None
+    return accounts, accounts.current_settings()
+
+
+def login_dir(home):
+    """The Claude login folder `home` as the mailroom names a login's: None for the default login."""
+    return None if is_default_login(home) else str(home)
+
+
+def login_flags(home, flags):
+    """`flags`, a claude command line's options, as a claude on the login whose folder is `home` takes them, from the
+    mailroom (accounts.login_flags): a per-token login's settings file and model after them, in place of any they carry.
+    `flags` as they are without per-login options (logins)."""
+    m = logins()
+    return list(flags) if m is None else [str(x) for x in m[0].login_flags(m[1], login_dir(home), list(flags))]
+
+
+def login_account(home):
+    """(the mailroom's accounts module, the account of the login whose folder is `home`: accounts.account_by_dir), or
+    (None, {}) without per-login options (logins)."""
+    m = logins()
+    return (None, {}) if m is None else (m[0], m[0].account_by_dir(m[1], login_dir(home))[1])
+
+
+def headless_logins(cmd, base):
+    """(name, config dir, command, env) for each Claude login a claude the board starts may run on, in the mailroom's
+    order: headless.logins, the list the orchestrator and the pre-send review fall through on a usage limit (each
+    set-up login in usage.order as usage.ranked orders them, never a manual one such as Gemini's), with `cmd` as that
+    login takes it (accounts.login_flags) and `base` scrubbed for it (accounts.claude_env); config dir None for the
+    default login. Neither Codex nor the API key: the config goes without the key's secret name, so its token is never
+    read. None without a mailroom, or one older than headless.logins. Raises what loading the mailroom or its config
+    raises."""
+    headless = sources.optional_mailroom("headless")
+    if headless is None or not hasattr(headless, "logins"):
+        return None
+    cfg = dict(sources.mailroom("config").load(), orchestrator_fallback_secret=None)
+    return [(name, env.get("CLAUDE_CONFIG_DIR") or None, command, env)
+            for name, command, env in headless.logins(cfg, list(cmd), base, None)]
+
+
+def resume_model(src, home, recorded, fresh):
+    """The model a session that last ran on the login whose folder is `src`, its transcript recording `recorded`, runs
+    when resumed on the login whose folder is `home`, by the mailroom's rule for a move (accounts.move_model): that
+    login's own model if it has one; never a model only a one-model login runs, which gives way to `fresh` (config
+    spawn_claude_model); else `recorded`. `recorded` without per-login options (logins)."""
+    m = logins()
+    if m is None:
+        return recorded
+    accounts, s = m
+    name = lambda d: accounts.account_by_dir(s, login_dir(d))[0]
+    return accounts.move_model(s, name(src), name(home), None, recorded, fresh)
+
+
 # Once Codex knows of a newer release it opens on an "Update available" menu and waits for a key before loading the
 # thread, so an agent the board resumes (or a restart brings back) would sit there. The board's launches skip that
 # check.
-CODEX_NO_UPDATE_PROMPT = "-c check_for_update_on_startup=false"
+CODEX_NO_UPDATE = "check_for_update_on_startup=false"         # the setting (voicedesk's copies take it too)
+CODEX_NO_UPDATE_PROMPT = "-c " + CODEX_NO_UPDATE
 
 # The start-up dialogs Enter answers: an update notice, and the folder trust prompt (Enter takes "trust").
 ENTER_DIALOGS = ("Press enter to continue", "Do you trust")
@@ -70,16 +174,22 @@ def scrub_tmux_env(tmux, run=None):
     global environment, so no later session inherits them, agent-spawn's included. Names only are read; values never
     leave tmux. Without a server it does nothing. Returns "" when none is left, else which tmux kept and its answer."""
     run = run or sources.run_merged
-    code, out = run([tmux, "show-environment", "-g"], timeout=10)
-    if code != 0:
-        return ""
     kept = []
-    for v in [ln.split("=", 1)[0] for ln in out.splitlines() if "=" in ln]:
+    for v in tmux_env_names(tmux, run):
         if v in LEAKED:
             code, out = run([tmux, "set-environment", "-g", "-u", v], timeout=10)
             if code != 0:
                 kept.append("%s (%s)" % (v, out[-200:] or "exit %d" % code))
     return "tmux kept %s in its global environment" % ", ".join(kept) if kept else ""
+
+
+def tmux_env_names(tmux, run=None):
+    """The names of the variables in the tmux server's global environment, which every new session's shell inherits
+    (names only: values never leave tmux); [] without a server or tmux."""
+    if not tmux:
+        return []
+    code, out = (run or sources.run_merged)([tmux, "show-environment", "-g"], timeout=10)
+    return [ln.split("=", 1)[0] for ln in out.splitlines() if "=" in ln] if code == 0 else []
 
 
 def tmux_name_for(agent, existing):
@@ -114,10 +224,11 @@ def resume_settings(agent, cfg):
     """(config dir, model, effort, note) to resume an exited agent with; cfg is the mailroom's config (its
     config.load()). Claude: the login the mailroom's own offline resumes pick (failover.place_resume: agent-spawn
     --account auto's rule, judged by the model the session runs), and the model and effort its transcript last
-    recorded (failover.transcript_flags, as agent-switch reads them). Unless that login holds the newest copy of the
-    conversation, the placement copies it there and trusts its folder in that login's .claude.json. A mailroom older
-    than place_resume: the login with the newest copy, the model its transcript names and no effort. Codex: no config
-    dir, and its thread's model and effort. What the agent's own record lacks is the mailroom's spawn default for its
+    recorded (failover.transcript_flags, as agent-switch reads them), as the mailroom moves a model between logins
+    (resume_model: a per-token login's own model, which a Claude model would fail on). Unless that login holds the
+    newest copy of the conversation, the placement copies it there and trusts its folder in that login's .claude.json.
+    A mailroom older than place_resume: the login with the newest copy, the model its transcript names and no effort.
+    Codex: no config dir, and its thread's model and effort. What the agent's own record lacks is the mailroom's spawn default for its
     CLI, and a null default is None (the CLI's own choice). note: which login and why ("" for Codex). Raises
     RuntimeError for a Claude session with no transcript on any login; whatever the placement raises propagates."""
     sid, cli = agent["id"], agent["cli"]
@@ -138,33 +249,33 @@ def _claude_settings(agent, cfg):
         account, home = sources.claude_home_of(sid)
         return home, sources.last_claude_model(home, sid), None, (
             "on login %s, where its newest copy is (this mailroom places no resumes)" % account)
-    current = agent.get("config_dir") or None
-    if current and Path(current).resolve() == sources.DEFAULT_CLAUDE_HOME.resolve():
-        current = None
+    current = login_dir(agent.get("config_dir") or None)
     d, note = failover.place_resume({"id": sid, "cwd": agent.get("cwd") or "", "config_dir": current}, cfg,
                                     trust=spawn_trust(), dry_run=False)
     home = Path(d) if d else sources.DEFAULT_CLAUDE_HOME
     path = failover.transcript({"id": sid, "config_dir": str(home)})
     flags = failover.transcript_flags(failover.read_tail(path, failover.settings(cfg)["tail_bytes"])) if path else []
     recorded = dict(zip(flags[::2], flags[1::2]))
-    return home, recorded.get("--model"), recorded.get("--effort"), note
+    return home, resume_model(current, home, recorded.get("--model"), cfg.get("spawn_claude_model")), \
+        recorded.get("--effort"), note
 
 
-def resume_command(cli, sid, cwd, home, model, effort, name):
+def resume_command(cli, sid, cwd, home, model, effort, name, inherited=()):
     """The shell line that resumes session `sid` interactively, with the leaked variables scrubbed. Claude runs on
-    the login whose config dir is `home` (None: the default login) under the agent name `name`; Codex runs in
-    `cwd` with the repo's hook-trust flag. A `model` or `effort` of None is left to the CLI."""
+    the login whose config dir is `home` (None: the default login) under the agent name `name`, with its options as
+    that login takes them (login_flags: a per-token login's OpenRouter settings, and its model in place of `model`),
+    and without what the mailroom's scrub keeps from a claude (scrubbed_names) among this process's variables and
+    `inherited`, the names the pane's shell may hold besides (tmux_env_names: the tmux server's). Codex runs in `cwd`
+    with the repo's hook-trust flag. A `model` or `effort` of None is left to the CLI."""
     if cli == "claude":
         exe = sources.find_bin("claude") or "claude"
-        env = ("env %s -u CLAUDE_CONFIG_DIR" % SCRUB_ENV
-               if not home or Path(home).resolve() == sources.DEFAULT_CLAUDE_HOME.resolve()
-               else "env %s CLAUDE_CONFIG_DIR=%s" % (SCRUB_ENV, shlex.quote(str(home))))
-        parts = [env, shlex.quote(exe), "--resume", sid, "--dangerously-skip-permissions"]
-        if model:
-            parts += ["--model", shlex.quote(model)]
-        if effort:
-            parts += ["--effort", shlex.quote(effort)]
-        return " ".join(parts + ["--name", shlex.quote(name)])
+        unset = "".join(" -u " + shlex.quote(n) for n in scrubbed_names(set(os.environ) | set(inherited))
+                        if n not in LEAKED)
+        env = ("env %s%s -u CLAUDE_CONFIG_DIR" % (SCRUB_ENV, unset) if is_default_login(home)
+               else "env %s%s CLAUDE_CONFIG_DIR=%s" % (SCRUB_ENV, unset, shlex.quote(str(home))))
+        flags = ["--dangerously-skip-permissions"] + (["--model", model] if model else []) + (
+            ["--effort", effort] if effort else []) + ["--name", name]
+        return " ".join([env, shlex.quote(exe), "--resume", sid] + [shlex.quote(x) for x in login_flags(home, flags)])
     exe = sources.find_bin("codex") or "codex"
     parts = ["env", SCRUB_ENV, shlex.quote(exe), "resume", "-s", "danger-full-access", "-a", "never", "-C",
              shlex.quote(cwd), CODEX_NO_UPDATE_PROMPT]
@@ -178,11 +289,25 @@ def resume_command(cli, sid, cwd, home, model, effort, name):
     return " ".join(parts + [sid])
 
 
+def mailroom_keys_lock():
+    """The mailroom's keys lock (agentmail/commands.py's keys_lock, the one definition of it), a function of whether to
+    wait: whatever types or presses keys in an agent's pane holds it, so the lines and answers typed here never mix
+    with the mailroom's keys in a pane (fast mode's effort keys, a relaunch, agent-spawn's lines). Raises RuntimeError
+    when the mailroom isn't installed, and AttributeError when its install is older than the lock."""
+    return sources.mailroom("commands").keys_lock
+
+
 def launch_in_tmux(agent, line, name, run=sources.run_merged, live=None, wait=45, cap=None, tmux=None):
     """Start a tmux session in the agent's folder, cap it, type the launch line, answer its start-up dialogs
-    (answer_dialog) and wait until the agent is live. Shared by the board's Resume and the post-reboot restore.
-    (up, memory, error, note): error says why nothing was launched, when tmux would not start the session or kept a
+    (answer_dialog) and wait until the agent is live, each key typed under the mailroom's keys lock
+    (mailroom_keys_lock). Shared by the board's Resume and the post-reboot restore. (up, memory, error, note): error
+    says why nothing was launched, when the keys lock is not there, or tmux would not start the session or kept a
     leaked variable; note, what a dialog left for the owner (answer_dialog), or ""."""
+    try:
+        keys_lock = mailroom_keys_lock()
+    except (RuntimeError, ImportError, AttributeError) as e:
+        return False, "", "the mailroom's keys lock is not there (%s: %s), so the agent was not started" % (
+            type(e).__name__, e), ""
     tmux = tmux or sources.find_bin("tmux")
     live = live or sources.is_live
     kept = scrub_tmux_env(tmux, run)
@@ -195,9 +320,10 @@ def launch_in_tmux(agent, line, name, run=sources.run_merged, live=None, wait=45
     if kept:
         return False, "", "%s, so the agent was not started in tmux session '%s'" % (kept, name), ""
     memory = (cap or memory_cap)(tmux, name, agent)
-    run([tmux, "send-keys", "-t", "=%s:" % name, "-l", line], timeout=10)
-    time.sleep(0.3)
-    run([tmux, "send-keys", "-t", "=%s:" % name, "Enter"], timeout=10)
+    with keys_lock(True):
+        run([tmux, "send-keys", "-t", "=%s:" % name, "-l", line], timeout=10)
+        time.sleep(0.3)
+        run([tmux, "send-keys", "-t", "=%s:" % name, "Enter"], timeout=10)
     t0, note = time.time(), ""
     while time.time() - t0 < wait:
         time.sleep(1.5)
@@ -205,7 +331,8 @@ def launch_in_tmux(agent, line, name, run=sources.run_merged, live=None, wait=45
         keys, said = answer_dialog(screen, name)
         note = said or note
         if keys:
-            run([tmux, "send-keys", "-t", "=%s:" % name] + keys, timeout=10)
+            with keys_lock(True):
+                run([tmux, "send-keys", "-t", "=%s:" % name] + keys, timeout=10)
             continue
         if live(agent):
             return True, memory, "", note

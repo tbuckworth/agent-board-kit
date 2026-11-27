@@ -1,6 +1,7 @@
-# 7. The Mac
+# 7. The Mac and the phone app
 
-The Mac is a client of the Linux machine. It can run:
+The Mac is a client of the Linux machine, and the main way in: the board is where you read and answer
+your agents and start work. It can run:
 
 - the **agent board** and the **to-do app** (menu-bar apps that talk to the Linux machine over ssh);
 - its own Claude Code / Codex sessions that **mail through the Linux machine**, so your replies
@@ -83,6 +84,50 @@ x delete, g agent, 1 2 3 or h m l importance, u urgent). Double-clicking an agen
 opens its latest mail to you in Gmail, in the Chrome profile signed in to `OWNER_EMAIL` if Chrome has
 one, else the default browser. Self-checks that never put a window on screen:
 `/Applications/ToDo.app/Contents/MacOS/ToDo --selftest` and `--selftest-clicks`.
+
+## The phone app (Agent Mail)
+
+**Agent Mail** puts the Mail tab on your phone: the list, threads, replies with files, options and plots,
+fast mode, drafts shared with the Mac, and messages to the orchestrator. It is a page the Linux machine serves
+on your own Tailscale network only, which Chrome installs on the home screen; each sign-in, reply and
+orchestrator message needs your fingerprint (a passkey). It is built and tested on Android with Chrome. How it is
+protected, and every setting: [board/README.md, "Mail on the phone (Agent Mail)"](../board/README.md#mail-on-the-phone-agent-mail).
+
+1. **Tailscale** on the Linux machine and the phone, the same login. In the Tailscale admin console, turn on
+   **MagicDNS** and **HTTPS certificates**. Never turn on Funnel for this port: the page refuses to answer while
+   it is public.
+2. **`WITH_PHONE_APP="yes"`** in `kit.env`, then `./install.sh` on the Linux machine. That puts `cryptography`
+   in the kit's venv and installs the `agent-board-mail-web` service (not started until step 4).
+3. **Find your phone's node id** on the Linux machine:
+
+   ```bash
+   tailscale status --json | jq -r '.Peer[] | "\(.ID)  \(.HostName)"'
+   ```
+
+4. **Name it** in `~/.config/agent-board/mailweb.json` (`proxy_uids` `[0]` is tailscaled running as root), then
+   start the service:
+
+   ```bash
+   echo '{"devices": ["YOUR-PHONE-NODE-ID"], "proxy_uids": [0]}' > ~/.config/agent-board/mailweb.json
+   ./install.sh --start
+   ```
+
+   If your Tailscale login is not `OWNER_EMAIL` (a GitHub login, say), add `"logins": ["you@github"]`.
+
+5. **Publish it on your tailnet** (port 8466, the default):
+
+   ```bash
+   sudo tailscale serve --bg --https=8466 unix:$HOME/.local/state/agent-board/mail-web/page.sock
+   ```
+
+   (`sudo tailscale set --operator=$USER` once lets you run `tailscale serve` without sudo.)
+
+6. **Enrol the phone from the Mac**: right-click the board's menu-bar icon → **Phone…** → **Show an enrolment
+   code**. Scan the QR code with the phone, tap **Enrol this phone**, and touch the fingerprint sensor. The
+   enrolment is recorded as a security alert: it shows in the Mail tab and as a Mac notification.
+7. **Install it**: in Chrome, ⋮ → **Add to home screen** → **Install**.
+
+Check: `kit doctor` shows the phone app's lines green, and the app opens your Mail tab's list.
 
 ## Agents on the Mac (optional)
 

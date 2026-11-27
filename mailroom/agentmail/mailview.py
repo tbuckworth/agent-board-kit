@@ -2,15 +2,17 @@
 attachments, part), an allowlist sanitizer for its HTML (safe_html), and a whole thread as one self-contained HTML
 page (document), made to be shown with scripts off and every network load blocked. Stdlib only.
 
-What safe_html lets through: the tags in TAGS with the attributes in ATTRS (and TAG_ATTRS on their tags); links
-to http, https and mailto only, each with rel="noreferrer noopener"; images only as data: URIs of the types in
+What safe_html lets through: the tags in TAGS with the attributes in ATTRS (and TAG_ATTRS on their tags), text and
+attribute values without a character shown as nothing (shown: no bidi control can show text in another order);
+links to http, https and mailto only, each with rel="noreferrer noopener"; images only as data: URIs of the types in
 IMAGE_TYPES, made from the mail's own cid: parts or given as such; for each widget the message kept
 (agentmail/widgets.py), the div its HTML marks as that widget's place (WIDGET_MARKER), as class="widget" and
-data-widget="SCOPE-N", and no other data- attribute; CSS that can load nothing (_css_safe), with
-<style> rules nested in the message's own scope so they cannot reach the page or another message. document puts
-each message body on a card with paint containment, so not even a fixed-position element can cover the page, and
-anchors its own CSS at the page's own top-level elements (its messages, the subject heading and the line under it),
-so a mail cannot dress its content up as part of the page."""
+data-widget="SCOPE-N", and no other data- attribute; CSS only of the formatting properties and values CSS_ALLOWED
+takes, nothing that can load (_css_safe), with <style> rules nested in the message's own scope so they cannot reach
+the page or another message; at-rules other than @media and @supports (@counter-style, @font-face, @page and the
+rest) go. document puts each message body on a card with paint containment, so not even a fixed-position element
+can cover the page, and anchors its own CSS at the page's own top-level elements (its messages, the subject heading
+and the line under it), so a mail cannot dress its content up as part of the page."""
 import base64
 import email
 import email.policy
@@ -45,6 +47,43 @@ class Parsed(NamedTuple):
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f]")   # C0 controls but tab, newline, form feed, return; and DEL
 
+# Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties.txt, Unicode 15.0), which Python's unicodedata does
+# not give: characters shown as nothing, such as zero-width spaces and joiners, variation selectors, tag characters
+# (which spell out ASCII that a model reads but a person cannot see), and the bidi controls, which show the text
+# around them in another order than it reads. No text of a mail's that the page shows keeps them (shown), nor does a
+# widget's (widgets.plain).
+IGNORABLE = (
+    (0x00AD, 0x00AD),     # soft hyphen
+    (0x034F, 0x034F),     # combining grapheme joiner
+    (0x061C, 0x061C),     # Arabic letter mark
+    (0x115F, 0x1160),     # Hangul choseong and jungseong fillers
+    (0x17B4, 0x17B5),     # Khmer inherent vowels
+    (0x180B, 0x180F),     # Mongolian free variation selectors and vowel separator
+    (0x200B, 0x200F),     # zero-width space, non-joiner and joiner; left-to-right and right-to-left marks
+    (0x202A, 0x202E),     # bidi embeddings and overrides
+    (0x2060, 0x206F),     # word joiner, invisible operators, bidi isolates, deprecated format characters
+    (0x3164, 0x3164),     # Hangul filler
+    (0xFE00, 0xFE0F),     # variation selectors 1 to 16
+    (0xFEFF, 0xFEFF),     # zero-width no-break space (byte order mark)
+    (0xFFA0, 0xFFA0),     # halfwidth Hangul filler
+    (0xFFF0, 0xFFF8),     # unassigned
+    (0x1BCA0, 0x1BCA3),   # shorthand format controls
+    (0x1D173, 0x1D17A),   # musical beam, tie, slur and phrase controls
+    (0xE0000, 0xE0FFF),   # tag characters, variation selectors 17 to 256, unassigned
+)
+_IGNORABLE = re.compile("[%s]" % "".join("%s-%s" % (chr(a), chr(b)) for a, b in IGNORABLE))
+
+
+def without_ignorable(text):
+    """text without the characters IGNORABLE lists."""
+    return _IGNORABLE.sub("", text)
+
+
+def shown(text):
+    """A mail's text as the page may show it: without control characters (_CONTROL) or characters shown as nothing
+    (IGNORABLE)."""
+    return without_ignorable(_CONTROL.sub("", text))
+
 
 def _leaves(part):
     """The MIME leaves under part, depth first: every part that is not multipart/*. An attached mail (message/*)
@@ -57,9 +96,9 @@ def _leaves(part):
 
 
 def _name(leaf, index, ctype):
-    """A part's file name: the last path component of its filename, without control characters; else
+    """A part's file name: the last path component of its filename as the page may show it (shown); else
     part-INDEX.EXT, EXT guessed from the content type (bin when there is none)."""
-    name = re.split(r"[\\/]", _CONTROL.sub("", leaf.get_filename() or ""))[-1].strip()
+    name = re.split(r"[\\/]", shown(leaf.get_filename() or ""))[-1].strip()
     if name in ("", ".", ".."):
         name = "part-%d%s" % (index, mimetypes.guess_extension(ctype) or ".bin")
     return name
@@ -108,16 +147,20 @@ def part(raw, index):
 
 SCOPE_RE = re.compile(r"[a-z][0-9]+")   # a message key ("s123", "i45"): safe_html's scope and document's ids
 TAGS = frozenset("""p br div span a b strong i em u s strike del ins mark small big sub sup code pre kbd samp var tt
-    blockquote q cite abbr ul ol li dl dt dd table thead tbody tfoot tr th td caption colgroup col h1 h2 h3 h4 h5
+    blockquote cite abbr ul ol li dl dt dd table thead tbody tfoot tr th td caption colgroup col h1 h2 h3 h4 h5
     h6 hr img font center figure figcaption details summary section article header footer main""".split())
 VOID = frozenset(("br", "hr", "img", "col"))
 # Dropped with all their content; style's CSS is kept apart (_Sanitizer.css), then sanitized and scoped.
 DROP = frozenset("""script style iframe frameset object applet svg math template noscript noembed noframes title
     button select textarea option canvas audio video picture""".split())
 DROP_VOID = frozenset("input embed source track link meta base frame param keygen".split())   # no content to drop
-ATTRS = frozenset("""style class title dir lang align valign width height bgcolor color border cellpadding
-    cellspacing colspan rowspan start reversed face alt""".split())
-TAG_ATTRS = {"type": ("ol", "ul", "li"), "size": ("font",), "href": ("a",), "src": ("img",)}
+# No dir: with it, right-to-left on a block of English shows its words in another order than they read. No face:
+# a font is only one CSS_FONT_FAMILIES names (a symbol font shows pictures for words). Any other tag, <q>, <bdo> and
+# <bdi> among them, is dropped and its text kept.
+ATTRS = frozenset("""style class title lang align valign width height bgcolor color border cellpadding
+    cellspacing colspan rowspan start reversed alt""".split())
+TAG_ATTRS = {"type": ("ol", "ul", "li"), "size": ("font",), "href": ("a",), "src": ("img",), "open": ("details",)}
+# agent-board's agentboard/mailforward.py strips this from forwarded mail: change both together.
 WIDGET_MARKER = "data-agentmail-widget"   # where a mail's HTML puts widget N's fallback (agentmail/widgets.py)
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 _DATA_IMAGE = re.compile(r"data:(%s)[;,]" % "|".join(map(re.escape, IMAGE_TYPES)), re.I)
@@ -179,9 +222,215 @@ def _css_safe(piece):
                 or re.search("[\"']", _CSS_STRING.sub("", piece)))
 
 
+# ---- the CSS a mail may use ----
+#
+# A declaration is kept only when CSS_ALLOWED names its property and that property's check takes its value, in style
+# attributes and <style> blocks alike. The list is what agents' mail uses for formatting (counted over a large set of
+# stored agent mail). Every other property goes: whatever could move, scale, clip, cover, fade or hide text, or
+# write text the mail does not hold (position, transform, filter, mask, clip-path, overflow, opacity, visibility,
+# text-indent, content, display: none, background images, every -webkit- property and the rest), so that the text
+# the owner selects and quotes is the text they see. Lengths are px, pt, em or rem (a percentage where a check says),
+# never negative, and a margin, padding, border or width is held to a most, so that one step cannot push text out
+# of sight. Not caught here: text in the colour of what is behind it, and text pushed aside step by step through
+# nested elements; the board shows the whole of what the owner quotes in their reply box before it goes.
+CARD_PX = 960         # the widest a message's card, and the subject over it, is on the thread page (PAGE_CSS)
+SPACE_PX = 100        # the most a margin, padding, border width, border spacing or letter spacing may be
+BOX_PX = CARD_PX      # the most a width, min-width or height may be: no wider than the card
+LEAST_FONT_PX = 8     # a smaller font size or line height in px is raised to this (in pt, its equal, 6pt)
+LEAST_FONT_EM = 0.5   # and a smaller font size in em or rem to this (in %, 50%)
+LEAST_LINE = 1        # and a smaller line height as a number or in em to this (in %, 100%)
+LEAST_BOX_PX = 1      # a smaller width, min-width, max-width or height is dropped (in %, under 1%): it hides text
+_PX = {"px": 1, "pt": 4 / 3, "em": 16, "rem": 16}   # px in one unit, an em taken as 16px
+_LENGTH = re.compile(r"(\d+\.?\d*|\.\d+)(px|pt|em|rem|%)?", re.I)
+_COLOUR = re.compile(r"#[0-9a-f]{3}|#[0-9a-f]{6}|[a-z]+", re.I)     # opaque: no alpha, no transparent
+_NAMES = re.compile(r"[a-z-]+(?:\s+[a-z-]+)*", re.I)
+# The font families a mail may name: the generic ones, and the text fonts agent mail commonly names. No other: a
+# symbol font such as Webdings shows pictures where the text says words.
+CSS_FONT_FAMILIES = frozenset((
+    "serif", "sans-serif", "monospace", "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace", "-apple-system",
+    "blinkmacsystemfont", "arial", "helvetica", "helvetica neue", "segoe ui", "roboto", "verdana", "georgia",
+    "times new roman", "courier new", "menlo", "consolas", "sfmono-regular", "inherit"))
+_FONT = re.compile(r"((?:(?:normal|italic|oblique|small-caps|bold|bolder|lighter|[1-9]00)\s+)*)([^\s/]+)"
+                   r"(?:\s*/\s*([^\s/]+))?\s+(.+)", re.I | re.S)
+_IMPORTANT = re.compile(r"\s*!\s*important\s*$", re.I)
+_BORDER_STYLES = "none hidden solid dashed dotted double groove ridge inset outset"
+
+
+def _length(tok, most_px, most_percent):
+    """tok when it is a length of 0 up to most_px (px, pt, em or rem) or of 0% up to most_percent (None: no
+    percentage), else None; a bare number only as 0."""
+    m = _LENGTH.fullmatch(tok)
+    if not m:
+        return None
+    n, unit = float(m.group(1)), (m.group(2) or "").lower()
+    if not unit:
+        return tok if n == 0 else None
+    if unit == "%":
+        return tok if most_percent is not None and n <= most_percent else None
+    return tok if n * _PX[unit] <= most_px else None
+
+
+def _raised(tok, least_px, least_em, least_number):
+    """tok, a font size or line height, raised to its least when smaller: least_px in px and pt, least_em in em and
+    rem (100 times it in %), least_number as a bare number (None: a bare number is not taken); None for anything
+    else."""
+    m = _LENGTH.fullmatch(tok)
+    if not m:
+        return None
+    n, unit = float(m.group(1)), (m.group(2) or "").lower()
+    if not unit:
+        least = least_number
+    elif unit == "%":
+        least = least_em * 100
+    else:
+        least = least_px / _PX[unit] if unit in ("px", "pt") else least_em
+    if least is None:
+        return None
+    return tok if n >= least else "%g%s" % (least, unit)
+
+
+def _colour(value):
+    return value if _COLOUR.fullmatch(value) and value.lower() != "transparent" else None
+
+
+def _words(words):
+    """A check taking one or more of words (a space-separated string), in any case."""
+    allowed = frozenset(words.split())
+    return lambda value: value if value and all(w in allowed for w in value.lower().split()) else None
+
+
+def _names(value):
+    """Keywords only: list-style-type: lower-alpha, font-variant-numeric: tabular-nums."""
+    return value if _NAMES.fullmatch(value) else None
+
+
+def _spaces(count, auto):
+    """A check taking 1 to count lengths (each _length up to SPACE_PX, no percentage), or auto where auto allows."""
+    def check(value):
+        toks = value.split()
+        ok = 1 <= len(toks) <= count and all((auto and t.lower() == "auto") or _length(t, SPACE_PX, None)
+                                             for t in toks)
+        return value if ok else None
+    return check
+
+
+def _at_least_box(tok):
+    """Whether tok, a length or percentage, is at least LEAST_BOX_PX (1%)."""
+    m = _LENGTH.fullmatch(tok)
+    unit = (m.group(2) or "").lower() if m else ""
+    return bool(unit) and float(m.group(1)) >= (1 if unit == "%" else LEAST_BOX_PX / _PX[unit])
+
+
+def _box(value):
+    """width, min-width, height: auto, or one length from LEAST_BOX_PX up to BOX_PX, or 1% to 100%."""
+    return value if value.lower() == "auto" or (_length(value, BOX_PX, 100) and _at_least_box(value)) else None
+
+
+def _max_box(value):
+    """max-width: none, or one length or percentage from LEAST_BOX_PX up (a most cannot push text away)."""
+    ok = value.lower() == "none" or (_length(value, float("inf"), float("inf")) and _at_least_box(value))
+    return value if ok else None
+
+
+def _radius(value):
+    toks = value.split()
+    return value if 1 <= len(toks) <= 4 and all(_length(t, float("inf"), 50) for t in toks) else None
+
+
+def _border(value):
+    """A border shorthand: at most a width (up to SPACE_PX, or thin, medium, thick), a style and a colour."""
+    toks = value.split()
+    ok = 1 <= len(toks) <= 3 and all(t.lower() in ("thin", "medium", "thick") or _length(t, SPACE_PX, None)
+                                     or t.lower() in _BORDER_STYLES.split() or _colour(t) for t in toks)
+    return value if ok else None
+
+
+def _decoration(value):
+    toks = value.split()
+    lines = "none underline overline line-through solid double dotted dashed wavy".split()
+    return value if toks and all(t.lower() in lines or _colour(t) for t in toks) else None
+
+
+def _letter_spacing(value):
+    return value if value.lower() == "normal" else _spaces(1, False)(value)
+
+
+def _family(value):
+    """A family list each of whose names (quoted or not, in any case) CSS_FONT_FAMILIES holds."""
+    names = [n.strip().strip("'\"").strip().lower() for n in value.split(",")]
+    return value if all(n in CSS_FONT_FAMILIES for n in names) else None
+
+
+def _font_size(value):
+    words = "xx-small x-small small medium large x-large xx-large xxx-large larger".split()
+    return value if value.lower() in words else _raised(value, LEAST_FONT_PX, LEAST_FONT_EM, None)
+
+
+def _line_height(value):
+    return value if value.lower() == "normal" else _raised(value, LEAST_FONT_PX, LEAST_LINE, LEAST_LINE)
+
+
+def _font(value):
+    """The font shorthand ("700 22px/1.3 Georgia, serif"), its size and line height checked as their own
+    properties are (raised when small), its family as font-family is."""
+    m = _FONT.fullmatch(value)
+    size = _font_size(m.group(2)) if m else None
+    height = _line_height(m.group(3)) if m and m.group(3) else None
+    if size is None or (m.group(3) and height is None) or _family(m.group(4)) is None:
+        return None
+    return "%s%s%s %s" % (m.group(1), size, "/" + height if height else "", m.group(4))
+
+
+_KEYWORD_CHECKS = {
+    "font-weight": "normal bold bolder lighter 100 200 300 400 500 600 700 800 900",
+    "font-style": "normal italic oblique",
+    "text-align": "left right center justify start end",
+    "text-transform": "none uppercase lowercase capitalize",
+    "white-space": "normal nowrap pre pre-wrap pre-line break-spaces",
+    "word-break": "normal break-all keep-all break-word",
+    "overflow-wrap": "normal break-word anywhere",
+    "word-wrap": "normal break-word anywhere",
+    "vertical-align": "baseline top middle bottom text-top text-bottom sub super",
+    "display": "block inline inline-block list-item table inline-table table-row table-cell table-row-group "
+               "table-header-group table-footer-group table-column table-column-group table-caption",
+    "border-style": _BORDER_STYLES,
+    "border-collapse": "collapse separate",
+    "table-layout": "auto fixed",
+    "box-sizing": "content-box border-box",
+}
+CSS_ALLOWED = dict(
+    {k: _words(v) for k, v in _KEYWORD_CHECKS.items()},
+    **{"color": _colour, "background-color": _colour, "background": _colour, "border-color": _colour,
+       "font": _font, "font-family": _family, "font-size": _font_size, "line-height": _line_height,
+       "font-variant": _names, "font-variant-numeric": _names, "font-variant-caps": _names,
+       "text-decoration": _decoration, "letter-spacing": _letter_spacing,
+       "margin": _spaces(4, True), "padding": _spaces(4, False), "border-width": _spaces(4, False),
+       "border-spacing": _spaces(2, False), "border-radius": _radius,
+       "border": _border, "border-top": _border, "border-right": _border, "border-bottom": _border,
+       "border-left": _border,
+       "width": _box, "min-width": _box, "height": _box, "max-width": _max_box,
+       "list-style": _names, "list-style-type": _names},
+    **{"margin-" + side: _spaces(1, True) for side in ("top", "right", "bottom", "left")},
+    **{"padding-" + side: _spaces(1, False) for side in ("top", "right", "bottom", "left")})
+
+
+def _declaration(d):
+    """d, a declaration (_css_tree), as it may go out ("name: value", with its !important), or None: it is unsafe
+    (_css_safe), or CSS_ALLOWED has no check for its property, or the check refuses its value. The check may change
+    the value: a font size or line height too small is raised to its least."""
+    if not (_CSS_DECLARATION.match(d) and _css_safe(d)):
+        return None
+    name, _, value = d.partition(":")
+    value, important = _IMPORTANT.subn("", value.strip())
+    check = CSS_ALLOWED.get(name.strip().lower())
+    kept = check(value.strip()) if check else None
+    return None if kept is None else "%s: %s%s" % (name.strip().lower(), kept, " !important" if important else "")
+
+
 def _declarations(items):
-    """The safe declarations among items (_css_tree), each ended with ";"; blocks and at-rules are dropped."""
-    return " ".join(d + ";" for d in items if isinstance(d, str) and _CSS_DECLARATION.match(d) and _css_safe(d))
+    """The declarations among items (_css_tree) that may go out (_declaration), each ended with ";"; blocks and
+    at-rules are dropped."""
+    return " ".join(k + ";" for k in (_declaration(d) for d in items if isinstance(d, str)) if k is not None)
 
 
 def _selector(prelude):
@@ -257,7 +506,7 @@ class _Sanitizer(HTMLParser):
             if name in seen:
                 continue
             seen.add(name)
-            value = _CONTROL.sub("", value or "")
+            value = shown(value or "")
             if tag not in TAG_ATTRS.get(name, ()) and name not in ATTRS:
                 continue
             if name == "style":
@@ -314,7 +563,7 @@ class _Sanitizer(HTMLParser):
         if self.dropping == ["style"]:
             self.css[-1] += data
         elif not self.dropping:
-            self.out.append(htmllib.escape(_CONTROL.sub("", data), quote=False))
+            self.out.append(htmllib.escape(shown(data), quote=False))
 
 
 def safe_html(html, images, scope, widgets):
@@ -340,6 +589,9 @@ def safe_html(html, images, scope, widgets):
 
 CSP = ("default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; "
        "form-action 'none'")
+# The sanitizer drops overflow (a mail could copy the renderer's own scroll box to clip text), so the card scrolls
+# instead: a table's cells break no word, so a table wider than the card scrolls with it rather than squeezing its
+# columns, and code wraps to fit (overflow-wrap: anywhere).
 PAGE_CSS = """
 :root { color-scheme: light dark; --bg: #f6f8fc; --fg: #1f1f1f; --muted: #5f6368; --line: #e0e3e7;
   --head: #ffffff; --mine: #e8f0fe; --current: #1a73e8; }
@@ -349,10 +601,10 @@ PAGE_CSS = """
 }
 body { margin: 0; padding: 12px; background: var(--bg); color: var(--fg);
   font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-body > .subject { max-width: 960px; margin: 4px auto 2px; padding: 0 4px; font-size: 20px; font-weight: 600;
+body > .subject { max-width: CARD_WIDTH; margin: 4px auto 2px; padding: 0 4px; font-size: 20px; font-weight: 600;
   line-height: 1.3; overflow-wrap: break-word; }
-body > .about { max-width: 960px; margin: 0 auto 12px; padding: 0 4px; color: var(--muted); font-size: 12.5px; }
-body > .msg { max-width: 960px; margin: 0 auto 8px; background: var(--head); border: 1px solid var(--line);
+body > .about { max-width: CARD_WIDTH; margin: 0 auto 12px; padding: 0 4px; color: var(--muted); font-size: 12.5px; }
+body > .msg { max-width: CARD_WIDTH; margin: 0 auto 8px; background: var(--head); border: 1px solid var(--line);
   border-radius: 10px; }
 body > .msg.mine { background: var(--mine); }
 body > .msg.current { border-color: var(--current); box-shadow: 0 0 0 1px var(--current); }
@@ -371,11 +623,13 @@ body > .msg > .card { margin: 0 10px 10px; padding: 12px 14px; border-radius: 8p
   color: #1f2328; color-scheme: light; contain: content; overflow-x: auto; overflow-wrap: break-word; }
 body > .msg.mine > .card { background: #f3f7fe; }
 body > .msg > .card > .mail img { max-width: 100%; height: auto; }
+body > .msg > .card > .mail pre { overflow-wrap: anywhere; }
+body > .msg > .card > .mail td, body > .msg > .card > .mail th { overflow-wrap: normal; }
 body > .msg > .card > .text { white-space: pre-wrap; }
 body > .msg > .card > .note { margin: 0 0 8px; color: #5f6368; font-size: 12px; }
 body > .msg > .card > .atts { margin-top: 12px; padding-top: 8px; border-top: 1px solid #e0e3e7; font-size: 13px; }
 body > .msg > .card > .atts a, body > .msg > .card > .note a { color: #0b57d0; }
-"""
+""".replace("CARD_WIDTH", "%dpx" % CARD_PX)   # the card's width, written once (CARD_PX)
 HEAD = ('<!DOCTYPE html>\n<html><head><meta charset="utf-8">\n'
         '<meta http-equiv="Content-Security-Policy" content="%s">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
@@ -425,7 +679,7 @@ def _content(entry):
             raise ValueError("message %s: gmail_url %r is not an http or https link" % (key, url))
         note = '<p class="note">%s <a href="%s" rel="noreferrer noopener">Open in Gmail</a></p>' % (
             UNSTORED, htmllib.escape(url))
-    return note + '<div class="text">%s</div>' % htmllib.escape(entry["text"], quote=False), entry["text"]
+    return note + '<div class="text">%s</div>' % htmllib.escape(shown(entry["text"]), quote=False), entry["text"]
 
 
 def _message(entry):
@@ -434,13 +688,13 @@ def _message(entry):
     if not SCOPE_RE.fullmatch(key):
         raise ValueError("message key %r is not like s123 or i45" % key)
     card, text = _content(entry)
-    to = '<span class="to">to %s</span>' % htmllib.escape(entry["recipients"]) if entry["recipients"] else ""
-    status = '<span class="status">%s</span>' % htmllib.escape(entry["status"]) if entry.get("status") else ""
+    to = '<span class="to">to %s</span>' % htmllib.escape(shown(entry["recipients"])) if entry["recipients"] else ""
+    status = '<span class="status">%s</span>' % htmllib.escape(shown(entry["status"])) if entry.get("status") else ""
     return ('<details id="%s" class="msg%s"%s><summary><b class="from">%s</b>%s<span class="when">%s</span>'
             '<span class="snip">%s</span>%s</summary>\n<div class="card">%s</div></details>\n'
             % (htmllib.escape(key), " mine" if entry["mine"] else "", " open" if entry["open"] else "",
-               htmllib.escape(entry["sender"]), to, htmllib.escape(_when(entry["ts"])),
-               htmllib.escape(snippet(text, SUMMARY_CHARS)), status, card))
+               htmllib.escape(shown(entry["sender"])), to, htmllib.escape(_when(entry["ts"])),
+               htmllib.escape(snippet(shown(text), SUMMARY_CHARS)), status, card))
 
 
 def about(count, agents):
@@ -461,9 +715,11 @@ def document(subject, agents, entries):
     open, widgets (how many widgets the message kept: safe_html marks their places), and the optional status (such
     as "delivered" or "held: ..."), raw, text and gmail_url (each may be left out or None). With raw, the mail's bytes: its HTML through safe_html (or its text rendered by
     compose.text_to_html when it has no HTML) and its attachments as mailbox-part:KEY/INDEX links. Without raw,
-    text shown as it is, and, with gmail_url, a note that the mail was sent before the tab kept copies and an
-    "Open in Gmail" link. Raises ValueError on a key unlike SCOPE_RE, an entry with neither raw nor text, or a
-    gmail_url that is not http or https."""
+    text shown as it is but for control characters and characters shown as nothing (shown, as for every text the page
+    takes from an entry, the subject and the agents), and, with gmail_url, a note that the mail was sent before the
+    tab kept copies and an "Open in Gmail" link. Raises ValueError on a key unlike SCOPE_RE, an entry with neither
+    raw nor text, or a gmail_url that is not http or https."""
     head = '<h1 class="subject">%s</h1>\n<p class="about">%s</p>\n' % (
-        htmllib.escape(subject or NO_SUBJECT, quote=False), htmllib.escape(about(len(entries), agents), quote=False))
+        htmllib.escape(shown(subject or NO_SUBJECT), quote=False),
+        htmllib.escape(shown(about(len(entries), agents)), quote=False))
     return HEAD + head + "".join(_message(e) for e in entries) + "</body></html>\n"

@@ -110,7 +110,7 @@ def send_if_due(db, cfg, now, notifier):
         return "not due"
     head, md, item_ids, has_content = build(db, cfg, now)
     if has_content:
-        if not notifier.send(head, md):  # really sent, also in shadow mode
+        if not notifier.send(head, md, alert=None):  # really sent, also in shadow mode
             return "failed"
         db.set_meta(SENT_AT, now)
         for i in item_ids:

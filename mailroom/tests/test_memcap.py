@@ -351,9 +351,10 @@ class SpawnIntegration(unittest.TestCase):
                                   or (None, "")):
             sp.start_agent(plan, Path("/b"), {"MemoryMax": 32 * G})
         # The server is freed first, excluding the pane's tree, so the pane's own move is the last one; then the
-        # line is typed (set-environment: the default login keeps CLAUDE_CONFIG_DIR out of the session).
+        # line is typed (set-environment: the default login keeps CLAUDE_CONFIG_DIR out of the session; then C-u,
+        # the line and its Enter).
         self.assertEqual(events, ["new-session", "display-message", ("free", 456, [123, 124]), ("adopt", 123),
-                                  "set-environment", "send-keys", "send-keys"])
+                                  "set-environment", "send-keys", "send-keys", "send-keys"])
         self.assertEqual(plan["memory"], "agent-n.scope (MemoryMax=32G)")
 
 

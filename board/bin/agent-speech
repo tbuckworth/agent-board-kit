@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""agent-speech: the desktop's voice, Kokoro (hexgrad/Kokoro-82M, Apache-2.0) on a Unix socket in the board's state
+folder, for the Mac's ask box and whatever else speaks to the owner (agentboard/speech.py: the socket, the settings).
+
+    agent-speech serve                  load Kokoro and answer on the socket (systemd/agent-speech.service.in)
+    agent-speech fetch                  download Kokoro's model and the voice set (once; serve never goes online)
+    agent-speech say TEXT... [-o OUT.wav]
+                                        TEXT through the running daemon: each sentence's timing, and the audio
+
+serve and fetch run on the speech venv's python, which holds Kokoro and PyTorch (SPEECH_PYTHON: the venv at
+~/.local/share/agent-kit/speech-venv, or the python AGENT_SPEECH_PYTHON names; requirements-speech.txt; README, "The ask
+box on the Mac"): run on another python that cannot import them (the kit's wrapper in ~/.local/bin runs the kit's), they
+start again on that one when it exists, else say how to make it. say needs only the standard library. Kokoro's G2P
+(misaki) falls back to espeak-ng for words it does not know, a library and data that the espeakng-loader wheel carries:
+nothing is installed outside the venv. The text never leaves the desktop: serve loads everything from Hugging Face's
+cache (HF_HUB_OFFLINE, as the unit sets it).
+"""
+import argparse
+import io
+import os
+import signal
+import sys
+import time
+import wave
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agentboard import speech  # noqa: E402
+
+REPO = "hexgrad/Kokoro-82M"
+RATE = 24000                # Kokoro's audio: samples a second
+SPEECH_VENV = Path.home() / ".local/share/agent-kit/speech-venv"
+SPEECH_PYTHON = Path(os.environ.get("AGENT_SPEECH_PYTHON") or SPEECH_VENV / "bin" / "python")
+REEXEC = "AGENT_SPEECH_REEXEC"     # set on the python this started again on, so it never starts again in a loop
+SETUP = """\
+Set up the speech venv once (README, "The ask box on the Mac"):
+  python3 -m venv {venv}
+  {venv}/bin/pip install torch          # Linux's default wheel has CUDA; CPU only: add
+                                        # --index-url https://download.pytorch.org/whl/cpu
+  {venv}/bin/pip install --no-deps -r {requirements}
+  agent-speech fetch                    # Kokoro's model and voice, about 330 MB, from Hugging Face
+or set AGENT_SPEECH_PYTHON to a python that has kokoro and torch."""
+
+
+def speech_python(modules, argv=None, python=None, execv=os.execv, environ=None):
+    """Make sure `modules` (the names serve or fetch import) can be imported: when one cannot on this python, start
+    this command again on the speech venv's python (`python`, SPEECH_PYTHON by default) when it exists and is not this
+    python, and was not started so already (REEXEC). Returns None to go on here, or why not (with SETUP), for the
+    caller to print and exit 2. `execv` and `environ` are os.execv and os.environ, or a test's stand-ins."""
+    import importlib.util
+    environ = os.environ if environ is None else environ
+    missing = [m for m in modules if importlib.util.find_spec(m) is None]
+    if not missing:
+        return None
+    python = Path(python or SPEECH_PYTHON)
+    here = Path(sys.executable)
+    if python.is_file() and os.access(python, os.X_OK) and python != here and not environ.get(REEXEC):
+        environ[REEXEC] = "1"
+        execv(str(python), [str(python), str(Path(__file__).resolve())] + list(sys.argv[1:] if argv is None else argv))
+    where = ("%s cannot import them either" % python if python.is_file() and python != here
+             else "%s, the speech venv's python, does not exist" % python if not python.is_file()
+             else "it is the speech venv's python")
+    return "agent-speech: %s cannot import %s, and %s.\n%s" % (
+        sys.executable, ", ".join(missing), where, SETUP.format(
+            venv=SPEECH_VENV, requirements=Path(__file__).resolve().parent.parent / "requirements-speech.txt"))
+
+
+def device_of(cfg, cuda_available):
+    """The device Kokoro runs on: the settings' own, or for "auto" "cuda" when PyTorch sees a GPU (`cuda_available`,
+    torch.cuda.is_available), else "cpu"."""
+    if cfg["device"] != "auto":
+        return cfg["device"]
+    return "cuda" if cuda_available() else "cpu"
+
+
+def kokoro(cfg):
+    """(synth, how): Kokoro's pipeline on cfg's device (device_of), voice and speed, warmed up; synth(text) gives
+    (16-bit PCM bytes, RATE)."""
+    import numpy as np
+    import torch
+    from kokoro import KModel, KPipeline
+    device = device_of(cfg, torch.cuda.is_available)
+    model = KModel(repo_id=REPO).to(device).eval()
+    pipe = KPipeline(lang_code=cfg["voice"][0], repo_id=REPO, model=model)
+    pipe.load_voice(cfg["voice"])
+
+    def synth(text):
+        with torch.inference_mode():
+            chunks = [r.audio.numpy() for r in pipe(text, voice=cfg["voice"], speed=cfg["speed"])
+                      if r.audio is not None]
+        audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        return (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes(), RATE
+
+    synth("Ready.")
+    fallback = "espeak-ng (espeakng-loader)" if pipe.g2p.fallback is not None else "none: unknown words are skipped"
+    return synth, "%s on %s%s, %d threads, speed %s; fallback for unknown words: %s" % (
+        cfg["voice"], device, " (auto)" if cfg["device"] == "auto" else "", torch.get_num_threads(), cfg["speed"],
+        fallback)
+
+
+def cmd_serve(a):
+    why = speech_python(("torch", "kokoro"))
+    if why:
+        print(why, file=sys.stderr)
+        return 2
+    cfg = speech.settings()
+    t = time.time()
+    synth, how = kokoro(cfg)
+    server = speech.Server(synth, cfg["socket"])
+    speech.log("INFO serving %s on %s, loaded in %.1f s" % (how, cfg["socket"], time.time() - t))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))     # systemd's stop: the socket is taken away as it ends
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
+def cmd_fetch(a):
+    why = speech_python(("huggingface_hub",))
+    if why:
+        print(why, file=sys.stderr)
+        return 2
+    from huggingface_hub import hf_hub_download
+    cfg = speech.settings()
+    for name in ("config.json", "kokoro-v1_0.pth", "voices/%s.pt" % cfg["voice"]):
+        print(hf_hub_download(REPO, name))
+    return 0
+
+
+def cmd_say(a):
+    cfg = speech.settings()
+    text, t, audio, rate = " ".join(a.text), time.time(), [], None
+    try:
+        for clip in speech.synthesize(text, cfg["socket"]):
+            print("%5.2f s  clip %d: %.1f s of audio, synthesized in %.2f s: %s" % (
+                time.time() - t, clip["seq"], clip["audio_seconds"], clip["synth_seconds"], clip["text"]))
+            with wave.open(io.BytesIO(clip["wav"])) as w:
+                rate = w.getframerate()
+                audio.append(w.readframes(w.getnframes()))
+    except speech.SpeechError as e:
+        print("could not speak: %s" % e, file=sys.stderr)
+        return 1
+    if a.o and rate:
+        Path(a.o).write_bytes(speech.wav(b"".join(audio), rate))
+        print("wrote %s" % a.o)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agent-speech", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("serve", help="load Kokoro and answer on the socket")
+    sub.add_parser("fetch", help="download Kokoro's model and the voice set, once")
+    p = sub.add_parser("say", help="TEXT through the running daemon")
+    p.add_argument("text", nargs="+")
+    p.add_argument("-o", metavar="OUT.wav", help="write the audio here")
+    a = ap.parse_args()
+    return {"serve": cmd_serve, "fetch": cmd_fetch, "say": cmd_say}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

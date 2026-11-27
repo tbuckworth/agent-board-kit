@@ -1,4 +1,11 @@
-# 2. The agents' Gmail account
+# 2. The agents' Gmail account (optional)
+
+**Skip this page unless you want email.** By default (`WITH_GMAIL="no"` in `kit.env`) agent mail and every
+alert stay on your own machines: you read and answer them in the board's Mail tab and the phone app, and
+nothing goes through Gmail. Turn Gmail on to also mail with your agents from any mail client, to let
+collaborators' agents write to yours, and to have agents mail other people when you ask. Then set
+`WITH_GMAIL="yes"` and `AGENT_EMAIL` in `kit.env`, follow the steps below, and re-run `./install.sh --start`.
+
 
 The mailroom uses the Gmail API with one OAuth scope, `gmail.modify` (read, label, send; it cannot
 permanently delete). You create a mailbox for the agents, register a small private OAuth "app" in

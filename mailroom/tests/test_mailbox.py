@@ -12,6 +12,7 @@ import gzip
 import io
 import json
 import os
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -25,12 +26,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
 from test_remote import Base, CFG, CFG_FILE, MAC_FILE, SID  # noqa: E402
-from test_groups import A, ALEX, Base as GroupBase  # noqa: E402
+from test_groups import A, OWNER as OWNER_ACTOR, Base as GroupBase  # noqa: E402
 import fakes  # noqa: E402
+import pictures  # noqa: E402
 import homes  # noqa: E402
 from scripts import load_script  # noqa: E402
 from agentmail import (alerts, backup, cli, config, deliver, groupmail, mailbox, mailroom, mailview,  # noqa: E402
-                       messages, outbound, recovery, remote, replyfiles, routing, rpc, store)
+                       messages, outbound, recovery, remote, replyfiles, review, routing, rpc, store)
 from agentmail.store import Store  # noqa: E402
 
 OWNER = CFG["allowlist"][0]
@@ -38,7 +40,7 @@ HOST = CFG["host_id"]
 KEY = "k" * 20
 INFO = dict(ok=True, cost=0, turns=1, duration_s=1, error="", result="done")
 DAY = 86400
-PNG = b"\x89PNG\r\n\x1a\n" + b"plot" * 300
+PNG = pictures.png(1600, 900)
 MAC_SID = "87654321-4321-4321-8321-cba987654321"
 
 
@@ -142,7 +144,473 @@ class Mailbox(Base):
         return code, out.getvalue(), err.getvalue()
 
 
+class ResearcherSwitch(Mailbox):
+    def setUp(self):
+        super().setUp()
+        # The test runner itself may descend from Codex. The simulated Board command does not.
+        homes.patch(self, cli, "agent_ancestor", lambda pid, stop=None: None)
+        self.homes.claude(SID, name="mailtab")
+        self.claude_payload = homes.researcher_install(self.homes.default, "claude", "0.7.0")
+        homes.researcher_install(self.homes.codex_home, "codex", "0.7.1+codex.20261124")
+
+    def toggle(self, sent, state):
+        code, out, err = self.main(["mailbox", "researcher", "--expect-tag", sent["tag"], "--",
+                                    sent["thread_id"], state])
+        self.assertEqual(code, 0, err)
+        return json.loads(out)
+
+    def test_idempotent_agent_switch_survives_reopen_and_reaches_the_exact_live_conversation(self):
+        first, second = self.agent_mail("First"), self.agent_mail("Second")
+        other = self.agent_mail("Other", sess=self.st.session_for(
+            "codex", "00000000-0000-4000-8000-000000000001", "other", origin_host=HOST))
+        off = {"on": False, "agent": "mailtab (claude)", "tag": first["tag"], "delivery": None, "delivery_detail": None}
+        on = dict(off, on=True, delivery="pending")
+        self.assertEqual(self.listed()[first["thread_id"]]["researcher"], off)
+        self.assertEqual(self.toggle(first, "on"), {"ok": True, "thread": self.listed()[first["thread_id"]]})
+        self.assertEqual(self.toggle(second, "on")["thread"]["researcher"], on)
+        self.assertEqual(self.listed()[other["thread_id"]]["researcher"],
+                         dict(off, agent="other (codex)", tag=other["tag"]))
+        path = self.st.con.execute("pragma database_list").fetchone()[2]
+        self.st.con.close()
+        self.st = Store(path)
+        self.assertEqual(mailbox.show(self.st, CFG, second["thread_id"], 2e9)["thread"]["researcher"], on)
+        self.fake.service.reset_mock()
+
+        # agent-send is the external boundary. The daemon, delivery command and persistent store are real.
+        with mock.patch.object(deliver.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout="sent to the exact session", stderr="")) as send, \
+                mock.patch.object(self.room.time, "sleep"):
+            self.room.between_polls(self.fake, self.st, CFG, 2, False)
+            send.assert_called_once()
+            cmd = send.call_args.args[0]
+            self.assertEqual(cmd[-1], SID)
+            self.assertIn("--exact-id", cmd)
+            self.assertEqual(cmd[cmd.index("--offline") + 1], "fail")
+            activation = send.call_args.kwargs["input"]
+            self.assertIn("`researcher:researcher`", activation)
+            self.assertIn("`commands/researcher.md`", activation)
+            self.assertIn(str(self.claude_payload), activation)
+            self.assertIn("--payload", activation)
+            self.assertIn("revision 1", activation)
+            self.assertIn("approve-human RUN REVISION", activation)
+            self.assertIn("verify RUN", activation)
+            self.assertIn("evidence RUN", activation)
+            self.assertIn("presentation RUN", activation)
+            self.assertIn("in_reply_to", activation)
+            self.assertEqual(self.listed()[second["thread_id"]]["researcher"], dict(on, delivery="accepted"))
+            self.assertEqual(self.toggle(second, "off")["thread"]["researcher"], dict(off, delivery="pending"))
+            self.assertEqual(self.toggle(first, "off")["thread"]["researcher"], dict(off, delivery="pending"))
+            self.room.between_polls(self.fake, self.st, CFG, 2, False)
+            self.assertEqual(send.call_count, 2)
+            self.assertIn("revision 2", send.call_args.kwargs["input"])
+            self.assertIn("pending approval", send.call_args.kwargs["input"])
+            self.assertIn("Switching off cannot approve", send.call_args.kwargs["input"])
+
+        self.assertEqual(self.st.researcher_mode(self.sess["tag"])["status"], "accepted")
+        self.fake.service.assert_not_called()
+
+    def test_expected_tag_refuses_a_thread_whose_routed_owner_changed(self):
+        sent = self.agent_mail()
+        thread = sent["thread_id"]
+        displayed = self.listed()[thread]["researcher"]["tag"]
+        self.assertEqual(displayed, self.sess["tag"])
+        other = self.st.session_for("codex", "00000000-0000-4000-8000-000000000001", "replacement", origin_host=HOST)
+        # Replace the saved sender between listing and action, with one valid owner in each snapshot.
+        self.st.con.execute("update sent set tag=? where id=?", (other["tag"], sent["id"]))
+        self.assertEqual(self.listed()[thread]["researcher"]["tag"], other["tag"])
+        code, out, err = self.main(["mailbox", "researcher", "--expect-tag", displayed, "--", thread, "on"])
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("Researcher owner changed", err)
+        self.assertFalse(self.st.researcher_modes())
+
+        confirmed = self.toggle(dict(sent, tag=other["tag"]), "on")
+        self.assertEqual(confirmed["thread"]["researcher"]["tag"], other["tag"])
+        self.assertIsNone(self.st.researcher_mode(displayed))
+        self.st.record_sent(displayed, "later", thread, "<later@test>", OWNER, "Later",
+                            cc_addr=None, body=None, eml=None, attachments=None)
+        self.assertIsNone(self.listed()[thread]["researcher"])
+        code, out, err = self.main(["mailbox", "researcher", "--expect-tag", other["tag"], "--", thread, "off"])
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("Researcher owner changed", err)
+        self.assertTrue(self.st.researcher_mode(other["tag"])["enabled"])
+
+    def test_legacy_toggle_without_expected_tag_cannot_change_the_preference(self):
+        sent = self.agent_mail()
+        args = ["mailbox", "researcher", "--", sent["thread_id"]]
+        code, out, err = self.main(args + ["on"])
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--expect-tag", err)
+        self.assertIsNone(self.st.researcher_mode(sent["tag"]))
+
+        self.toggle(sent, "on")
+        code, out, err = self.main(args + ["off"])
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--expect-tag", err)
+        self.assertTrue(self.st.researcher_mode(sent["tag"])["enabled"])
+
+    def test_refuses_unrouted_or_ambiguous_threads_without_changing_either_agent(self):
+        unrouted = self.agent_mail("Unrouted", sess=None)
+        mixed = self.agent_mail("Mixed")
+        other = self.st.session_for("codex", "00000000-0000-4000-8000-000000000001", "other", origin_host=HOST)
+        self.st.record_sent(other["tag"], "other", mixed["thread_id"], "<other@test>", OWNER, "Mixed",
+                            cc_addr=None, body=None, eml=None, attachments=None)
+        group = self.agent_mail("Group", sess=self.st.session_for(
+            routing.GROUP_CLI, "group-id", "Group", origin_host=HOST))
+        notice = self.agent_mail("[mailroom] Special route")
+        orchestrator = self.agent_mail("Orchestrator", sess=self.st.session_for(
+            "orchestrator", "orchestrator", "orchestrator", origin_host=HOST))
+        for sent in (unrouted, mixed, group, notice, orchestrator):
+            with self.subTest(thread=sent["thread_id"]):
+                self.assertIsNone(self.listed()[sent["thread_id"]]["researcher"])
+                code, out, err = self.main(["mailbox", "researcher", "--expect-tag", self.sess["tag"], "--",
+                                            sent["thread_id"], "on"])
+                self.assertEqual(code, 1)
+                self.assertIn("Researcher owner changed", err)
+                self.assertEqual(out, "")
+        self.assertFalse(self.st.researcher_modes())
+
+    def test_stale_on_is_skipped_and_off_is_retried_when_the_agent_is_unavailable(self):
+        sent = self.agent_mail()
+        self.toggle(sent, "on")
+        self.toggle(sent, "off")
+        with mock.patch.object(deliver.subprocess, "run") as send, mock.patch.object(self.room.time, "sleep"), \
+                mock.patch.object(self.room.time, "time", return_value=2e9) as now:
+            send.side_effect = [mock.Mock(returncode=2, stdout="", stderr="agent not live"),
+                                mock.Mock(returncode=1, stdout="", stderr="temporary transport error"),
+                                mock.Mock(returncode=deliver.HELD, stdout="held in Codex queue", stderr="")]
+            self.room.between_polls(self.fake, self.st, CFG, 2, False)
+            send.assert_called_once()
+            first = self.st.researcher_mode(self.sess["tag"])
+            self.assertEqual(first["status"], "unavailable")
+            self.assertEqual(self.listed()[sent["thread_id"]]["researcher"]["delivery"], "unavailable")
+            self.assertIn("agent not live", first["detail"])
+            self.assertIn("revision 2", send.call_args.kwargs["input"])
+            now.return_value = first["retry_at"]
+            self.room.between_polls(self.fake, self.st, CFG, 2, False)
+            self.assertEqual(self.listed()[sent["thread_id"]]["researcher"]["delivery"], "error")
+            now.return_value = self.st.researcher_mode(self.sess["tag"])["retry_at"]
+            self.room.between_polls(self.fake, self.st, CFG, 2, False)
+            self.assertEqual(send.call_count, 3)
+            self.assertEqual(len({call.kwargs["input"] for call in send.call_args_list}), 1)
+            self.assertEqual(self.st.researcher_mode(self.sess["tag"])["status"], "queued")
+            self.assertEqual(self.listed()[sent["thread_id"]]["researcher"]["delivery"], "queued")
+
+    def test_a_delivery_finishing_after_off_cannot_settle_the_new_revision(self):
+        sent = self.agent_mail()
+        self.toggle(sent, "on")
+
+        def accepts_old_control(_cmd, **kwargs):
+            self.assertIn("revision 1", kwargs["input"])
+            self.toggle(sent, "off")
+            return mock.Mock(returncode=0, stdout="accepted old control", stderr="")
+
+        # The transport can accept an older notice while the Board saves its replacement.
+        with mock.patch.object(deliver.subprocess, "run", side_effect=accepts_old_control), \
+                mock.patch.object(self.room.time, "sleep"):
+            self.room.between_polls(self.fake, self.st, CFG, 1, False)
+        mode = self.st.researcher_mode(self.sess["tag"])
+        self.assertEqual((mode["enabled"], mode["revision"], mode["status"]), (0, 2, "pending"))
+        self.assertIsNone(mode["detail"])
+
+    def test_future_owner_mail_carries_the_current_agent_preference_with_its_reply_action(self):
+        sent = self.agent_mail()
+        self.toggle(sent, "on")
+        # Delivery to the existing conversation is external, as above. Mail-tab routing and its mailbox are real.
+        with mock.patch.object(deliver.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout="sent", stderr="")) as send:
+            self.answer(sent["thread_id"], "Please study this.")
+            self.room.route_tab_replies(self.fake, self.st, CFG, self.st.local_replies_waiting(), False)
+            self.assertIn("agent-mail reply 1", send.call_args.kwargs["input"])
+            self.assertIn("agent-mail researcher-state -- " + self.sess["tag"], send.call_args.kwargs["input"])
+            self.assertIn("Please study this.", send.call_args.kwargs["input"])
+            self.toggle(sent, "off")
+            self.answer(sent["thread_id"], "Approve v2", key=KEY + "new")
+            self.room.route_tab_replies(self.fake, self.st, CFG, self.st.local_replies_waiting(), False)
+            self.assertIn("revision 2", send.call_args.kwargs["input"])
+            self.assertIn("agent-mail reply 2", send.call_args.kwargs["input"])
+            self.assertIn("Approve v2", send.call_args.kwargs["input"])
+        self.assertEqual([r["action"] for r in self.st.list_inbound()], ["delivered", "delivered"])
+
+    def test_state_lookup_and_delivery_follow_a_rehomed_agent(self):
+        sent = self.agent_mail()
+        self.toggle(sent, "on")
+        moved = "00000000-0000-4000-8000-000000000001"
+        self.assertEqual(self.st.rehome("claude", SID, "codex", moved, origin_host=HOST), 1)
+        self.assertEqual(self.toggle(sent, "on")["thread"]["researcher"]["tag"], self.sess["tag"])
+        code, out, err = self.main(["researcher-state", "--", self.sess["tag"]])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), {"on": True, "revision": 2, "applied": False})
+        # This only substitutes the external agent-send executable. The routing lookup still follows the old tag.
+        with mock.patch.object(deliver.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout="sent", stderr="")) as send, mock.patch.object(self.room.time, "sleep"):
+            self.room.between_polls(self.fake, self.st, CFG, 1, False)
+        self.assertEqual(send.call_args.args[0][-1], moved)
+        self.assertIn("$researcher:researcher", send.call_args.kwargs["input"])
+
+    def test_only_the_exact_conversation_can_acknowledge_a_current_revision(self):
+        sent = self.agent_mail()
+        tag = self.sess["tag"]
+        self.toggle(sent, "on")
+        # The daemon reads the installed fixture. Only agent-send is substituted.
+        with mock.patch.object(deliver.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout="sent", stderr="")):
+            self.room.researchermode.tick(self.st, CFG, time.time())
+        fingerprint = json.loads(self.st.researcher_mode(tag)["payload"])["fingerprint"]
+        args = ["researcher-state", "--applied", "1", "--payload", fingerprint, "--", tag]
+        code, _, err = self.main(args, env={"CLAUDE_CODE_SESSION_ID": "not-the-owner"})
+        self.assertEqual(code, 1)
+        self.assertIn("only the routed conversation", err)
+        code, out, err = self.main(args, env={"CLAUDE_CODE_SESSION_ID": SID})
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), {"on": True, "revision": 1, "applied": True})
+        self.assertEqual(self.listed()[sent["thread_id"]]["researcher"]["delivery"], "applied")
+        first = self.st.researcher_mode(tag)["applied_at"]
+        self.assertEqual(self.main(args, env={"CLAUDE_CODE_SESSION_ID": SID})[0], 0)
+        self.assertEqual(first, self.st.researcher_mode(tag)["applied_at"])
+        self.toggle(sent, "off")
+        code, _, err = self.main(args, env={"CLAUDE_CODE_SESSION_ID": SID})
+        self.assertEqual(code, 1)
+        self.assertIn("revision is no longer current", err)
+        self.assertIsNone(self.st.researcher_mode(tag)["applied_at"])
+        self.assertEqual(self.listed()[sent["thread_id"]]["researcher"]["delivery"], "pending")
+
+    def test_agent_cannot_toggle_as_owner(self):
+        sent = self.agent_mail()
+        code, _, err = self.main(["mailbox", "researcher", "--expect-tag", sent["tag"], "--", sent["thread_id"], "on"],
+                                 env={"CODEX_THREAD_ID": SID})
+        self.assertEqual(code, 2)
+        self.assertIn("refusing mailbox researcher", err)
+        self.assertIsNone(self.st.researcher_mode(self.sess["tag"]))
+
+    def test_an_on_acknowledgement_requires_a_verified_payload(self):
+        sent = self.agent_mail()
+        self.toggle(sent, "on")
+        args = ["researcher-state", "--applied", "1", "--", self.sess["tag"]]
+        code, _, err = self.main(args, env={"CLAUDE_CODE_SESSION_ID": SID})
+        self.assertEqual(code, 1)
+        self.assertIn("verified Researcher payload", err)
+        self.assertIsNone(self.st.researcher_mode(self.sess["tag"])["applied_at"])
+
+    def test_unavailable_installed_version_is_reported_without_sending_an_on_notice(self):
+        old = homes.researcher_install(self.homes.default, "claude", "0.4.0")
+        (old / "scripts/methods_review.py").unlink()
+        sent = self.agent_mail()
+        self.toggle(sent, "on")
+        # This is the external agent-send boundary. An incompatible plugin must never reach it.
+        with mock.patch.object(deliver.subprocess, "run") as send:
+            self.room.researchermode.tick(self.st, CFG, time.time())
+        send.assert_not_called()
+        item = self.listed()[sent["thread_id"]]["researcher"]
+        self.assertEqual(item["delivery"], "unavailable")
+        self.assertIn("installed version 0.4.0", item["delivery_detail"])
+        self.assertIn("Install or refresh the Researcher plugin", item["delivery_detail"])
+        mode = self.st.researcher_mode(self.sess["tag"])
+        self.assertIsNone(mode["payload"])
+
+        incomplete = homes.researcher_install(self.homes.default, "claude", "0.7.1")
+        (incomplete / "scripts/methods_review.py").unlink()
+        with mock.patch.object(deliver.subprocess, "run") as send:
+            self.room.researchermode.tick(self.st, CFG, mode["retry_at"])
+        send.assert_not_called()
+        item = self.listed()[sent["thread_id"]]["researcher"]
+        self.assertEqual(item["delivery"], "unavailable")
+        self.assertIn("missing or empty installed file scripts/methods_review.py", item["delivery_detail"])
+
+    def test_incompatible_python_holds_activation_and_requests_one_routed_blocker_report(self):
+        python = homes.temp_dir(self) / "python3"
+        python.write_text("#!/bin/sh\nexit 1\n")
+        python.chmod(0o700)
+        cfg = dict(CFG, researcher_python=[str(python)])
+        sent = self.agent_mail()
+        self.toggle(sent, "on")
+        # The failing interpreter really runs. Substitute agent-send, which would wake a live conversation.
+        with mock.patch.object(deliver.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout="sent", stderr="")) as send:
+            self.room.researchermode.tick(self.st, cfg, time.time())
+            mode = self.st.researcher_mode(self.sess["tag"])
+            self.assertEqual(mode["status"], "unavailable")
+            self.assertIsNone(mode["payload"])
+            cmd = send.call_args.args[0]
+            self.assertEqual(cmd[cmd.index("--offline") + 1], "fail")
+            notice = send.call_args.kwargs["input"]
+            self.assertIn("methods_review.py --help", notice)
+            self.assertIn("routed Agent Mail", notice)
+            self.assertNotIn("--applied", notice)
+            self.room.researchermode.tick(self.st, cfg, mode["retry_at"])
+            send.assert_called_once()
+
+    def test_acknowledgement_rechecks_the_interpreter_even_when_the_payload_files_are_unchanged(self):
+        python = homes.temp_dir(self) / "python3"
+        python.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        python.chmod(0o700)
+        settings = dict(CFG_FILE, researcher_python=[str(python)])
+        homes.config_file(self, settings)
+        sent = self.agent_mail()
+        tag = self.sess["tag"]
+        self.toggle(sent, "on")
+        # Agent-send is the external boundary. Both preflights run the installed helper through the interpreter.
+        with mock.patch.object(deliver.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout="sent", stderr="")):
+            self.room.researchermode.tick(self.st, dict(CFG, **settings), time.time())
+        payload = json.loads(self.st.researcher_mode(tag)["payload"])
+        self.assertEqual(payload["python"], str(python))
+        python.write_text("#!/bin/sh\nexit 1\n")
+        args = ["researcher-state", "--applied", "1", "--payload", payload["fingerprint"], "--", tag]
+        code, _, err = self.main(args, env={"CLAUDE_CODE_SESSION_ID": SID})
+        self.assertEqual(code, 1)
+        self.assertIn("methods_review.py --help", err)
+        self.assertEqual(self.listed()[sent["thread_id"]]["researcher"]["delivery"], "unavailable")
+        self.assertIsNone(self.st.researcher_mode(tag)["applied_at"])
+
+    def test_a_plugin_replaced_after_delivery_cannot_be_acknowledged_using_the_old_fingerprint(self):
+        sent = self.agent_mail()
+        tag = self.sess["tag"]
+        self.toggle(sent, "on")
+        def refresh_after_receiving(_cmd, **_kwargs):
+            fingerprint = json.loads(self.st.researcher_mode(tag)["payload"])["fingerprint"]
+            homes.researcher_install(self.homes.default, "claude", "0.7.1")
+            args = ["researcher-state", "--applied", "1", "--payload", fingerprint, "--", tag]
+            code, _, err = self.main(args, env={"CLAUDE_CODE_SESSION_ID": SID})
+            self.assertEqual(code, 1)
+            self.assertIn("installed files changed", err)
+            return mock.Mock(returncode=0, stdout="sent", stderr="")
+
+        # Agent-send can confirm transport after the conversation's verification already refused the payload.
+        with mock.patch.object(deliver.subprocess, "run", side_effect=refresh_after_receiving):
+            self.room.researchermode.tick(self.st, CFG, time.time())
+        self.assertEqual(self.listed()[sent["thread_id"]]["researcher"]["delivery"], "unavailable")
+
+    def test_researcher_on_preserves_the_fast_reminder_and_review_skip(self):
+        sent = self.agent_mail()
+        self.toggle(sent, "on")
+        self.st.start_fast(sent["thread_id"], self.sess["tag"], time.time(), 5)
+        self.answer(sent["thread_id"], "What is the question?")
+        # Both agent delivery and the reviewer model are external. Inbound routing and outbound review are real.
+        with mock.patch.object(deliver.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout="sent", stderr="")) as send:
+            self.room.route_tab_replies(self.fake, self.st, CFG, self.st.local_replies_waiting(), False)
+        self.assertIn("Agent Mail Researcher on", send.call_args.kwargs["input"])
+        self.assertIn("Fast mode", send.call_args.kwargs["input"])
+        with mock.patch.object(review, "ask_model", side_effect=AssertionError("Fast skips the reviewer model")) as model:
+            code, out, err = self.main(["reply", "1"], "Which control should I use?", {"CLAUDE_CODE_SESSION_ID": SID})
+            self.assertEqual(code, 0, err)
+            self.assertIn("fast mode: not reviewed", out)
+            model.assert_not_called()
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.st.latest_review(self.sess["tag"], "owner")["kind"], "fast")
+
+    def test_regular_request_with_review_disabled_can_be_matched_to_its_direct_reply(self):
+        homes.config_file(self, dict(CFG_FILE, review={"enabled": False}))
+        with mock.patch.object(review, "ask_model", side_effect=AssertionError("the review is disabled")) as model:
+            code, out, err = self.main(["send", "--to", "owner", "--subject", "Decide run-1 revision a1"],
+                                       "Approve, revise or stop.",
+                                       {"CLAUDE_CODE_SESSION_ID": SID})
+        self.assertEqual(code, 0, err)
+        model.assert_not_called()
+        self.assertIsNone(self.st.latest_review(self.sess["tag"], "owner"))
+        self.assertIn(" | thread t1 | ", out)
+        code, out, err = self.main(["researcher-request", "--", self.sess["tag"], "t1"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), {"thread_id": "t1", "message_id": "<g1@mail.gmail.com>"})
+        self.answer("t1", "Approve")
+        row, = self.st.local_replies_waiting()
+        self.assertEqual(row["in_reply_to"], "<g1@mail.gmail.com>")
+        code, out, err = self.main(["show", str(row["id"])])
+        self.assertEqual(code, 0, err)
+        self.assertIn("in_reply_to    <g1@mail.gmail.com>", out)
+
+    def test_an_empty_mail_is_never_sent_reviewed_or_not(self):
+        """A mail with nothing to read (no text, no image, no attachment) is refused before the review, so neither the
+        send after a held mail, which goes whatever the review says, nor one with --no-review, nor an unrouted one goes
+        out blank (an agent's probe, `send --subject x --body-file /dev/null`, would reach the owner as an empty card).
+        Text, an attachment alone, or HTML alone (whose text the plain part is made from) still goes."""
+        homes.config_file(self, dict(CFG_FILE, review={"enabled": False}))
+        empty = homes.temp_dir(self) / "empty.txt"
+        empty.write_text("")
+        for argv, stdin in ((["send", "--to", "owner", "--subject", "x", "--body-file", str(empty)], ""),
+                            (["send", "--to", "owner", "--subject", "x"], " \n\t\n"),
+                            (["send", "--to", "owner", "--subject", "x", "--no-review", "a probe"], ""),
+                            (["send", "--unrouted", "--to", "owner", "--subject", "x", "--body-file", str(empty)], "")):
+            with self.subTest(argv=argv, stdin=stdin):
+                code, out, err = self.main(argv, stdin, {"CLAUDE_CODE_SESSION_ID": SID})
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn("nothing to send: the mail is empty", err)
+        sent = self.agent_mail()
+        self.his_mail(sent["thread_id"])
+        inbound = self.st.con.execute("select max(id) from inbound").fetchone()[0]
+        code, out, err = self.main(["reply", str(inbound), "--body-file", str(empty)], "", {"CLAUDE_CODE_SESSION_ID": SID})
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("nothing to send: the mail is empty", err)
+        self.assertEqual(len(self.sent), 1)                     # only the one agent_mail sent
+        csv, html = homes.temp_dir(self) / "runs.csv", homes.temp_dir(self) / "only.html"
+        csv.write_text("run,loss\nr1,1.9\n")
+        html.write_text("<p>The run finished.</p>")
+        for argv in (["send", "--to", "owner", "--subject", "runs", "--body-file", str(empty), "--attach", str(csv)],
+                     ["send", "--to", "owner", "--subject", "done", "--html", str(html)]):
+            with self.subTest(argv=argv):
+                code, _, err = self.main(argv, "", {"CLAUDE_CODE_SESSION_ID": SID})
+                self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.sent), 3)                     # the attachment alone and the HTML alone went
+
+    def test_mail_tab_only_request_gives_the_same_parent_evidence_without_gmail(self):
+        homes.config_file(self, dict(CFG_FILE, mailbox={"owner_delivery": "local"}, review={"enabled": False}))
+        code, _, err = self.main(["send", "--to", "owner", "--subject", "Decide run-1 revision a1"],
+                                 "Approve, revise or stop.", {"CLAUDE_CODE_SESSION_ID": SID})
+        self.assertEqual(code, 0, err)
+        request, = self.st.list_sent()
+        self.assertIsNone(request["gmail_id"])
+        code, out, err = self.main(["researcher-request", "--", self.sess["tag"], request["thread_id"]])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["message_id"], request["message_id"])
+        self.answer(request["thread_id"], "Stop")
+        reply, = self.st.local_replies_waiting()
+        self.assertEqual(reply["in_reply_to"], request["message_id"])
+        self.fake.service.assert_not_called()
+
+    def test_request_lookup_rejects_a_thread_with_several_outgoing_messages(self):
+        request = self.agent_mail("Decide run-1 revision a1")
+        self.agent_mail("Follow-up", inb=self.his_mail(request["thread_id"]))
+        code, out, err = self.main(["researcher-request", "--", self.sess["tag"], request["thread_id"]])
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("expected one agent mail", err)
+
+    def test_gmail_records_a_direct_parent_separately_from_references_used_for_routing(self):
+        request = self.agent_mail("Decide run-1 revision a1")
+        cases = [
+            ([("In-Reply-To", request["message_id"])], request["message_id"]),
+            ([("References", request["message_id"])], None),
+            ([("In-Reply-To", request["message_id"] + " <other@test>")], None),
+            ([("In-Reply-To", "<other@test>"), ("In-Reply-To", request["message_id"])], None),
+        ]
+        # Mock agent-send and Gmail, keeping both ingress and stored routing evidence real.
+        with mock.patch.object(deliver.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout="sent", stderr="")):
+            for n, (headers, expected) in enumerate(cases):
+                with self.subTest(headers=headers):
+                    self.message(self.sess, headers=headers, text="Approve")
+                    self.fake.get_full.return_value["threadId"] = request["thread_id"]
+                    gid = "in-%d" % n
+                    self.room.process(self.fake, self.st, CFG, gid, False)
+                    row = self.st.inbound_by_gmail_id(gid)
+                    self.assertEqual((row["matched_tag"], row["action"]), (self.sess["tag"], "delivered"))
+                    self.assertEqual(row["in_reply_to"], expected)
+
+
 class Transmit(Mailbox):
+    def test_store_requeues_an_earlier_on_binding_without_a_runtime_check(self):
+        path = homes.temp_dir(self) / "old.sqlite"
+        with sqlite3.connect(path) as con:
+            con.execute("create table researcher_modes(tag text primary key, enabled integer, revision integer, "
+                        "status text, detail text, retry_at real, applied_at real, payload text)")
+            con.execute("insert into researcher_modes values(?, 1, 7, 'accepted', null, null, 1, ?)",
+                        ("tag123", json.dumps({"root": "/old/workflow", "version": "0.7.0", "fingerprint": "old"})))
+        migrated = Store(path)
+        self.addCleanup(migrated.con.close)
+        mode = migrated.researcher_mode("tag123")
+        self.assertEqual((mode["enabled"], mode["revision"], mode["status"]), (1, 8, "pending"))
+        self.assertIsNone(mode["payload"])
+        self.assertIsNone(mode["applied_at"])
+
     def test_each_mail_is_kept_before_it_is_sent_and_its_row_says_what_it_was(self):
         attach = homes.temp_dir(self) / "results.csv"
         attach.write_text("a,b\n1,2\n")
@@ -154,7 +622,8 @@ class Transmit(Mailbox):
         body.write_text("Daily report.")
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, SSH_CONNECTION=""):
             self.am.do_send(self.ctx, argparse.Namespace(to="owner", cc=None, subject="report", unrouted=True,
-                                                         body_file=str(body), html=None, image=None, attach=None))
+                                                         body_file=str(body), html=None, image=None, attach=None,
+                                                         alert=None))
         unrouted = self.st.con.execute("select * from sent order by id desc limit 1").fetchone()
         self.assertEqual((unrouted["tag"], messages.load(unrouted["eml"])), ("", self.raws[1]))
 
@@ -200,7 +669,7 @@ class References(Mailbox):
     def test_an_agents_answer_to_a_tab_reply_names_the_agent_mail_gmail_knows(self):
         first = self.agent_mail()
         inb = self.st.inbound(int(self.answer(first["thread_id"])["key"][1:]))
-        outbound.reply_mail(self.ctx, self.sess, inb, outbound.Mail("Done.", None, [], []), "test", None)
+        outbound.reply_mail(self.ctx, self.sess, inb, outbound.Mail("Done.", None, [], []), "test", None, None)
         msg, thread = self.sent[-1]
         self.assertEqual(thread, first["thread_id"])
         self.assertEqual(msg["In-Reply-To"], routing.local_message_id(KEY))
@@ -210,7 +679,7 @@ class References(Mailbox):
     def test_an_answer_under_a_new_subject_to_a_tab_reply_has_no_gmail_link(self):
         first = self.agent_mail()
         inb = self.st.inbound(int(self.answer(first["thread_id"])["key"][1:]))
-        outbound.reply_mail(self.ctx, self.sess, inb, outbound.Mail("Done.", None, [], []), "test", "New")
+        outbound.reply_mail(self.ctx, self.sess, inb, outbound.Mail("Done.", None, [], []), "test", "New", None)
         text = self.sent[-1][0].get_body(("plain",)).get_content()
         self.assertTrue(text.endswith('Continues the thread "Run A results".\n'), text)
 
@@ -330,7 +799,8 @@ class Listing(Mailbox):
         self.assertEqual(got, {
             "id": t, "subject": "Run A results", "agents": ["mailtab (claude)", "orchestrator", "mailroom"],
             "snippet": " ".join(long.split())[:mailbox.SNIPPET_CHARS - 1].rstrip() + "…", "last": 170, "count": 4,
-            "unread": True, "box": "inbox", "snooze_until": None, "newest": 3, "attachments": True})
+            "unread": True, "box": "inbox", "snooze_until": None, "newest": 3, "attachments": True, "fast": None,
+            "researcher": None})
 
     def test_a_snippet_is_the_words_the_reader_sees_not_the_markdown(self):
         text = "**Merged into main:** [PR #70](https://github.com/o/r/pull/70)\n\n- `agent-mail` fixed\n- one more"
@@ -428,20 +898,41 @@ class Answer(Mailbox):
         self.assertEqual(self.st.con.execute("select count(*) from inbound").fetchone()[0], 1)
 
     def test_answers_that_are_refused(self):
+        """A reply the owner can edit to pass is refused with ANSWER_REFUSED, which the board reads as "the draft can be
+        edited and sent again"; every other refusal keeps its own code. Nothing is recorded."""
         first = self.agent_mail()
         his_only = self.his_mail("t-his")["thread_id"]
         self.answer(first["thread_id"], key="u" * 16)
-        cases = [(first["thread_id"], "x", "short", "--key is 16 to 64"), ("nope", "x", KEY, "not in the mailbox"),
-                 (his_only, "x", KEY, "holds no agent mail"), (first["thread_id"], " \n", KEY, "the reply is empty"),
-                 (first["thread_id"], "x" * 20001, KEY, "the most is 20000"),
-                 (his_only, "x", "u" * 16, "answered thread %s, not" % first["thread_id"])]
-        for thread, text, key, said in cases:
-            with self.subTest(said=said), self.assertRaisesRegex(outbound.MailError, said):
-                self.answer(thread, text, key)
+        refused = mailbox.ANSWER_REFUSED
+        cases = [(first["thread_id"], " \n", KEY, "the reply is empty", refused),
+                 (first["thread_id"], "x" * 20001, KEY, "the most is 20000", refused),
+                 (first["thread_id"], "x", "short", "--key is 16 to 64", 1),
+                 ("nope", "x", KEY, "not in the mailbox", 4),
+                 (his_only, "x", KEY, "holds no agent mail", 1),
+                 (his_only, "x", "u" * 16, "answered thread %s, not" % first["thread_id"], 1)]
+        for thread, text, key, said, exit_code in cases:
+            with self.subTest(said=said):
+                code, out, err = self.main(["mailbox", "answer", thread, "--key", key], stdin=text)
+                self.assertEqual((code, out), (exit_code, ""))
+                self.assertIn(said, err)
         for var in cli.AGENT_ENV:
             code, out, err = self.main(["mailbox", "answer", first["thread_id"], "--key", KEY], "hi", env={var: "1"})
             self.assertEqual((code, out), (2, ""), var)
             self.assertIn("refusing mailbox answer inside an agent session", err)
+        with no_agent_env(), open(os.devnull) as nothing, mock.patch("sys.stdin", nothing), \
+                contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as stop:
+            self.am.main(["mailbox", "answer", first["thread_id"], "--key", KEY])    # nothing piped in
+        self.assertEqual(stop.exception.code, 1)
+        self.assertIn("no reply: pipe its text in", err.getvalue())
+        self.assertIsNone(self.st.inbound_by_gmail_id("mailbox:" + KEY))
+
+    def test_a_config_with_no_owner_address_is_an_error_not_a_refusal(self):
+        """No edit of the draft fixes a setup error, so it exits 1, not ANSWER_REFUSED; and it is named before the
+        thread is looked for, since with no owner address no thread is in the mailbox."""
+        first = self.agent_mail()
+        with self.assertRaisesRegex(outbound.MailError, "config has no owner address") as stop:
+            mailbox.answer(self.st, dict(CFG, alert_to=None, allowlist=[]), first["thread_id"], KEY, "Ship it.", [])
+        self.assertEqual(stop.exception.exit_code, 1)
         self.assertIsNone(self.st.inbound_by_gmail_id("mailbox:" + KEY))
 
 
@@ -499,16 +990,19 @@ class AnswerFiles(Mailbox):
         t = self.agent_mail()["thread_id"]
         homes.patch(self, mailbox, "MAX_ANSWER_FILE_BYTES", 10)
         one = {"name": "a.png", "data": b64(b"12345")}
-        cases = [([], "is not {\"text\""), ({"files": [one]}, "is not {\"text\""),
-                 ({"text": "x", "files": one}, "is not {\"text\""), ({"text": "x", "files": [{"name": "a"}]}, "is not"),
-                 ({"text": "x", "files": [{"name": "a.png", "data": "not base64!"}]}, "file 'a.png': its data is not base64"),
-                 ({"text": "x", "files": [one] * 21}, "the reply has 21 files; the most is 20"),
-                 ({"text": "x", "files": [one, one, one]}, "the reply's files are 15 B; the most is 10 B"),
-                 ({"text": " ", "files": []}, "the reply is empty")]
-        for payload, said in cases:
+        refused = mailbox.ANSWER_REFUSED                                   # the owner can edit these to pass
+        cases = [([], "is not {\"text\"", 1), ({"files": [one]}, "is not {\"text\"", 1),
+                 ({"text": "x", "files": one}, "is not {\"text\"", 1),
+                 ({"text": "x", "files": [{"name": "a"}]}, "is not", 1),
+                 ({"text": "x", "files": [{"name": "a.png", "data": "not base64!"}]},
+                  "file 'a.png': its data is not base64", 1),
+                 ({"text": "x", "files": [one] * 21}, "the reply has 21 files; the most is 20", refused),
+                 ({"text": "x", "files": [one, one, one]}, "the reply's files are 15 B; the most is 10 B", refused),
+                 ({"text": " ", "files": []}, "the reply is empty", refused)]
+        for payload, said, exit_code in cases:
             with self.subTest(said=said):
                 code, got, err = self.answered(t, payload)
-                self.assertEqual((code, got), (1, None))
+                self.assertEqual((code, got), (exit_code, None))
                 self.assertIn(said, err)
         code, _, err = self.main(["mailbox", "answer", t, "--key", KEY, "--json"], stdin="{not json")
         self.assertEqual(code, 1)
@@ -535,7 +1029,7 @@ class Widgets(Mailbox):
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, SSH_CONNECTION=""):
             self.am.do_send(self.ctx, argparse.Namespace(to="owner", cc=None, subject="pick", unrouted=True,
                                                          body_file=self.body(text), html=html, image=list(images),
-                                                         attach=None))
+                                                         attach=None, alert=None))
         return self.st.con.execute("select * from sent order by id desc limit 1").fetchone()
 
     def blocks(self):
@@ -603,7 +1097,7 @@ class Widgets(Mailbox):
 
 
 class Show(Mailbox):
-    PNG = b"\x89PNG\r\n\x1a\n" + b"plot" * 8
+    PNG = pictures.png(1200, 700)
 
     def test_a_thread_s_messages_and_its_page_open_at_the_unread_and_the_last(self):
         old = self.agent_mail(subject="Run A results", text="Before the store.", at=100)
@@ -644,6 +1138,19 @@ class Show(Mailbox):
         code, out, err = self.main(["mailbox", "part", "s2", str(attachment["index"])])
         self.assertEqual(json.loads(out), {"name": "results.csv", "type": "text/csv",
                                            "data": base64.b64encode(b"a,b\n1,2\n").decode()})
+
+    def test_a_bare_address_in_a_plain_text_mail_is_a_link_on_its_page(self):
+        body = homes.temp_dir(self) / "body.txt"
+        body.write_text("The page: https://claude.ai/artifact/abc-123?x=1&y=2.\n")
+        code, out, err = self.main(["send", "--unrouted", "--to", "owner", "--subject", "Artifact", "--body-file",
+                                    str(body)], env={"SSH_CONNECTION": ""})
+        self.assertEqual((code, err), (0, ""))
+        thread = self.st.con.execute("select thread_id from sent order by id desc limit 1").fetchone()["thread_id"]
+        code, out, err = self.main(["mailbox", "show", thread])
+        self.assertEqual((code, err), (0, ""))
+        url = "https://claude.ai/artifact/abc-123?x=1&amp;y=2"
+        self.assertIn('<p>The page: <a href="%s" style="color: #0969da;" rel="noreferrer noopener">%s</a>.</p>'
+                      % (url, url), json.loads(out)["document"])
 
     def test_what_show_and_part_refuse(self):
         sent = self.agent_mail()
@@ -757,6 +1264,77 @@ class TabReplies(Mailbox):
         self.assertEqual(self.st.inbound(row["id"])["action"], "delivered")
         self.fake.modify.assert_not_called()
 
+    def between_polls(self, seconds):
+        """(the log, the seconds slept, and the seconds slept before each delivery) of the daemon's wait of `seconds`
+        before its next poll, deliver.deliver_session standing in for agent-send."""
+        slept, delivered = [], []
+
+        def sent(*args, **kwargs):
+            delivered.append(len(slept))
+            return 0, "sent"
+        with mock.patch.object(self.room.time, "sleep", side_effect=slept.append), \
+                mock.patch.object(deliver, "deliver_session", side_effect=sent), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.room.between_polls(self.fake, self.st, CFG, seconds, False)
+        return out.getvalue(), len(slept), delivered
+
+    def local_mail(self):
+        """An agent mail to the owner kept for the Mail tab alone (config mailbox.owner_delivery "local"): its thread is
+        one Gmail holds no mail of. Returns its sent row."""
+        self.ctx = outbound.Context(dict(CFG, mailbox={"owner_delivery": "local"}))
+        return self.agent_mail()
+
+    def test_a_tab_reply_is_routed_within_a_second_without_asking_gmail(self):
+        first = self.local_mail()
+        self.assertEqual(self.between_polls(30)[1:], (30, []))   # nothing waits
+        row = self.st.inbound(int(self.answer(first["thread_id"], "Ship it.")["key"][1:]))
+        log, slept, delivered = self.between_polls(30)
+        self.assertEqual((slept, delivered), (30, [1]))
+        self.assertEqual(self.st.inbound(row["id"])["action"], "delivered")
+        self.assertIn("tab    #%d from %s" % (row["id"], OWNER), log)
+        self.fake.history_since.assert_not_called()
+        self.fake.thread_messages.assert_not_called()
+
+    def test_while_gmail_fails_a_tab_reply_is_routed_all_the_same(self):
+        first = self.local_mail()
+        row = self.st.inbound(int(self.answer(first["thread_id"])["key"][1:]))
+        self.fake.history_since.side_effect = OSError("Gmail cannot be reached")
+        self.st.set_meta("history_id", "before")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertRaises(OSError, self.room.poll, self.fake, self.st, CFG, False)   # the poll before fails
+        self.assertEqual(self.between_polls(5)[2], [1])
+        self.assertEqual(self.st.inbound(row["id"])["action"], "delivered")
+
+    def test_a_reply_in_a_thread_gmail_holds_waits_for_the_poll(self):
+        """Its route to the orchestrator, for a session gone, would read the thread from Gmail."""
+        first = self.agent_mail()   # sent through Gmail (owner_delivery "gmail"), so Gmail holds the thread
+        row = self.st.inbound(int(self.answer(first["thread_id"])["key"][1:]))
+        self.assertEqual(self.between_polls(30)[2], [])
+        self.assertEqual(self.st.inbound(row["id"])["action"], "local")
+        with mock.patch.object(deliver, "deliver_session", return_value=(0, "sent")):
+            self.poll()
+        self.assertEqual(self.st.inbound(row["id"])["action"], "delivered")
+
+    def failing_once(self, what, then):
+        """between_polls(2) with the store's method `what` raising "database is locked" once, then giving then: (the
+        log, the seconds slept, the seconds slept before each delivery)."""
+        with mock.patch.object(self.st, what, side_effect=[sqlite3.OperationalError("database is locked"), then]):
+            return self.between_polls(2)
+
+    def test_a_store_that_cannot_be_read_is_logged_and_read_again_a_second_later(self):
+        said = "tab replies not routed between polls: OperationalError: database is locked; tried again in a second"
+        first = self.local_mail()
+        row = self.st.inbound(int(self.answer(first["thread_id"])["key"][1:]))
+        log, slept, delivered = self.failing_once("local_replies_waiting", self.st.local_replies_waiting())
+        self.assertEqual((slept, delivered), (2, [2]))
+        self.assertIn(said, log)
+        self.assertEqual(self.st.inbound(row["id"])["action"], "delivered")
+        row = self.st.inbound(int(self.answer(first["thread_id"], key="q" * 20)["key"][1:]))   # a second reply
+        log, slept, delivered = self.failing_once("thread_in_gmail", False)
+        self.assertEqual((slept, delivered), (2, [2]))
+        self.assertIn(said, log)
+        self.assertEqual(self.st.inbound(row["id"])["action"], "delivered")
+
     def test_a_stopping_daemon_leaves_tab_replies_waiting(self):
         first = self.agent_mail()
         row = self.st.inbound(int(self.answer(first["thread_id"])["key"][1:]))
@@ -805,7 +1383,8 @@ class TabReplyFiles(TabReplies):
         """The lines a reply's files add to its text when they are in folder."""
         d = folder / ("i%d" % row["id"])
         return ("See the plot.\n\nAlex attached 2 files, saved on this machine; open them with your file or image "
-                "tools:\n- %s (image/png, 1 KB)\n- %s (text/plain, 4 B)" % (d / "plot.png", d / "notes.txt"))
+                "tools:\n- %s (image/png, %s)\n- %s (text/plain, 4 B)" % (d / "plot.png", mailview.size(len(PNG)),
+                                                                        d / "notes.txt"))
 
     def test_on_this_machine_the_files_are_beside_the_session_and_named_in_its_text(self):
         row = self.reply_with_files()
@@ -975,7 +1554,7 @@ class GroupTabReply(GroupBase):
         self.st.set_meta("history_id", "before")
         with contextlib.redirect_stdout(io.StringIO()):
             self.room.poll(self.room.gmail, self.st, self.cfg, False)
-        post, = json.loads(self.run_(ALEX, "posts", group=gid, json=True))
+        post, = json.loads(self.run_(OWNER_ACTOR, "posts", group=gid, json=True))
         self.assertEqual((post["id"], post["from_agent"], post["text"]),
                          (groupmail.post_id(routing.local_gmail_id(KEY)), None, "Ship it."))
         self.assertEqual(sorted(self.names_delivered()), ["alice", "bob"])
@@ -985,8 +1564,10 @@ class GroupTabReply(GroupBase):
     def test_a_group_takes_no_files(self):
         self.group(A, "Release", "bob")
         groupmail.announce(self.room.gmail, self.st, self.cfg)
-        with no_agent_env(), self.assertRaisesRegex(outbound.MailError, "goes to group 'Release', which takes text only"):
+        said = "goes to group 'Release', which takes text only"
+        with no_agent_env(), self.assertRaisesRegex(outbound.MailError, said) as refused:
             mailbox.answer(self.st, self.cfg, "t1", KEY, "Ship it.", [("plot.png", PNG)])
+        self.assertEqual(refused.exception.exit_code, mailbox.ANSWER_REFUSED)
         self.assertIsNone(self.st.inbound_by_gmail_id(routing.local_gmail_id(KEY)))
 
 

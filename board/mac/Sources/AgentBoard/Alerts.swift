@@ -2,17 +2,19 @@ import AppKit
 import UserNotifications
 
 /// One notification: a thing shown in red on the board, whose `key` stays the same while it stays red, or a meeting
-/// about to start (Meetings.swift), whose notification carries the meeting's `link`.
+/// about to start (Meetings.swift), whose notification carries the meeting's `link`. A `once` item notifies at most
+/// once for its key, red again or not: its key names the occasion (the desktop's boot, for its locked keyring).
 struct RedItem: Equatable {
     var key: String
     var title: String
     var body: String
     var agent: String?
     var link: AlertLink? = nil
+    var once = false
 }
 
 /// What a click on a notification opens instead of the board: a meeting's link, in the Chrome profile signed in to
-/// `account` (BoardModel.openMeeting).
+/// `account` (BoardModel.openMeeting). A security alert's notification opens its thread instead (SecurityAlerts).
 struct AlertLink: Equatable {
     var url: String
     var account: String
@@ -20,8 +22,8 @@ struct AlertLink: Equatable {
 
 /// What the board shows in red right now, by the same rules the views colour by: a blocked tile, a stranded reply,
 /// a plan window or Codex credits nearly out (UsageLevel), a Claude login signed in to another login's account
-/// (SharedLogin), security updates on the desktop, and the link to the desktop down (after `linkGrace`, so a
-/// reconnect after sleep is not news).
+/// (SharedLogin), security updates on the desktop, Chrome's keyring there locked (once a boot), and the link to the
+/// desktop down (after `linkGrace`, so a reconnect after sleep is not news).
 enum RedRules {
     static let linkGrace: TimeInterval = 300
 
@@ -56,6 +58,12 @@ enum RedRules {
             out.append(RedItem(key: "security", title: "Desktop: \(s) security update\(s == 1 ? "" : "s")",
                                body: snapshot?.desktop?.summary ?? "", agent: nil))
         }
+        if let k = snapshot?.keyring, KeyringMark(k) == .locked {
+            out.append(RedItem(key: "keyring:" + (k.bootId ?? ""), title: KeyringMark.locked.text,
+                               body: "\(KeyringNames.name("default", in: k.collections)) on the desktop is locked, so "
+                                   + "Chrome there waits at its password dialog. Click the board's lock mark to unlock "
+                                   + "it.", agent: nil, once: true))
+        }
         if link != .live && downFor >= linkGrace {
             var why = ""
             if case .down(let w) = link { why = w }
@@ -81,24 +89,34 @@ enum SharedLogin {
 }
 
 /// A macOS notification when anything on the board turns red. Each red thing notifies once; it notifies again only
-/// after it has stopped being red. What has been notified is saved, so a relaunch doesn't repeat it.
+/// after it has stopped being red, except a `once` item, which never does. What has been notified is saved, so a
+/// relaunch doesn't repeat it.
 @MainActor
 final class Alerts: NSObject, UNUserNotificationCenterDelegate {
     nonisolated static let savedKey = "redNotified"
+    nonisolated static let onceKey = "onceNotified"
+    nonisolated static let onceKept = 20                          // the newest `once` keys remembered
     nonisolated static let groupOver = 3                          // more new reds than this at once: one notification for all
 
     /// Open the board, selecting this agent (from a click on the notification).
     var onOpen: ((String?) -> Void)?
     /// Open a notification's link (from a click on a meeting's notification).
     var onLink: ((AlertLink) -> Void)?
+    /// Open a thread in the Mail tab (from a click on a security alert's notification, SecurityAlerts.notify).
+    var onThread: ((String) -> Void)?
     private(set) var red: Set<String>
+    private(set) var once: [String]
     private let save: ([String]) -> Void
+    private let saveOnce: ([String]) -> Void
     private let post: ([RedItem]) -> Void
 
     init(saved: [String] = UserDefaults.standard.stringArray(forKey: Alerts.savedKey) ?? [],
-         save: (([String]) -> Void)? = nil, post: (([RedItem]) -> Void)? = nil) {
+         once: [String] = UserDefaults.standard.stringArray(forKey: Alerts.onceKey) ?? [],
+         save: (([String]) -> Void)? = nil, saveOnce: (([String]) -> Void)? = nil, post: (([RedItem]) -> Void)? = nil) {
         red = Set(saved)
+        self.once = once
         self.save = save ?? { UserDefaults.standard.set($0, forKey: Alerts.savedKey) }
+        self.saveOnce = saveOnce ?? { UserDefaults.standard.set($0, forKey: Alerts.onceKey) }
         self.post = post ?? Alerts.notify
         super.init()
     }
@@ -121,10 +139,15 @@ final class Alerts: NSObject, UNUserNotificationCenterDelegate {
     @discardableResult
     func update(_ items: [RedItem]) -> [RedItem] {
         let keys = Set(items.map { $0.key })
-        let fresh = items.filter { !red.contains($0.key) }
+        let fresh = items.filter { !red.contains($0.key) && !($0.once && once.contains($0.key)) }
         if keys != red {
             red = keys
             save(keys.sorted())
+        }
+        let done = fresh.filter { $0.once }.map { $0.key }
+        if !done.isEmpty {
+            once = Array((once + done).suffix(Alerts.onceKept))
+            saveOnce(once)
         }
         if !fresh.isEmpty { post(fresh) }
         return fresh
@@ -160,7 +183,7 @@ final class Alerts: NSObject, UNUserNotificationCenterDelegate {
 
     /// Without notification permission: Notification Center through osascript, text passed as arguments (never
     /// put into the script).
-    nonisolated private static func fallback(_ item: RedItem) {
+    nonisolated static func fallback(_ item: RedItem) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", "on run argv", "-e", "display notification (item 2 of argv) with title \"Agent Board\" subtitle (item 1 of argv)",
@@ -175,16 +198,36 @@ final class Alerts: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                             withCompletionHandler completionHandler: @escaping () -> Void) {
-        let info = response.notification.request.content.userInfo
-        let agent = info["agent"] as? String
-        var link: AlertLink?
-        if let url = info["link"] as? String, let account = info["account"] as? String { link = AlertLink(url: url, account: account) }
+        let target = Alerts.target(response.notification.request.content.userInfo)
         DispatchQueue.main.async { [weak self] in
             MainActor.assumeIsolated {
-                if let link = link, let onLink = self?.onLink { onLink(link) } else { self?.onOpen?(agent) }
+                switch target {
+                case .thread(let id):
+                    if let onThread = self?.onThread { onThread(id) } else { self?.onOpen?(nil) }
+                case .link(let link):
+                    if let onLink = self?.onLink { onLink(link) } else { self?.onOpen?(nil) }
+                case .board(let agent):
+                    self?.onOpen?(agent)
+                }
             }
         }
         completionHandler()
+    }
+
+    /// What a click on a notification with this userInfo opens: a security alert's thread ("thread", SecurityAlerts),
+    /// a meeting's link ("link" and "account"), else the board at its agent ("agent", or none).
+    enum Target: Equatable {
+        case thread(String)
+        case link(AlertLink)
+        case board(String?)
+    }
+
+    nonisolated static func target(_ info: [AnyHashable: Any]) -> Target {
+        if let thread = info["thread"] as? String { return .thread(thread) }
+        if let url = info["link"] as? String, let account = info["account"] as? String {
+            return .link(AlertLink(url: url, account: account))
+        }
+        return .board(info["agent"] as? String)
     }
 }
 
@@ -201,6 +244,7 @@ enum AlertsTest {
         func check(_ ok: Bool, _ what: String) { print((ok ? "ok    " : "FAIL  ") + what); if !ok { fails += 1 } }
         for i in snap.agents.indices { snap.agents[i].state = "idle"; snap.agents[i].stranded = false }
         snap.desktop = nil
+        snap.keyring = nil
         var posted: [[RedItem]] = []
         var saved: [String] = []
         let alerts = Alerts(saved: [], save: { saved = $0 }, post: { posted.append($0) })

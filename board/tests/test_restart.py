@@ -55,6 +55,76 @@ def board(registry):
 
 
 class CommandsTest(unittest.TestCase):
+    def gemini_mailroom(self):
+        """The mailroom's config with a Gemini login (a settings file and its one model) beside a plan login, and its
+        modules where the board reads them (stand-ins: the mailroom is another component, with its own tests)."""
+        cfg = {"usage": {"claude_accounts": {
+            "default": {"config_dir": None},
+            "gemini": {"config_dir": "/home/alex/.claude-gemini", "settings": "/home/alex/gemini-claude-settings.json",
+                       "model": "google/gemini-4-neon", "manual": True, "weekly_budget_usd": 500}}}}
+        return stand_ins.mailroom(accounts=stand_ins.MailroomAccounts, usage=stand_ins.MailroomUsage,
+                                  config=stand_ins.MailroomConfig(cfg))
+
+    def test_a_per_token_agent_resumes_with_its_logins_settings_and_model(self):
+        """Its line ends with the login's --settings and --model (accounts.launch_args), and the model it last ran is
+        not passed: a Claude model id on that login fails every request."""
+        saved = (sources.mailroom, dict(os.environ))
+        stand_ins.use(self)
+        sources.mailroom = self.gemini_mailroom()
+        os.environ.update(ANTHROPIC_BASE_URL="https://openrouter.ai/api", ANTHROPIC_MODEL="google/gemini-4-neon")
+        try:
+            line = restart.launch_line(agent(config_dir="/home/alex/.claude-gemini", account="gemini"),
+                                       inherited=["ANTHROPIC_DEFAULT_OPUS_MODEL", "LANG"])
+            plain = restart.launch_line(agent(config_dir=str(sources.DEFAULT_CLAUDE_HOME)))
+        finally:
+            sources.mailroom = saved[0]
+            os.environ.clear()
+            os.environ.update(saved[1])
+        self.assertTrue(line.endswith("--effort xhigh --name alpha --settings /home/alex/gemini-claude-settings.json "
+                                      "--model google/gemini-4-neon"), line)
+        self.assertNotIn("claude-opus-5-5", line)
+        self.assertIn(" CLAUDE_CONFIG_DIR=/home/alex/.claude-gemini /bin/claude --resume ", line)
+        # a plan login's agent keeps its own model, and takes nothing of a per-token agent's shell (Claude Code puts its
+        # settings' env in every command an agent runs), nor what the tmux server holds
+        self.assertIn("--model claude-opus-5-5 --effort xhigh --name alpha", plain)
+        self.assertNotIn("--settings", plain)
+        for words in (line, plain):
+            for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+                         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "CLAUDE_CODE_OAUTH_TOKEN"):
+                self.assertIn(" -u %s " % name, words)
+        self.assertIn(" -u ANTHROPIC_DEFAULT_OPUS_MODEL ", line)
+        self.assertNotIn(" -u LANG ", line)
+        self.assertEqual(line.count(" -u CLAUDECODE "), 1)              # relaunch.LEAKED's, once
+
+    def test_a_claude_the_board_starts_has_the_mailrooms_scrub(self):
+        """relaunch.claude_env: the mailroom's accounts.claude_env, then the login's folder; without a mailroom, the
+        environment it is given without CLAUDE_CONFIG_DIR."""
+        base = {"ANTHROPIC_BASE_URL": "https://openrouter.ai/api", "CLAUDE_CODE_SUBAGENT_MODEL": "google/gemini-4-neon",
+                "CLAUDE_CONFIG_DIR": "/home/alex/.claude-gemini", "LANG": "en_US.UTF-8"}
+        saved = sources.mailroom
+        stand_ins.use(self)
+        sources.mailroom = self.gemini_mailroom()
+        try:
+            self.assertEqual(relaunch.claude_env(None, base), {"LANG": "en_US.UTF-8"})
+            self.assertEqual(relaunch.claude_env("/home/alex/.claude-work", base),
+                             {"LANG": "en_US.UTF-8", "CLAUDE_CONFIG_DIR": "/home/alex/.claude-work"})
+            # a claude's options on each login are the mailroom's (accounts.login_flags), and so is its model
+            self.assertEqual(relaunch.login_flags("/home/alex/.claude-gemini", ["--model", "claude-opus-5-5", "-p"]),
+                             ["-p", "--settings", "/home/alex/gemini-claude-settings.json",
+                              "--model", "google/gemini-4-neon"])
+            self.assertEqual(relaunch.login_flags(None, ["--model", "claude-opus-5-5"]), ["--model", "claude-opus-5-5"])
+            self.assertEqual(relaunch.resume_model(None, "/home/alex/.claude-gemini", "claude-opus-5-5", "x"),
+                             "google/gemini-4-neon")
+            self.assertEqual(relaunch.resume_model("/home/alex/.claude-gemini", None, "google/gemini-4-neon",
+                                                   "claude-fable-5-2"), "claude-fable-5-2")    # leaving it: a new one's
+            self.assertEqual(relaunch.resume_model(None, None, "claude-opus-5-5", "x"), "claude-opus-5-5")
+            os.environ["AGENT_MAILROOM_DIR"] = "/nonexistent"           # no mailroom installed
+            self.assertEqual(relaunch.claude_env(None, base), {k: base[k] for k in base if k != "CLAUDE_CONFIG_DIR"})
+            self.assertEqual(relaunch.login_flags("/home/alex/.claude-gemini", ["-p"]), ["-p"])
+            self.assertEqual(relaunch.scrubbed_names(["X"]), [])
+        finally:
+            sources.mailroom = saved
+
     def test_show_cmd_unwraps_claude_tool_shells(self):
         bg = "/bin/bash -c source /x/snap.sh 2>/dev/null || true && eval 'for i in $(seq 1 9); do sleep 30; done'"
         fg = "/bin/bash -c source /x/snap.sh && eval 'grep -q '\"'\"'DONE'\"'\"' log' && pwd -P >| /tmp/cwd"
@@ -323,13 +393,16 @@ class RunTest(unittest.TestCase):
         def live(a):            # the live session registry: not running yet, then up once launched
             checks["n"] += 1
             return checks["n"] > 1
-        saved = (sources.find_bin, sources.is_live)
-        sources.find_bin = lambda name: str(d / name) if (d / name).exists() else None
+        saved = (sources.find_bin, sources.is_live, sources.mailroom)
+        # the mailroom's install is stand_ins.MAILROOM (its agent-spawn), whose modules stand in below
+        sources.find_bin = lambda name: str(d / name) if (d / name).exists() else (
+            stand_ins.find_bin(name) if name == "agent-spawn" else None)
         sources.is_live = live
+        sources.mailroom = stand_ins.mailroom()   # the keys lock the launch takes
         try:
             res = restart.restore_one(agent(cwd=str(d), choice="nudge"), "an update")
         finally:
-            sources.find_bin, sources.is_live = saved
+            sources.find_bin, sources.is_live, sources.mailroom = saved
         self.assertTrue(res["ok"])
         self.assertEqual(res["result"], "resumed; nudge FAILED (no such session)")
 
@@ -343,13 +416,14 @@ class RunTest(unittest.TestCase):
                                 'capture-pane) if [ -e answered ]; then echo "› Ask Codex"; else cat screen; fi;;\n'
                                 'esac\nexit 0\n')
         (d / "tmux").chmod(0o755)
-        saved = (sources.find_bin, sources.is_live)
+        saved = (sources.find_bin, sources.is_live, sources.mailroom)
         sources.find_bin = lambda name: str(d / name) if (d / name).exists() else None
         sources.is_live = lambda a: (d / "answered").exists()   # the live session registry: up once answered
+        sources.mailroom = stand_ins.mailroom()   # the keys lock the launch takes
         try:
             res = restart.restore_one(agent(cli="codex", cwd=str(d)), "")
         finally:
-            sources.find_bin, sources.is_live = saved
+            sources.find_bin, sources.is_live, sources.mailroom = saved
         self.assertTrue(res["ok"], res)
         self.assertEqual(res["result"], "resumed quietly; Codex: 1 hook is new or changed, left untrusted (review in "
                                         "Codex's /hooks)")

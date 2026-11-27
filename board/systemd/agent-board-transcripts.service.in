@@ -1,0 +1,12 @@
+[Unit]
+Description=agent-board: archive every agent transcript into the archive folder, with its catalog by board group
+
+[Service]
+Type=oneshot
+# PATH as a login shell has it: claude (the group guesses), ssh and rsync (the Mac's transcripts, when a Mac is set)
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
+ExecStart={{PYTHON}} {{KIT_DIR}}/board/bin/agent-board transcripts archive
+# in the background: below normal CPU priority, and disk reads and writes only when nothing else wants the disk
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h

@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import config, jsonfile, memwatch, registry, watch  # noqa: E402
+from agentmail import config, deliver, jsonfile, memwatch, registry, watch  # noqa: E402
 
 BIN = Path(__file__).resolve().parent
 # What memwatch.decide keeps. Deleting it when damaged only resets the repeat limits.
@@ -39,7 +39,8 @@ def sample():
 
 def act(actions, cfg):
     """Send each of memwatch.decide's actions: a ping through agent-send, the email through agent-mail. Logs each
-    with its exit code; returns the keys of those that went (exit 0), for memwatch.record."""
+    with its exit code; returns the keys of those that went (exit 0, or for a ping deliver.HELD: a Codex agent holds
+    it in its queue, where it arrives at its next turn), for memwatch.record."""
     done = []
     for a in actions:
         if a[0] == "ping":
@@ -54,11 +55,11 @@ def act(actions, cfg):
                 watch.log("email %r not sent: config has no alert_to, owner_email or allowlist" % a[1])
                 continue
             # agent-mail runs under this interpreter, the kit's venv, which holds the Google client libraries
-            r = subprocess.run([sys.executable, str(BIN / "agent-mail"), "send", "--unrouted", "--to", to,
-                                "--subject", "[agent-memwatch] " + a[1]], input=a[2],
+            r = subprocess.run([sys.executable, str(BIN / "agent-mail"), "send", "--unrouted", "--alert", "memory",
+                                "--to", to, "--subject", "[agent-memwatch] " + a[1]], input=a[2],
                                capture_output=True, text=True, timeout=120)
             watch.log("email %r: exit %s %s" % (a[1], r.returncode, (r.stdout + r.stderr).strip()[-160:]))
-        if r.returncode == 0:
+        if r.returncode == 0 or (a[0] == "ping" and r.returncode == deliver.HELD):
             done.append(a[-1])
     return done
 

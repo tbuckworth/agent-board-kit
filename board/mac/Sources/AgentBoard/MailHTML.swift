@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import WebKit
 
@@ -6,7 +7,9 @@ import WebKit
 // sanitized there), shown in a WKWebView that runs no page script, loads nothing from anywhere and never navigates.
 // Links leave it: web and mailto links open in the default browser or mail app, attachment links fetch the part over
 // the board's connection (mail_part) and open the file from a private temporary folder. The app's own scripts run in
-// it: the outline and paging below, and the agents' widgets (MailWidgets.swift) in their own content world.
+// it: the outline and paging below, the agents' widgets (MailWidgets.swift), code blocks' Copy buttons (MailCopy.swift),
+// agent mail's Forward buttons (MailForward.swift) and comments on selected text (MailComments.swift), each in a
+// content world of its own.
 
 /// A link the owner clicked in a thread document.
 enum MailLink: Equatable {
@@ -57,6 +60,9 @@ enum MailNavigation: Equatable {
 /// images, which the desktop inlines). Compiled once, on first use.
 @MainActor
 enum MailBlocker {
+    /// The thread document's Content-Security-Policy (agentmail/mailview.py's CSP), for the app's own pages: the
+    /// enlarged item's (MailEnlarge) and the self-tests'.
+    nonisolated static let policy = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; form-action 'none'"
     static let rules = """
     [{"trigger": {"url-filter": ".*"}, "action": {"type": "block"}},
      {"trigger": {"url-filter": "^data:"}, "action": {"type": "ignore-previous-rules"}}]
@@ -82,72 +88,125 @@ enum MailBlocker {
     }
 }
 
-/// The thread document in MailWeb's web view. A document that is the same as the one showing is not loaded again, so
-/// its scroll position and open messages stay. The message `current` (the one being read) is outlined, opened and
-/// brought to the top, once the document has loaded and whenever it changes; each new `page` scrolls a screen down or
-/// up. Its `widgets` are drawn once it has loaded. Files dropped on it go to `take`, for the reply.
+/// The thread document in `web`, a web view of MailWeb's: the tab's, or a popped-out thread's window's own. A document
+/// that is the same as the one showing is not loaded again, so its scroll position and open messages stay. The message
+/// `current` (the one being read) is outlined, opened and brought to the top, once the document has loaded and whenever
+/// it changes; each new `page` scrolls a screen down or up. Its `widgets` are drawn once it has loaded, showing the
+/// answers in its `draft`, and the text its comments quote is highlighted; both follow the draft, so the tab and a
+/// window showing the same thread show the same answers and highlights. Files dropped on it go to `take`, for the reply.
 struct MailDocument: NSViewRepresentable {
     let html: String
-    let thread: String                    // whose document it is: a choice is for this thread's reply
+    let thread: String                    // whose document it is: its Forward buttons forward this thread's mail
+    let agentMail: Set<String>            // the keys of the agents' mails in it: a comment quotes only these
     let widgets: [MailWidget]
+    let draft: Draft                      // the thread's reply: options picked and text commented on go into it
     let current: String?
     let page: MailPage?
     let zoom: CGFloat
+    let web: MailWebView                  // the web view it shows in, with its own loader
     let follow: (MailLink) -> Void        // a link was clicked
     let refuse: (String) -> Void          // the document can't be shown safely, and why
-    let choose: (String, String) -> Void  // an option was picked in thread (first): the reply's first line (second)
-    let problem: (String) -> Void         // a widget was not drawn, and why
+    let problem: (String) -> Void         // a widget was not drawn, a block not copied, a comment not taken, and why
     let take: (NSPasteboard) -> Bool      // files dropped on it: whether they were taken
+    let forward: MailDocumentLoader.Forward   // a Forward button was clicked
 
-    func makeCoordinator() -> MailDocumentLoader { MailWeb.loader }
-
-    func makeNSView(context: Context) -> MailWebView { MailWeb.view }
+    func makeNSView(context: Context) -> MailWebView { web }
 
     func updateNSView(_ web: MailWebView, context: Context) {
-        let loader = context.coordinator
+        let loader = web.loader
         loader.follow = follow
         loader.refuse = refuse
-        loader.choose = choose
         loader.problem = problem
+        loader.forward = forward
         web.take = take
         if web.pageZoom != zoom { web.pageZoom = zoom }
-        loader.show(html, thread: thread, widgets: widgets, current: current, in: web)
+        loader.show(html, thread: thread, agentMail: agentMail, widgets: widgets, draft: draft, current: current,
+                    in: web)
         loader.turn(page, in: web)
     }
 }
 
-/// The one web view thread documents show in, with its loader, made on first use and kept while the app runs. A new
-/// WKWebView starts a WebKit process, a third of a second or more before its first document shows, so the view is
-/// not made anew each time the tab comes back, and `warm` starts it when the tab appears, before a thread is opened.
+/// The web views thread documents show in. The tab's (`view`) is made on first use and kept while the app runs: a new
+/// WKWebView starts a WebKit process, a third of a second or more before its first document shows, so it is not made
+/// anew each time the tab comes back, and `warm` starts it when the tab appears, before a thread is opened. Each
+/// popped-out thread's window (MailWindows) has one of its own, from `make`, which goes with the window.
 @MainActor
 enum MailWeb {
-    static let loader = MailDocumentLoader()
-    static let view: MailWebView = {
+    static let view = make()
+    /// The tab's web view's loader.
+    static var loader: MailDocumentLoader { view.loader }
+    static let blank = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body></body></html>"
+    /// The smallest font a thread document is drawn in, whatever its mail asks (its CSS, or a <font size=> attribute):
+    /// no text is too small to read.
+    static let minimumFontSize: CGFloat = 9
+
+    /// A new web view with a loader of its own, locked down and with the app's scripts in their content worlds.
+    static func make() -> MailWebView {
+        let loader = MailDocumentLoader()
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = false
+        config.preferences.minimumFontSize = minimumFontSize
         config.websiteDataStore = .nonPersistent()
         if case .success(let source) = MailWidgets.script {      // when it is missing, drawing says so (MailDocumentLoader)
-            config.userContentController.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentEnd,
-                                                                    forMainFrameOnly: true, in: MailWidgets.world))
+            for script in [source, MailWidgets.enlarge] {
+                config.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentEnd,
+                                                                        forMainFrameOnly: true, in: MailWidgets.world))
+            }
         }
         config.userContentController.add(loader, contentWorld: MailWidgets.world, name: MailWidgets.handler)
-        let web = MailWebView(frame: .zero, configuration: config)
+        config.userContentController.addUserScript(WKUserScript(source: MailCopy.script, injectionTime: .atDocumentEnd,
+                                                                forMainFrameOnly: true, in: MailCopy.world))
+        config.userContentController.addScriptMessageHandler(loader, contentWorld: MailCopy.world, name: MailCopy.handler)
+        config.userContentController.addUserScript(WKUserScript(source: MailForward.script, injectionTime: .atDocumentEnd,
+                                                                forMainFrameOnly: true, in: MailForward.world))
+        config.userContentController.addScriptMessageHandler(loader, contentWorld: MailForward.world, name: MailForward.handler)
+        config.userContentController.addUserScript(WKUserScript(source: MailComments.script, injectionTime: .atDocumentEnd,
+                                                                forMainFrameOnly: true, in: MailComments.world))
+        config.userContentController.add(loader, contentWorld: MailComments.world, name: MailComments.handler)
+        let web = MailWebView(loader: loader, configuration: config)
+        web.comment = { [weak web] in if let web = web { web.loader.commentOnSelection(in: web) } }
         web.navigationDelegate = loader
         web.allowsBackForwardNavigationGestures = false
         web.setValue(false, forKey: "drawsBackground")      // the board's own background shows behind the document
         return web
-    }()
-    static let blank = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body></body></html>"
+    }
 
-    /// Start the web view's process with an empty page, unless it has had a document already.
+    /// Start the tab's web view's process with an empty page, unless it has had a document already.
     static func warm() {
-        if !loader.started { loader.show(blank, thread: "", widgets: [], current: nil, in: view) }
+        guard !loader.started else { return }
+        loader.show(blank, thread: "", agentMail: [], widgets: [], draft: nil, current: nil, in: view)
     }
 }
 
-/// The document's web view, which hands files dropped on it (Attachments) to `take` instead of opening them.
+/// The document's web view, which hands files dropped on it (Attachments) to `take` instead of opening them, and whose
+/// right-click menu starts with Comment… while the selection is text a comment can quote (MailComments). Its `loader`
+/// loads its documents and answers its scripts; the view keeps it.
 final class MailWebView: WKWebView {
+    let loader: MailDocumentLoader
     var take: ((NSPasteboard) -> Bool)?
+    /// Whether the selection is text of an agent's mail that a comment can quote, as the comments script last said.
+    var commentable = false
+    /// What Comment… does.
+    var comment: (() -> Void)?
+
+    init(loader: MailDocumentLoader, configuration: WKWebViewConfiguration) {
+        self.loader = loader
+        super.init(frame: .zero, configuration: configuration)
+    }
+
+    /// Never made from an archive.
+    required init?(coder: NSCoder) { nil }
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        guard commentable else { return }
+        let item = NSMenuItem(title: "Comment…", action: #selector(commentOnSelection(_:)), keyEquivalent: "")
+        item.target = self
+        menu.insertItem(item, at: 0)
+        menu.insertItem(.separator(), at: 1)
+    }
+
+    @objc func commentOnSelection(_ sender: Any?) { comment?() }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         Attachments.holds(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
@@ -165,16 +224,30 @@ final class MailWebView: WKWebView {
 
 /// Loads documents into one web view, decides every navigation in it (MailNavigation): a clicked link goes to
 /// `follow`, and runs the app's own scripts in it (the page runs none of its own): the outline on the message being
-/// read, paging, and the widgets, whose choices come back to `choose` (WKScriptMessageHandler).
+/// read, paging, the widgets, whose answers go into the thread's draft (WKScriptMessageHandler), the comments on
+/// selected text, which do too, the code blocks' Copy buttons, each answered with whether the pasteboard took the text,
+/// and agent mail's Forward buttons, each answered once its draft has opened or why not
+/// (WKScriptMessageHandlerWithReply). The cards and highlights follow the draft's answers and comments, so an × in
+/// the reply box or Discard clears them.
 @MainActor
-final class MailDocumentLoader: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+final class MailDocumentLoader: NSObject, WKNavigationDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
+    /// Forward agent mail (second) of thread (first), then call back with nil once its draft has opened, else why not.
+    typealias Forward = (String, String, @escaping @MainActor (String?) -> Void) -> Void
+
     var follow: (MailLink) -> Void = { _ in }
     var refuse: (String) -> Void = { _ in }
-    var choose: (String, String) -> Void = { _, _ in }
     var problem: (String) -> Void = { _ in }
+    /// Where a code block's Copy button puts its text: the general pasteboard (a test's own, or a refusal, in its test).
+    var copyText: (String) -> String? = { MailCopy.write($0, to: .general) }
+    /// What a Forward button asks for: MailModel.forward, which MailDocument sets (a test sets its own).
+    var forward: Forward = { _, _, done in done("the Mail tab has not wired its Forward buttons") }
     private var html: String?            // the document asked for last
     private var thread = ""              // whose it is
+    private var agentMail: Set<String> = []  // its agents' mails' keys
     private var widgets: [MailWidget] = []   // its widgets
+    private var navigation: WKNavigation?    // its load: only that one's end makes it ready
+    private var draft: Draft?            // its thread's reply
+    private var watching: [AnyCancellable] = []   // on the draft's answers and comments
     private(set) var ready = false       // it has loaded
     private var current: String?         // the message to outline, a key (MailLink.isKey, so safe in a script)
     private var marked: String?          // the message outlined in the document as it is
@@ -185,7 +258,8 @@ final class MailDocumentLoader: NSObject, WKNavigationDelegate, WKScriptMessageH
     /// Whether a document has been asked for.
     var started: Bool { html != nil }
 
-    func show(_ html: String, thread: String, widgets: [MailWidget], current: String?, in web: WKWebView) {
+    func show(_ html: String, thread: String, agentMail: Set<String>, widgets: [MailWidget], draft: Draft?,
+              current: String?, in web: WKWebView) {
         self.current = current.flatMap { MailLink.isKey($0) ? $0 : nil }
         guard html != self.html else {
             if ready { mark(in: web) }
@@ -193,9 +267,13 @@ final class MailDocumentLoader: NSObject, WKNavigationDelegate, WKScriptMessageH
         }
         self.html = html
         self.thread = thread
+        self.agentMail = agentMail
         self.widgets = widgets
+        navigation = nil
         ready = false
         marked = nil
+        follow(draft, in: web)
+        (web as? MailWebView)?.commentable = false
         MailBlocker.whenReady { [weak self, weak web] result in
             guard let self = self, let web = web, self.html == html else { return }
             switch result {
@@ -207,7 +285,7 @@ final class MailDocumentLoader: NSObject, WKNavigationDelegate, WKScriptMessageH
                     self.blocking = true
                 }
                 self.loading = true
-                web.loadHTMLString(html, baseURL: nil)
+                self.navigation = web.loadHTMLString(html, baseURL: nil)
             }
         }
     }
@@ -228,44 +306,146 @@ final class MailDocumentLoader: NSObject, WKNavigationDelegate, WKScriptMessageH
         }
     }
 
+    /// The document asked for last has loaded; an earlier one's load, ending late, is not it, so its scripts' posts
+    /// do not reach this thread's draft.
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let mine = self.navigation, navigation === mine else { return }
         ready = true
         mark(in: webView)
         draw(in: webView)
+        if let comments = draft?.comments, !comments.isEmpty { highlight(comments.map(CommentAnchor.init), in: webView) }
     }
 
-    /// Draw the document's widgets with widgets.js, in its content world. A widget it cannot draw keeps the plain
-    /// text the mailroom put in its place, and `problem` says why.
+    /// Keep the document's cards and highlights with `draft`'s answers and comments as they change (a comment's own
+    /// text aside, which the document does not show).
+    private func follow(_ draft: Draft?, in web: WKWebView) {
+        self.draft = draft
+        watching = []
+        guard let d = draft else { return }
+        watching = [
+            d.$picks.removeDuplicates().sink { [weak self, weak web] picks in
+                guard let self = self, let web = web, self.ready, !self.widgets.isEmpty else { return }
+                self.showPicks(picks, in: web)
+            },
+            d.$comments.map { $0.map(CommentAnchor.init) }.removeDuplicates().sink { [weak self, weak web] anchors in
+                guard let self = self, let web = web, self.ready else { return }
+                self.highlight(anchors, in: web)
+            },
+        ]
+    }
+
+    /// Run `source` in `world` with `arguments` (JSON text); when they cannot be made or the script fails, `problem`
+    /// says `failure` and why.
+    private func run(_ source: String, _ arguments: () throws -> [String: String], in web: WKWebView,
+                     world: WKContentWorld, failure: String) {
+        let args: [String: String]
+        do { args = try arguments() } catch {
+            return problem("\(failure): \(error.localizedDescription)")
+        }
+        web.callAsyncJavaScript(source, arguments: args, in: nil, in: world) { [weak self] result in
+            if case .failure(let error) = result { self?.problem("\(failure): \(error.localizedDescription)") }
+        }
+    }
+
+    /// Draw the document's widgets with widgets.js, in its content world, showing the draft's answers. A widget it
+    /// cannot draw keeps the plain text the mailroom put in its place, and `problem` says why.
     private func draw(in web: WKWebView) {
         guard !widgets.isEmpty else { return }
-        let json: String
-        do {
-            json = try MailWidgets.json(widgets)
-        } catch {
-            problem("The options and plots in this thread are shown as plain text: they could not be encoded (\(error.localizedDescription))")
-            return
-        }
+        let failure = "The options and plots in this thread are shown as plain text"
         switch MailWidgets.script {
         case .failure(let error):
-            problem("The options and plots in this thread are shown as plain text: \(error.localizedDescription)")
+            problem("\(failure): \(error.localizedDescription)")
         case .success:
-            web.callAsyncJavaScript(MailWidgets.draw, arguments: ["widgets": json], in: nil, in: MailWidgets.world) { [weak self] result in
-                if case .failure(let error) = result {
-                    self?.problem("The options and plots in this thread are shown as plain text: \(error.localizedDescription)")
-                }
+            let picks = draft?.picks ?? []
+            run(MailWidgets.draw, { ["widgets": try MailWidgets.json(self.widgets), "picks": try MailWidgets.json(picks: picks)] },
+                in: web, world: MailWidgets.world, failure: failure)
+        }
+    }
+
+    /// Show the answers `picks` in the document's cards, and none in the rest (widgets.js's mark).
+    private func showPicks(_ picks: [DraftPick], in web: WKWebView) {
+        run(MailWidgets.mark, { ["picks": try MailWidgets.json(picks: picks)] }, in: web, world: MailWidgets.world,
+            failure: "The options picked are not shown in the mail")
+    }
+
+    /// Highlight the text the comments `anchors` quote, in the comments script's world.
+    private func highlight(_ anchors: [CommentAnchor], in web: WKWebView) {
+        run(MailComments.draw, { ["comments": try MailComments.json(anchors)] }, in: web, world: MailComments.world,
+            failure: "The text commented on is not highlighted")
+    }
+
+    /// Comment… in the right-click menu: a comment on the selection, or `problem` says why there is none.
+    func commentOnSelection(in web: WKWebView) {
+        web.callAsyncJavaScript(MailComments.fromSelection, arguments: [:], in: nil,
+                                in: MailComments.world) { [weak self] result in
+            switch result {
+            case .success(let why as String): self?.problem("Not commented: " + why)
+            case .success: break
+            case .failure(let error): self?.problem("Not commented: \(error.localizedDescription)")
             }
         }
     }
 
-    /// A choice or a problem from widgets.js. Only the main frame's, in the widgets' world, and only a choice of a
-    /// reasonable length counts; it is for the thread whose document is loaded.
+    /// What the widgets' and the comments' scripts post, only the main frame's, in their own worlds, for the document
+    /// loaded: an answer (MailWidgets.answer) or a comment (MailComments.comment) for the draft, a plot, table or image
+    /// to open enlarged in a window of its own (MailEnlarge), a highlight clicked (its comment's field takes the
+    /// keyboard), whether the selection can be commented on, or a problem. One that does
+    /// not check out, or that a frozen draft does not take, is not taken, and `problem` says so; the cards then show
+    /// the draft's answers again.
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.frameInfo.isMainFrame, message.world == MailWidgets.world, ready,
-              let body = message.body as? [String: Any] else { return }
-        if let text = body["choice"] as? String, text.count <= MailWidgets.maxChoice, !thread.isEmpty {
-            choose(thread, text)
-        } else if let why = body["problem"] as? String {
-            problem("Shown as plain text: " + String(why.prefix(300)))
+        guard message.frameInfo.isMainFrame, ready, let body = message.body as? [String: Any] else { return }
+        if message.world == MailWidgets.world {
+            if let raw = body["pick"] {
+                guard let got = MailWidgets.answer(raw, of: widgets) else {
+                    return problem("An option picked was not taken: widgets.js posted an answer not understood")
+                }
+                if let d = draft, !d.pick(got.answer, comment: got.comment), let web = message.webView {
+                    problem("An option picked was not taken. " + Draft.frozenWhy)
+                    showPicks(d.picks, in: web)
+                }
+            } else if let item = body["enlarge"] as? [String: Any] {
+                if let why = MailEnlarge.open(item, widgets: widgets, problem: { [weak self] in self?.problem($0) }) {
+                    problem("Not enlarged: " + why)
+                }
+            } else if let why = body["problem"] as? String {
+                problem("Shown as plain text: " + String(why.prefix(300)))
+            }
+        } else if message.world == MailComments.world {
+            if let raw = body["comment"] {
+                let (got, why) = MailComments.comment(raw, of: agentMail)
+                if let c = got, let d = draft, !d.addComment(message: c.message, at: c.at, quote: c.quote) {
+                    problem("Not commented. " + Draft.frozenWhy)
+                }
+                if let w = why { problem("Not commented: " + w) }
+            } else if let id = body["focus"] as? String, let d = draft, d.comments.contains(where: { $0.id == id }) {
+                d.focus = id
+            } else if let on = body["selection"] as? Bool {
+                (message.webView as? MailWebView)?.commentable = on
+            } else if let why = body["problem"] as? String {
+                problem("Not commented: " + String(why.prefix(300)))
+            }
+        }
+    }
+
+    /// A click on a button of the app's own, only the main frame's, each in its own script's world, answering the
+    /// script with whether it was done, or why not. A code block's text from its Copy button (MailCopy) is put on the
+    /// pasteboard (copyText); a refusal is also said through `problem`. An agent mail's key from its Forward button
+    /// (MailForward) is forwarded from the thread loaded (`forward`), which says itself why it was not.
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
+                               replyHandler: @escaping (Any?, String?) -> Void) {
+        let body = message.body as? [String: Any]
+        guard message.frameInfo.isMainFrame, ready else { return replyHandler(nil, "not from this thread's document") }
+        if message.world == MailCopy.world, let text = body?["copy"] as? String {
+            if let why = MailCopy.copy(text, with: copyText) {
+                problem("Not copied: " + why)
+                return replyHandler(nil, why)
+            }
+            replyHandler(true, nil)
+        } else if message.world == MailForward.world, let key = body?["forward"] as? String, MailForward.forwards(key),
+                  !thread.isEmpty {
+            forward(thread, key) { why in replyHandler(why == nil ? true : nil, why) }
+        } else {
+            replyHandler(nil, "not a copy or a forward from this thread's document")
         }
     }
 

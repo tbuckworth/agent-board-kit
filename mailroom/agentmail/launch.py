@@ -8,7 +8,7 @@ import re
 import shlex
 import time
 
-from . import commands, config, jsonfile, memcap, procs, registry, reviewgate
+from . import accounts, commands, config, jsonfile, memcap, procs, registry, reviewgate
 
 BRIEF_DIR = config.HOME / ".local" / "state" / "agent-spawn"
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]   # the --effort levels Claude Code takes
@@ -117,39 +117,45 @@ def shell_line(config_dir, cmd, brief_path):
 
 
 def send_line(target, text):
-    """Type text into the tmux pane target (a pane id such as %17, or new_session's target) and press Enter.
-    Raises CommandError if tmux fails."""
-    commands.tmux("send-keys", "-t", target, "-l", text, check=True)
-    time.sleep(0.3)
-    commands.tmux("send-keys", "-t", target, "Enter", check=True)
+    """Type text into the tmux pane target (a pane id such as %17, or new_session's target) and press Enter, holding
+    the keys lock (commands.keys_lock) so no other keys land between them. Raises CommandError if tmux fails."""
+    with commands.keys_lock(True):
+        commands.tmux("send-keys", "-t", target, "-l", text, check=True)
+        time.sleep(0.3)
+        commands.tmux("send-keys", "-t", target, "Enter", check=True)
 
 
 def type_line(target, line, config_dir):
     """Type a shell_line into pane target (send_line), after giving the pane's tmux session this login's
     CLAUDE_CONFIG_DIR, or removing it (None), so a window opened there later, and every agent-mail or agent-send
-    the agent runs, see the same login. Raises CommandError if tmux fails."""
-    if config_dir:
-        commands.tmux("set-environment", "-t", target, "CLAUDE_CONFIG_DIR", config_dir, check=True)
-    else:
-        commands.tmux("set-environment", "-t", target, "-r", "CLAUDE_CONFIG_DIR", check=True)
-    send_line(target, line)
+    the agent runs, see the same login, and after C-u, which clears whatever the shell's line held (a stray key typed
+    while the agent was being stopped), all under the keys lock. Raises CommandError if tmux fails."""
+    with commands.keys_lock(True):
+        if config_dir:
+            commands.tmux("set-environment", "-t", target, "CLAUDE_CONFIG_DIR", config_dir, check=True)
+        else:
+            commands.tmux("set-environment", "-t", target, "-r", "CLAUDE_CONFIG_DIR", check=True)
+        commands.tmux("send-keys", "-t", target, "C-u", check=True)
+        send_line(target, line)
 
 
 # ------------------------------------------------------------------ Claude Code
-def claude_line(claude, sid, name, flags, config_dir, prompt, brief_path):
+def claude_line(claude, sid, name, flags, config_dir, prompt, brief_path, s=None):
     """The shell_line that starts claude for the login config_dir: `claude [--resume SID] [--name NAME] FLAGS
-    [PROMPT]`, or with brief_path, that file's text as its prompt."""
-    cmd = [claude] + (["--resume", sid] if sid else []) + (["--name", name] if name else []) + list(flags)
+    [PROMPT]`, or with brief_path, that file's text as its prompt. FLAGS are flags as that login takes them
+    (accounts.login_flags; s: usage.settings, None: config.json's): its settings file and its own model, if any."""
+    flags = accounts.login_flags(accounts.current_settings() if s is None else s, config_dir, flags)
+    cmd = [claude] + (["--resume", sid] if sid else []) + (["--name", name] if name else []) + flags
     return shell_line(config_dir, cmd + ([prompt] if prompt else []), brief_path)
 
 
-def start_claude(target, claude, name, config_dir, model, effort, brief_path):
+def start_claude(target, claude, name, config_dir, model, effort, brief_path, s=None):
     """Start a new Claude Code agent in pane target on the login config_dir: no permission prompts, model and
-    effort when given (None: the CLI's own), named NAME, with brief_path's text as its first prompt. Returns the
-    line typed. Raises CommandError if tmux fails."""
+    effort when given (None: the CLI's own; a login with its own model runs that, claude_line), named NAME, with
+    brief_path's text as its first prompt. Returns the line typed. Raises CommandError if tmux fails."""
     flags = ["--dangerously-skip-permissions"] + (["--model", model] if model else []) + \
         (["--effort", effort] if effort else [])
-    line = claude_line(claude, None, name, flags, config_dir, None, brief_path)
+    line = claude_line(claude, None, name, flags, config_dir, None, brief_path, s)
     type_line(target, line, config_dir)
     return line
 
@@ -169,21 +175,23 @@ def queue_codex(codex, thread_id, text):
 
 
 def codex_prompt_up(target, notes):
-    """Whether Codex's prompt shows in pane target. A start-up dialog means not yet, and is answered: Enter on the
-    update and trust dialogs (skip the update, trust the folder). The hook review gets the number of its "Continue
-    without trusting" choice, which picks it, or Enter when the highlight is already on it (should the number only
-    move the highlight). notes, a list, gets one line on the hook review: how many hooks were left off, or that it
-    offers no such choice and was left for the owner."""
+    """Whether Codex's prompt shows in pane target. A start-up dialog means not yet, and is answered under the keys
+    lock (commands.keys_lock): Enter on the update and trust dialogs (skip the update, trust the folder). The hook
+    review gets the number of its "Continue without trusting" choice, which picks it, or Enter when the highlight is
+    already on it (should the number only move the highlight). notes, a list, gets one line on the hook review: how
+    many hooks were left off, or that it offers no such choice and was left for the owner."""
     screen = commands.tmux("capture-pane", "-p", "-t", target, check=False).stdout
     if any(d in screen for d in CODEX_DIALOGS):
-        commands.tmux("send-keys", "-t", target, "Enter", check=True)
+        with commands.keys_lock(True):
+            commands.tmux("send-keys", "-t", target, "Enter", check=True)
         return False
     if CODEX_HOOK_REVIEW in screen:
         choice = CODEX_HOOK_UNTRUSTED.search(screen)
         count = CODEX_HOOK_COUNT.search(screen)
         if choice:
-            commands.tmux("send-keys", "-t", target, *(["Enter"] if choice.group(1) else ["-l", choice.group(2)]),
-                          check=True)
+            with commands.keys_lock(True):
+                commands.tmux("send-keys", "-t", target, *(["Enter"] if choice.group(1) else ["-l", choice.group(2)]),
+                              check=True)
             note = "Codex: %s, left untrusted (review in Codex's /hooks)" % (
                 count.group(1) if count else "some hooks are new or changed")
         else:

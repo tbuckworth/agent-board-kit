@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Agent Front Desk</title>
+<link rel="icon" href="/voice/icon.png" type="image/png">
+<link rel="stylesheet" href="/voice/voice.css">
+<script src="/voice/passkeys.js" defer></script>
+<script src="/voice/voice.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Front desk</h1>
+    <p id="model" class="model"></p>
+  </header>
+  <div id="gate" class="gate" hidden>
+    <p id="gatetext"></p>
+    <button id="gatebutton" class="filled" type="button" hidden></button>
+  </div>
+  <p id="error" class="error" role="alert" hidden></p>
+  <button id="talk" class="talk" type="button" disabled><span id="talklabel">Talk</span></button>
+  <p id="state" class="state" role="status" aria-live="polite">Loading…</p>
+  <ol id="transcript" class="transcript" aria-label="Transcript"></ol>
+</main>
+<div id="bar" class="bar" hidden>
+  <span id="barstate" class="barstate"></span>
+  <button id="stop" class="stop" type="button">Stop</button>
+</div>
+</body>
+</html>

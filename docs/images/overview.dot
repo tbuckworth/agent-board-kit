@@ -1,0 +1,51 @@
+// How agent-board-kit fits together. Render: dot -Tpng -Gdpi=150 overview.dot -o overview.png
+digraph kit {
+  graph [rankdir=TB, newrank=true, fontname="Helvetica", fontsize=15, nodesep=0.22, ranksep=0.42, pad=0.2,
+         bgcolor="white", label="agent-board-kit: what talks to what", labelloc=t, fontcolor="#111827"];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, color="#9ca3af", fillcolor="#ffffff",
+         fontcolor="#111827", margin="0.14,0.06"];
+  edge  [fontname="Helvetica", fontsize=10, color="#4b5563", fontcolor="#374151", arrowsize=0.7];
+
+  subgraph cluster_you {
+    label="You (over your Tailscale network)"; labeljust=l; fontsize=13;
+    style="rounded,filled"; fillcolor="#fef3c7"; color="#d97706"; fontcolor="#b45309";
+    boardapp [label="Mac: AgentBoard.app\ntiles, Mail tab,\nOrchestrator..., Chats"];
+    phone    [label="Phone:\nAgent Mail app,\nvoice page"];
+    todoapp  [label="Mac: ToDo.app"];
+    {rank=same; boardapp; phone; todoapp}
+  }
+
+  subgraph cluster_linux {
+    label="Always-on Linux machine"; labeljust=l; fontsize=13;
+    style="rounded,filled"; fillcolor="#ecfdf5"; color="#2f6f62"; fontcolor="#2f6f62";
+    board    [label="agent-board\ncollector and actions"];
+    mailroom [label="agent-mailroom\nkeeps agent mail,\nroutes each reply back"];
+    orch     [label="orchestrator\nclaude -p per request"];
+    spawn    [label="agent-spawn\nbranch, worktree,\ntmux, memory cap"];
+    agents   [label="agents\nClaude Code / Codex,\none per worktree", fillcolor="#dbeafe", color="#2563eb"];
+    status   [label="hooks: agent-status events"];
+    desk     [label="todo-desk"];
+    extras   [label="also: failover, usage routing,\nfast mode, researcher, desk,\nmemory watch, cloud-watchdog", style="rounded,filled,dashed", fillcolor="#f9fafb"];
+  }
+
+  github [label="GitHub\nrepos, PRs,\nyour to-do repo", fillcolor="#f3f4f6"];
+  gmail  [label="Gmail\n(optional)", style="rounded,filled,dashed", fillcolor="#fff7f7", color="#dc2626"];
+
+  boardapp -> board    [label=" ssh", dir=both];
+  phone    -> board    [label=" HTTPS", dir=both];
+  board    -> orch     [label=" Orchestrator..."];
+  board    -> mailroom [label=" your replies", dir=both];
+  mailroom -> agents   [label=" a reply"];
+  agents   -> mailroom [label=" agent-mail send"];
+  orch     -> spawn;
+  spawn    -> agents;
+  agents   -> status;
+  status   -> board    [constraint=false];
+  agents   -> github   [label=" commits, PRs"];
+  todoapp  -> desk     [label=" ssh", dir=both, constraint=false];
+  desk     -> github   [dir=both];
+  desk     -> orch     [label=" Assign to agent", constraint=false];
+  mailroom -> gmail    [style=dashed, dir=both, label=" if on"];
+  status   -> extras   [style=invis];
+  {rank=sink; github; gmail}
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=agent-board: the desk, the always-running agent you talk to from the ask box, on a Unix socket
+
+[Service]
+# PATH as a login shell has it: claude, agent-send and agent-mail in ~/.local/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
+ExecStart={{PYTHON}} {{KIT_DIR}}/board/bin/agent-board desk serve
+Restart=on-failure
+RestartSec=10
+# 3: Claude held more than the desk's tools (agentboard/desk.py, EXIT_UNSAFE); it stays stopped until looked at
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=default.target

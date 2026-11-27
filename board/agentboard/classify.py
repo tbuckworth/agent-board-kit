@@ -98,8 +98,9 @@ def mail_state(sent, inbound, now, reviews=None):
     inbound  rows from the owner routed to this session: {received_at, subject, action, id}
     reviews  its newest pre-send review per audience: {created_at, verdict, subject, kind, reasons, sent_message_id,
              audience, has_draft}
-    Returns {last_out, last_out_subject, last_out_id, last_out_thread (its thread, as the Mail tab names it), read,
-    last_in, unanswered, held, threads, revise, unrevised}; unanswered means
+    Returns {last_out, last_out_subject, last_out_id, last_out_thread (its thread, as the Mail tab names it),
+    last_out_kept (its latest mail is in the Mail tab alone: sources.tab_only), read, last_in, unanswered, held,
+    threads, revise, unrevised}; unanswered means
     the last word is the agent's: its newest mail to the owner is newer than anything the owner sent it. revise: its
     mails the review sent back that haven't gone out, newest first (the mailroom keeps each draft until a re-send to
     that audience, a withdraw or its fallback sends it as-is; a mail stopped for a credential, `secret`, keeps no
@@ -130,6 +131,7 @@ def mail_state(sent, inbound, now, reviews=None):
         "last_out_subject": strip_tag(last_out.get("subject") or "") if last_out else "",
         "last_out_id": (last_out.get("message_id") or "") if last_out else "",
         "last_out_thread": (last_out.get("thread_id") or "") if last_out else "",
+        "last_out_kept": sources.tab_only(out_id),   # kept for the Mail tab alone: Gmail has no copy to open
         "read": None,             # filled in from the Mail tab or the owner's Gmail (Collector.is_read): True / False / None
         "last_in": last_in["received_at"] if last_in else None,
         "unanswered": unanswered,
@@ -158,7 +160,8 @@ def keep_offline(ev, mail, last_activity, now):
 
 
 def strip_tag(subject):
-    return re.sub(r"\s*\[#[a-z0-9]{6,12}\]\s*$", "", subject or "").strip()
+    """`subject` without the mailroom's reply tag (sources.REPLY_TAG) or the spaces around it."""
+    return sources.REPLY_TAG.sub("", subject or "").strip()
 
 
 def signed_out(a):

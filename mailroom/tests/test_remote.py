@@ -24,7 +24,8 @@ import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail
 import fakes  # noqa: E402
 import homes  # noqa: E402
 from scripts import load_script  # noqa: E402
-from agentmail import config, deliver, listing, mailroom, outbound, recovery, registry, remote, routing, rpc, send
+from agentmail import (config, deliver, listing, mailroom, outbound, recovery, registry, remote, researcher_payload,
+                       researchermode, routing, rpc, send)
 from agentmail.store import Store
 
 SID = '12345678-1234-4234-8234-123456789abc'
@@ -148,6 +149,13 @@ class ProxyMail(Base):
             rpc.mail(self.ctx, self.request(files=files))
         self.assertEqual(self.sent, [])
 
+    def test_a_proxied_mail_with_nothing_to_read_is_refused_before_sending(self):
+        for text, html in (('', None), (' \n', '<p> </p>')):
+            with self.subTest(text=text, html=html), \
+                    self.assertRaisesRegex(outbound.MailError, 'nothing to send: the mail is empty'):
+                rpc.mail(self.ctx, self.request(text=text, html=html))
+        self.assertEqual(self.sent, [])
+
     def test_same_request_does_not_send_twice(self):
         req=self.request()
         first=rpc.mail(self.ctx,req)
@@ -196,7 +204,7 @@ class ProxyMail(Base):
     def test_mac_send_proxies_despite_local_send_disabled(self):
         body=Path(tempfile.mkdtemp(dir=TMP.name))/'body.txt'; body.write_text('body')
         a=argparse.Namespace(cmd='send',to='x',subject='x',cc=None,body_file=str(body),html=None,image=None,attach=None,
-                             no_review=None,session=SID,cli='codex',unrouted=False,request_id=None)
+                             no_review=None,session=SID,cli='codex',unrouted=False,alert=None,request_id=None)
         with patch.object(self.am,'resolve_session',return_value=dict(ORIGIN)), patch.object(remote,'call',return_value='sent') as call, contextlib.redirect_stdout(io.StringIO()):
             self.am.do_proxy(outbound.Context(MAC),a)
         payload=call.call_args.args[2]
@@ -312,6 +320,7 @@ class WireFormat(Base):
             'owner@example.com\nfrom_name      Alex\nsubject        Re: exact example request\nreceived_at    '
             '1700000000\nmatched_tag    %s\nmatch_rule     tag\naction         held\ndetail         why it is held\n'
             'released_to    None\nreleased_at    None\nrecovery_json  None\nnotified_at    None\neml            None\n'
+            'in_reply_to    None\n'
             'body:\nreply body\n'
             % (i, tag)))
         self.st.con.execute('update sent set sent_at=1700000000')
@@ -335,6 +344,41 @@ class WireFormat(Base):
                             "example (codex@mac)\n" % tag))
         self.assertEqual((self.sent[-1][1], self.sent[-1][0]['In-Reply-To']), (None, None))   # not in the old thread
 
+    def test_mac_conversation_reads_and_acknowledges_the_desktop_researcher_state(self):
+        session = self.st.session_for('codex', SID, 'example', origin_host='mac')
+        tag = session['tag']
+        self.st.set_researcher_mode(tag, True, time.time())
+        mac_home = self.homes.codex_home
+        homes.researcher_install(mac_home, 'codex', '0.7.0+codex.20261124')
+        payload = researcher_payload.local(MAC, 'codex', SID)
+        self.st.bind_researcher_payload(tag, 1, json.dumps(payload._asdict()))
+        initial = {'on': True, 'revision': 1, 'applied': False}
+        # The client fixture substitutes SSH. Feed its wire request to the real desktop RPC handler.
+        code, wire, out = self.client(['researcher-state', '--', tag], json.dumps(initial))
+        self.assertEqual((code, json.loads(out)), (0, initial))
+        self.assertEqual(json.loads(json.loads(rpc.serve(self.ctx, wire))['result']), initial)
+        applied = dict(initial, applied=True)
+        code, wire, out = self.client(['researcher-state', '--applied', '1', '--payload', payload.fingerprint,
+                                       '--session', SID, '--', tag], json.dumps(applied))
+        self.assertEqual((code, json.loads(out)), (0, applied))
+        # Recheck the same installed files through the real Mac RPC. Substitute only SSH.
+        def mac_ssh(_cmd, **kwargs):
+            with patch.object(registry, 'CODEX_HOME', mac_home):
+                return Mock(returncode=0, stdout=rpc.serve(outbound.Context(MAC), kwargs['input']), stderr='')
+        with patch.object(remote.subprocess, 'run', side_effect=mac_ssh) as ssh:
+            self.assertEqual(json.loads(json.loads(rpc.serve(self.ctx, wire))['result']), applied)
+        self.assertEqual(json.loads(ssh.call_args.kwargs['input'])['op'], 'researcher-payload')
+        self.assertIsNotNone(self.st.researcher_mode(tag)['applied_at'])
+
+    def test_mac_conversation_reads_the_request_receipt_from_the_desktop(self):
+        sent = self.request(args={'to': 'owner', 'subject': 'Decide run-1 revision a1'})
+        rpc.mail(self.ctx, sent)
+        tag = self.st.session_by_thread('thread')['tag']
+        result = {'thread_id': 'thread', 'message_id': '<sent@test>'}
+        code, wire, out = self.client(['researcher-request', '--', tag, 'thread'], json.dumps(result))
+        self.assertEqual((code, json.loads(out)), (0, result))
+        self.assertEqual(json.loads(json.loads(rpc.serve(self.ctx, wire))['result']), result)
+
     def test_errors_say_what_went_wrong(self):
         # the error says what went wrong, never just the exit code agent-mail would stop with ("4", "1")
         def error(req):
@@ -349,6 +393,54 @@ class WireFormat(Base):
 
 
 class Transport(Base):
+    def test_old_mac_payload_blocks_delivery_and_the_installed_refresh_is_used_on_retry(self):
+        tag = self.st.session_for('codex', SID, 'example', origin_host='mac')['tag']
+        self.st.set_researcher_mode(tag, True, 1)
+        old = homes.researcher_install(self.homes.codex_home, 'codex', '0.4.0')
+        (old / 'scripts/methods_review.py').unlink()
+        requests, delivered = [], []
+        old_python = homes.temp_dir(self) / "python3.9"
+        old_python.write_text("#!/bin/sh\nexit 1\n")
+        old_python.chmod(0o700)
+        empty_success = old_python.parent / "not-python"
+        empty_success.write_text("#!/bin/sh\nexit 0\n")
+        empty_success.chmod(0o700)
+        mac = dict(MAC, researcher_python=[str(old_python), str(empty_success)])
+
+        # SSH and agent-send are external. Use the real peer handler and its temporary plugin cache.
+        def transport(cmd, **kwargs):
+            if cmd[0] == 'ssh':
+                requests.append(json.loads(kwargs['input'])['op'])
+                return Mock(returncode=0, stdout=rpc.serve(outbound.Context(mac), kwargs['input']), stderr='')
+            self.assertEqual(cmd[-1], SID)
+            delivered.append(kwargs['input'])
+            return Mock(returncode=0, stdout='sent', stderr='')
+
+        with patch.object(remote.subprocess, 'run', side_effect=transport):
+            researchermode.tick(self.st, CFG, 1)
+            mode = self.st.researcher_mode(tag)
+            self.assertEqual(requests, ['researcher-payload'])
+            self.assertFalse(delivered)
+            self.assertEqual(mode['status'], 'unavailable')
+            self.assertIn('0.4.0', mode['detail'])
+            current = homes.researcher_install(self.homes.codex_home, 'codex', '0.7.0+codex.20261124')
+            researchermode.tick(self.st, CFG, mode['retry_at'])
+            blocked = self.st.researcher_mode(tag)
+            self.assertEqual(blocked['status'], 'unavailable')
+            self.assertIn('methods_review.py --help', blocked['detail'])
+            mac['researcher_python'].append(sys.executable)
+            researchermode.tick(self.st, CFG, blocked['retry_at'])
+        self.assertEqual(requests, ['researcher-payload', 'researcher-payload', 'deliver',
+                                    'researcher-payload', 'deliver'])
+        blocker, message = delivered
+        self.assertIn('Keep Researcher on hold', blocker)
+        self.assertNotIn('--applied', blocker)
+        self.assertIn(str(current), message)
+        self.assertNotIn(str(old), message)
+        self.assertIn(sys.executable + ' -B', message)
+        self.assertIn('even if this session loaded a', message)
+        self.assertEqual(self.st.researcher_mode(tag)['status'], 'accepted')
+
     def test_only_configured_peer_and_stdin_payload(self):
         payload={'op':'search','queries':['$(touch /tmp/forbidden)']}
         with patch.object(subprocess,'run',return_value=Mock(returncode=0,stdout=json.dumps({'protocol':1,'ok':True,'result':{}}))) as run:
@@ -371,7 +463,7 @@ class Transport(Base):
     def test_remote_known_delivery_carries_exact_uuid_and_reply_command(self):
         s=self.st.session_for('codex',SID,origin_host='mac')
         with patch.object(remote,'call',return_value={'code':0,'detail':'queued'}) as call:
-            self.assertEqual(deliver.deliver_session(s,'agent-mail reply 12',CFG),(0,'queued'))
+            self.assertEqual(deliver.deliver_session(s,'agent-mail reply 12',CFG,CFG['resume_offline']),(0,'queued'))
         self.assertEqual(call.call_args.args[2]['session_id'],SID)
         self.assertIn('--session '+SID,call.call_args.args[2]['text'])
 

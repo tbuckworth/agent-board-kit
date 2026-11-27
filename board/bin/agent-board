@@ -3,45 +3,110 @@
 
     agent-board snapshot [--pretty]     one JSON snapshot of every agent, mail, metrics, usage
     agent-board stream [--interval 3]   JSON lines: a snapshot when anything changes (and every 30 s),
-                                        metrics every 5 s; reads {"cmd": ...} lines on stdin, including
+                                        metrics every 5 s; reads {"cmd": ...} lines on stdin (refresh,
+                                        refresh_usage, refresh_keyring), including
                                         {"cmd":"act","rid":N,"req":{...}}: `act` run here, answered with
-                                        {"type":"act","rid":N,"out":...,"err":...} (no new SSH per click)
-    agent-board act                     one validated action, JSON request on stdin (see agentboard/actions.py)
+                                        {"type":"act","rid":N,"out":...,"err":...} (no new SSH per click; the ask
+                                        box's questions in a pool of their own, Acts), after {"type":"act_part",
+                                        "rid":N,"part":{...}} for each part of an answer in parts (actions.PARTS: the
+                                        ask box's spoken answer, a sentence at a time)
+    agent-board act [--parts]           one validated action, JSON request on stdin (see agentboard/actions.py); with
+                                        --parts, an action in actions.PARTS prints each part as it is ready, a line
+                                        {"act_part": {...}}, before its answer
     agent-board receive                 one file too big for a Mail-tab reply, on stdin after a JSON line {name, size};
                                         prints {"ok", "path"} (agentboard/mailbox.py, receive)
     agent-board sent [-n 20] [--json]   the messages the owner sent from the board, in full, newest last
     agent-board done REF... [-m NOTE]   for an agent: mark board messages dealt with (their last line gives the REF)
     agent-board time [--json]           recompute where the owner's time went, for the Time page (time.json)
+    agent-board mail-web                serve the Mail tab to the owner's phone on a Unix socket, for tailscale serve
+                                        to publish on the owner's tailnet (agentboard/mailweb.py; README, "Mail on the
+                                        phone"; agent-board-mail-web.service runs it in Python's isolated mode, -I),
+                                        and the voice page at /voice when it is set up (agentboard/voiceweb.py)
+    agent-board transcripts archive [--json]
+                                        copy every agent transcript into the archive, then rebuild its catalog and its
+                                        by-group tree (agentboard/transcripts.py; agent-board-transcripts.timer, daily)
+    agent-board transcripts list [--group G] [--subgroup S] [--since DATE] [--query WORDS] [-n N] [--json]
+                                        the archived sessions that match, with their transcripts' paths
+    agent-board agents [--json]         the live Claude and Codex agents the voice desk can ask
+                                        (agentboard/voicedesk.py)
+    agent-board ask AGENT QUESTION... [--stdin] [--json] [--model M] [--effort E] [--timeout S]
+                                        a question answered by a READ-ONLY copy of the agent's conversation, never
+                                        the agent itself (--stdin: the question on stdin)
+    agent-board looking [--json]        the Mac's front window, from its ActivityWatch over ssh, and the agent
+                                        behind it
+    agent-board desk serve              the desk: one long-lived Claude process the owner talks to, on a Unix socket
+                                        (agentboard/desk.py; agent-board-desk.service); exits 3 when Claude holds
+                                        more than the desk's tools
+    agent-board desk say TEXT... [--looking] [--json]
+                                        one turn to the running desk: its reply as it streams, then its timings,
+                                        tools and sends (--looking: the desk reads the Mac's front window first;
+                                        --json: each event as a JSON line)
+    agent-board desk new                a fresh conversation for the desk
+    agent-board desk mcp                the desk's own tools, as the MCP server on stdio its Claude starts
+    agent-board voice-enrol [--json]    a one-time link that enrols a device's passkey on the voice page
+                                        (agentboard/voiceweb.py; the device must be in mailweb.json's voice_devices)
+    agent-board keyring-status [--json] [--wait [--timeout 600]]
+                                        whether the browser's keyring on the desktop is locked (exit 0 unlocked, 1
+                                        locked, 3 unknown); --wait checks every 10 s until it is unlocked or the time
+                                        is up (agentboard/keyring.py; off unless the board config's keyring_unlock)
+    /usr/bin/python3 -I agent-board keyring-unlock
+                                        unlock the keyrings with the password on stdin; one JSON line out (README,
+                                        "Unlock the desktop", has the interface: how it is run, input bound, result,
+                                        exit codes). bin/agent-keyring-unlock runs it so from anywhere
 
 The Mac app keeps `ssh desktop agent-board stream` open; the process exits when the connection
 drops (EOF on stdin, a broken pipe, a write stalled for 2 minutes, or a Mac that has acknowledged
 nothing for ~50 s because it slept or left the network) and after --max-seconds.
 
-What each writes: snapshot and stream can update the Codex credits state (codex-credits.json) and add a usage
-reading for the usage breakdown (usage-samples.jsonl, at most one per 30 minutes), and stream also ticks off, in
-sent-marks.jsonl, the done messages whose emails the owner has seen. act does what its action does and records it
-(actions.jsonl, and the owner's text in sent.jsonl). receive writes one file under mail-files/. done appends to
-sent-marks.jsonl. time writes time.json, its caches and time.log. sent only reads.
+What each writes: snapshot and stream can update the Codex credits state (codex-credits.json), add a usage reading
+for the usage breakdown (usage-samples.jsonl, at most one per 30 minutes) and update the spend meters' transcript
+cache (spend-cache.json), and stream also ticks off, in sent-marks.jsonl, the done messages whose emails the owner has
+seen. act does what its action does and records it (actions.jsonl, and the owner's text in sent.jsonl). receive
+writes one file under mail-files/. done appends to sent-marks.jsonl. time writes time.json, its caches and time.log.
+mail-web changes the mailbox and the drafts and starts orchestrator events as its page asks, and records them as act
+does (the mail_*, draft_* and orchestrate actions); it keeps its passkeys, sessions and enrolment code in mail-web/
+(agentboard/mailwebstate.py); its voice page's questions to agents are asks, as below; with the keyring unlock on, it
+runs keyring-unlock with the password the Mail page sends, and records the outcome. voice-enrol writes the page's one
+enrolment code waiting (mail-web/enrol.json), and records it as act does.
+transcripts archive adds to the archive (never deleting there but its own links in by-group/), and writes its catalog,
+its caches and transcripts.log. keyring-unlock writes attempts.json and keyring.log under keyring/
+(agentboard/keyring.py) and records nothing else. ask, and act's voice_ask (the Mac's ask box), run a read-only fork
+of the agent's conversation on its own CLI: for a Claude agent a `claude -p` fork of a kept copy (made by one more
+fork, its transcript kept beside the agent's, listed in voice-desk/copies.json; on a per-token login, each fork's
+settings file in voice-desk/settings/, removed when it exits); for a Codex agent an ephemeral `codex exec fork`, which
+keeps nothing (its model catalog written to voice-desk/codex-models/). Both append to voice-desk/asks.jsonl; voice_ask
+also has the answer spoken by the desktop's voice (bin/agent-speech) and appends to voice-desk/speech.log. desk serve
+writes turns.jsonl beside its socket; its tools ask as `ask` does, and its sends go on the record as act's send does
+(actions.jsonl, sent.jsonl), as via the desk. sent, transcripts list, keyring-status, agents and looking (and act's
+voice_looking) only read.
 
-Optional parts follow the board config (agentboard/config.py): the Gmail read-check and the Mail tab's Sync with
-Gmail need gmail_credentials, the meeting alerts google_token; without them those parts are off and silent.
+Optional parts follow the board config (agentboard/config.py): the Gmail read-check and the Mail tab's Forward (a
+Gmail draft) need gmail_credentials, the meeting alerts meeting_alerts and google_token, the keyring's lock mark and
+unlock keyring_unlock; without them those parts are off and silent. The voice page, the desk, the desktop's voice and
+the transcript archive are off until their own settings and units are set up (README).
 """
 import concurrent.futures
+import datetime
 import hashlib
 import json
 import os
 import queue
 import select
 import signal
-import subprocess
 import sys
+import tempfile
 import textwrap
+import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentboard import (actions, allowance, chats, cli, collect, config, credits, gmailstate, mailbox,  # noqa: E402
-                        meetings, restart, sent, sources, subchats, timeuse)
+if sys.argv[1:2] == ["keyring-unlock"]:    # the owner's password may be on stdin already: out of reach before more loads
+    from agentboard import lockdown  # noqa: E402
+    lockdown.ready()                        # keyring.unlock_from asks again, and refuses a process that is not ready
+from agentboard import (actions, allowance, chats, cli, collect, config, credits, desk, gmailstate,  # noqa: E402
+                        keyring, mailbox, meetings, restart, sent, sources, subchats, timeuse, transcripts,
+                        voicedesk)
 
 STALL_SECONDS = 120
 # characters of one action's JSON that `act` reads: the largest mail reply (the Mac's ScreenTime.partBytes keeps each
@@ -49,6 +114,7 @@ STALL_SECONDS = 120
 MAX_REQUEST = mailbox.MAX_REPLY_REQUEST
 ACT_SECONDS = 900          # one action run from the stream; the slowest (worktree cleanup) fetches for up to 90 s
 ACT_WORKERS = 4
+ASK_WORKERS = 2            # the ask box's questions running at once (Acts)
 
 
 def make_gmail(sync):
@@ -70,18 +136,22 @@ def fingerprint(snap):
             "gmail": {k: v for k, v in (snap.get("gmail") or {}).items() if k != "checked_at"},
             "worktrees": snap.get("worktrees"), "desktop": {k: v for k, v in (snap.get("desktop") or {}).items() if k != "checked"},
             "restart": {k: v for k, v in (snap.get("restart") or {}).items() if k != "updated"}, "sent": snap.get("sent"),
-            "meetings": snap.get("meetings"), "problems": snap.get("problems")}
+            "meetings": snap.get("meetings"), "security_alerts": snap.get("security_alerts"),
+            "problems": snap.get("problems"), "keyring": snap.get("keyring")}
     return hashlib.sha1(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def annotate_usage(accounts):
     """The board's additions to each usage reading: each window's key (sources.mark_window_keys), the Codex credits
-    bar (credits.annotate) and the Claude logins signed in to the same account as another
-    (sources.mark_shared_logins); then the reading is kept for the usage breakdown's fit (allowance.sample, at most
-    one per 30 minutes)."""
+    bar (credits.annotate), the Claude logins signed in to the same account as another (sources.mark_shared_logins)
+    and each per-token login's spend this week against its weekly budget (allowance.annotate); then the reading is
+    kept for the usage breakdown's fit (allowance.sample, at most one per 30 minutes). It runs with each usage reading
+    (sources.Usage): once on the calling thread for the cached reading the stream starts with, then every 5 minutes on
+    Usage's background thread, never in the loop that builds the snapshots."""
     sources.mark_window_keys(accounts)
     credits.annotate(accounts)
     sources.mark_shared_logins(accounts)
+    allowance.annotate(accounts)
     allowance.sample(accounts)
 
 
@@ -91,10 +161,11 @@ def cmd_snapshot(a):
     col = collect.Collector(metrics=metrics, usage=sources.Usage(annotate=annotate_usage, sync=True),
                             git=sources.GitCache(budget=1000), prs=sources.PullRequests(sync=True), gmail=gmail,
                             worktrees=collect.worktree_scan(sync=True), desktop=collect.desktop_info(sync=True),
-                            restored=restart.restored_activity, sent=sent, restart=restart,
-                            chats=sources.Periodic(subchats.summary, chats.REFRESH, None, sync=True),
+                            keyring=keyring.make(sync=True), restored=restart.restored_activity, sent=sent,
+                            restart=restart, chats=sources.Periodic(subchats.summary, chats.REFRESH, None, sync=True),
                             meetings=meetings.make(sync=True),
-                            mailbox=sources.Periodic(mailbox.summary, mailbox.REFRESH, None, sync=True))
+                            mailbox=sources.Periodic(mailbox.summary, mailbox.REFRESH, None, sync=True),
+                            logins=sources.manual_logins)
     if gmail is not None:
         col.agents(with_git=False)        # tells Gmail which mails the board cares about
         gmail.maybe_refresh()             # then one look-up, so this snapshot shows read state
@@ -129,30 +200,103 @@ class Inbox:
 
 
 def run_act(req, timeout=ACT_SECONDS):
-    """One action exactly as `ssh desktop agent-board act` runs it, in its own process: (stdout, stderr). The JSON
-    is compact and keeps non-ASCII text as it is, so the request is no longer than the Mac's compact JSON made it
-    (escaped or spaced out, it could pass MAX_REQUEST)."""
-    try:
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), "act"],
-                           input=json.dumps(req, ensure_ascii=False, separators=(",", ":")),
-                           capture_output=True, text=True, timeout=timeout)
-        return r.stdout, r.stderr[-4000:]
-    except subprocess.TimeoutExpired:
-        return "", "the action took over %d s and was stopped" % timeout
-    except OSError as e:
-        return "", "could not run the action: %s" % e
+    """One action as `ssh desktop agent-board act` runs it, in its own process (run_act_parts): (its answer, "") or
+    ("", what went wrong)."""
+    got = []
+    run_act_parts(req, lambda part: None, lambda out, err: got.append((out, err)), timeout)
+    return got[0]
+
+
+def run_act_parts(req, on_part, on_answer, timeout=ACT_SECONDS, command=None):
+    """One action run as `ssh desktop agent-board act` runs it, in its own process, but as `act --parts`: each part of
+    an answer in parts (actions.PARTS) goes to on_part as it is printed, and on_answer(stdout, stderr) gets the answer
+    as soon as it is printed, though the process may take a moment more to end (voicedesk.run_copy leaves a copy to end
+    by itself), or ("", what went wrong) when it ends with none. The request's JSON is compact and keeps non-ASCII text
+    as it is, so it is no longer than the Mac's compact JSON made it (escaped or spaced out, it could pass
+    MAX_REQUEST). `command` is the act command (this script's `act --parts`), or a test's stand-in. Raises what failed
+    after an answer went out, for the caller to say (Acts.run)."""
+    answered = []
+
+    def on_event(msg):
+        if isinstance(msg.get("act_part"), dict):
+            on_part(msg["act_part"])
+        elif not answered:
+            answered.append(True)
+            on_answer(json.dumps(msg, ensure_ascii=False), "")
+        return False
+    with tempfile.TemporaryFile("w+") as err:
+        try:
+            code, stray, late = sources.run_json_lines(
+                command or [sys.executable, os.path.abspath(__file__), "act", "--parts"],
+                json.dumps(req, ensure_ascii=False, separators=(",", ":")), on_event, timeout=timeout, stderr=err)
+        except OSError as e:
+            if answered:
+                raise
+            return on_answer("", "could not run the action: %s" % e)
+        if not answered:                            # what it printed that is not JSON is said with its stderr
+            err.seek(0)
+            on_answer("", "the action took over %d s and was stopped" % timeout if late
+                      else (err.read() + stray)[-4000:] or "the action ended with no answer (exit %s)" % code)
+
+
+class Acts:
+    """The Mac's actions on the stream, each run as `agent-board act` (run_act_parts) in a worker's thread, its answer
+    put on `answers` with a byte on the pipe `wake`, for the stream's own thread to emit (emit uses SIGALRM), and before
+    it each part of an answer in parts (actions.PARTS) as it comes. A question from the ask box (ASKS), to an agent's
+    copy or to the desk, can take minutes (voicedesk.TIMEOUT for each fork of the agent's copy, which the desk may ask
+    too), so they have a pool of their own, ASK_WORKERS wide: however many are running, left running by a box the owner
+    closed or waiting their turn, the board's other actions never wait behind them. A failure after an answer went out
+    is put on `answers` as an error, as the stream's own are."""
+    ASKS = ("voice_ask", "desk_say")
+
+    def __init__(self, answers, wake):
+        self.answers, self.wake = answers, wake
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=ACT_WORKERS)
+        self.asks = concurrent.futures.ThreadPoolExecutor(max_workers=ASK_WORKERS)
+
+    def submit(self, rid, req):
+        slow = isinstance(req, dict) and req.get("action") in self.ASKS
+        (self.asks if slow else self.pool).submit(self.run, rid, req)
+
+    def run(self, rid, req):
+        answered = []
+
+        def answer(out, err):
+            answered.append(True)
+            self.put({"type": "act", "rid": rid, "out": out, "err": err})
+        try:
+            run_act_parts(req, lambda part: self.put({"type": "act_part", "rid": rid, "part": part}), answer)
+        except Exception as e:                     # always answer: the Mac waits on this rid
+            why = "%s: %s" % (type(e).__name__, e)
+            if answered:
+                self.put({"type": "error", "error": "action %d failed after its answer: %s" % (rid, why)})
+            else:
+                answer("", "the action could not run: " + why)
+
+    def put(self, msg):
+        self.answers.put(msg)
+        os.write(self.wake, b"x")
+
+    def shutdown(self):
+        """Drop what has not started; an action already running finishes, as over SSH."""
+        for pool in (self.pool, self.asks):
+            pool.shutdown(wait=False, cancel_futures=True)
+        for pool in (self.pool, self.asks):
+            pool.shutdown(wait=True)
 
 
 def cmd_stream(a):
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     metrics = sources.Metrics(gpu=True)
     usage = sources.Usage(interval=a.usage_interval, annotate=annotate_usage)
+    locked = keyring.make(sync=False)
     col = collect.Collector(metrics=metrics, usage=usage, prs=sources.PullRequests(), gmail=make_gmail(sync=False),
                             worktrees=collect.worktree_scan(sync=False), desktop=collect.desktop_info(sync=False),
-                            restored=restart.restored_activity, sent=sent, restart=restart,
+                            keyring=locked, restored=restart.restored_activity, sent=sent, restart=restart,
                             chats=sources.Periodic(subchats.summary, chats.REFRESH, None, sync=False),
                             meetings=meetings.make(sync=False),
-                            mailbox=sources.Periodic(mailbox.summary, mailbox.REFRESH, None, sync=False))
+                            mailbox=sources.Periodic(mailbox.summary, mailbox.REFRESH, None, sync=False),
+                            logins=sources.manual_logins)
     started = time.time()
     last_fp, last_snap, last_metrics = None, 0, 0
     emit({"type": "hello", "host": os.uname().nodename, "pid": os.getpid(), "interval": a.interval, "acts": 1})
@@ -160,15 +304,7 @@ def cmd_stream(a):
     inbox = Inbox(sys.stdin.fileno())
     answers = queue.Queue()                        # finished actions, emitted by this thread only (emit uses SIGALRM)
     wake_r, wake_w = os.pipe()
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=ACT_WORKERS)
-
-    def act(rid, req):
-        try:
-            out, err = run_act(req)
-        except Exception as e:                     # always answer: the Mac waits on this rid
-            out, err = "", "the action could not run: %s: %s" % (type(e).__name__, e)
-        answers.put({"type": "act", "rid": rid, "out": out, "err": err})
-        os.write(wake_w, b"x")
+    acts = Acts(answers, wake_w)
 
     try:
         while time.time() - started < a.max_seconds:
@@ -211,17 +347,21 @@ def cmd_stream(a):
                     if not isinstance(msg, dict):
                         continue
                     if msg.get("cmd") == "act" and isinstance(msg.get("rid"), int):
-                        pool.submit(act, msg["rid"], msg.get("req"))
+                        acts.submit(msg["rid"], msg.get("req"))
                     elif msg.get("cmd") == "refresh_usage":
                         usage.maybe_refresh(force=True)
                         force = now_please = True
                     elif msg.get("cmd") == "refresh":        # ⌘R: everything fresh, usage from its own cache
                         col.refresh()
                         force = now_please = True
+                    elif msg.get("cmd") == "refresh_keyring":    # after an unlock from the Mac: its state now
+                        if locked is not None:
+                            locked.invalidate()
+                        force = now_please = True
                 if eof:
                     return 0                       # the Mac closed the connection
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)      # an action already running finishes, as over SSH
+        acts.shutdown()
         metrics.close()
     return 0
 
@@ -231,9 +371,16 @@ def cmd_act(a):
         req = json.loads(sys.stdin.read(MAX_REQUEST) or "null")
     except ValueError:
         req = None
+    seams, lock = {}, threading.Lock()
+    if a.parts and isinstance(req, dict) and req.get("action") in actions.PARTS:
+        def on_part(part):
+            with lock:
+                print(json.dumps({"act_part": part}), flush=True)
+        seams["on_part"] = on_part
     res = actions.dispatch(req, agents=lambda: collect.Collector().agents(with_git=False)[0],
-                           worktrees=sources.list_worktrees)
-    print(json.dumps(res))
+                           worktrees=sources.list_worktrees, **seams)
+    with lock:
+        print(json.dumps(res), flush=True)
     return 0 if res.get("ok") else 1
 
 
@@ -260,7 +407,10 @@ def show_sent(rows):
         fate = "  NOT DELIVERED: %s" % r.get("error", "") if not r.get("ok") else ""
         print("%s  %s  %s -> %s  [%s]%s%s" % (when, r["ref"], r.get("kind"), r.get("to"), r["state"], fate,
                                              "  (recovered)" if r.get("recovered") else ""))
-        print(textwrap.indent(r["text"], "    ", lambda ln: True))
+        if r["text"]:                               # a message of files alone has none
+            print(textwrap.indent(r["text"], "    ", lambda ln: True))
+        if r.get("files"):
+            print("    -- files: " + ", ".join(r["files"]))
         if r.get("done"):
             print("    -- done %s: %s" % (hhmm(r["done"].get("ts")), r["done"].get("note") or "(no note)"))
         if r.get("tick", {}).get("by") == "mail" and r["checked"]:
@@ -309,6 +459,159 @@ def show_time(doc):
         sm["guessed"]["batches"], sm["approximate documents"]))
 
 
+def cmd_mail_web(a):
+    """The phone page's server (agentboard/mailweb.py), imported only here: it needs the `cryptography` package
+    (board/requirements.txt), which nothing else of the board does."""
+    try:
+        from agentboard import mailweb
+    except ImportError as e:
+        print("agent-board mail-web: %s; install board/requirements.txt (the kit's installer does)" % e,
+              file=sys.stderr)
+        return 2
+    try:
+        from agentboard import voiceweb
+        mailweb.serve(voiceweb.handler())
+    except (ValueError, RuntimeError, sources.CommandError) as e:   # settings or Tailscale not ready: the unit retries
+        print("agent-board mail-web: not serving: %s" % e, file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_transcripts(a):
+    """The transcript archive: `archive` (agent-board-transcripts.timer runs it daily) exits 1 when something failed
+    (a machine that could not be reached is only a warning) and 2 when it cannot run at all; `list` prints the catalog's
+    sessions that match."""
+    try:
+        cfg = transcripts.settings()
+        if a.tcmd == "archive":
+            report = transcripts.archive(cfg)
+            cli.out(report, a.json, show_archive)
+            for w in report["warnings"]:
+                print("warning: " + w, file=sys.stderr)
+            for p in report["problems"]:
+                print("problem: " + p, file=sys.stderr)
+            return 1 if report["problems"] else 0
+        since = time.mktime(a.since.timetuple()) if a.since else None
+        found = transcripts.listing(cfg, group=a.group, subgroup=a.subgroup, since=since, query=a.query)
+    except transcripts.ArchiveError as e:
+        print("agent-board transcripts: %s" % e, file=sys.stderr)
+        return 2
+    found = found[-a.n:] if a.n > 0 else found
+    cli.out(found, a.json, show_transcripts)
+    return 0
+
+
+def show_archive(r):
+    for key, counts in r["copied"].items():
+        print("%-34s %s" % (key, transcripts.counts_text(counts)))
+    g = r["guessed"]
+    print("%d sessions; %d frozen this run; the model asked about %d in %d calls, %d waiting for a later run" % (
+        r["sessions"], g["frozen"], g.get("asked", 0), g.get("batches", 0), g["waiting"]))
+    for name, n in sorted(r["groups"].items()):
+        print("  %5d  %s" % (n, name))
+    print("by-group links: %s" % ", ".join("%s %d" % kv for kv in r["links"].items()))
+
+
+def show_transcripts(rows):
+    if not rows:
+        print("no archived session matches")
+    for r in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["started"] or 0))
+        group = "%s / %s" % (r["group_name"] or transcripts.UNSORTED, r["subgroup"] or transcripts.NO_SUBGROUP)
+        label = " - ".join(x for x in (r["name"], r["title"]) if x) or r["id"]
+        print("%s  %s [%s]  %s %s  %s" % (when, group, r["group_source"], r["cli"], r["machine"], label))
+        if r["paths"]:
+            more = len(r["paths"]) - 1
+            print("    %s%s" % (r["paths"][0], "  (+%d more: other copies and subagents; --json lists them)" % more
+                                 if more else ""))
+
+
+def cmd_agents(a):
+    try:
+        rows = voicedesk.agents()
+    except voicedesk.VoiceError as e:
+        print("could not list the agents: %s" % e, file=sys.stderr)
+        return 1
+    cli.out(rows, a.json, voicedesk.show_agents)
+    return 0
+
+
+def cmd_ask(a):
+    """One question to an agent, answered by a read-only fork of its conversation (agentboard/voicedesk.py)."""
+    question = sys.stdin.read(voicedesk.MAX_QUESTION + 1) if a.stdin else " ".join(a.question)
+    res = voicedesk.ask(a.agent, question, model=a.model, effort=a.effort or None, timeout=a.timeout)
+    cli.out(res, a.json, voicedesk.show_answer)
+    return 0 if res["ok"] else 1
+
+
+def cmd_voice_enrol(a):
+    """A one-time link that enrols a device's passkey on the voice page (/voice/enrol#CODE), as mail-web's enrolment
+    code (actions.mail_web_enrol_action, on its record): it replaces any code waiting, and lasts mailweb.json's
+    enrol_minutes."""
+    res = actions.mail_web_enrol_action({}, page="/voice/enrol")
+    cli.out(res, a.json, lambda r: print(
+        "Open this on the device, before %s:\n%s" % (time.strftime("%H:%M", time.localtime(r["lapses"])), r["url"])
+        if r["ok"] else "no enrolment link: %s" % r["error"]))
+    return 0 if res["ok"] else 1
+
+
+def cmd_looking(a):
+    res = voicedesk.looking()
+    cli.out(res, a.json, voicedesk.show_looking)
+    return 0 if res["ok"] else 1
+
+
+def cmd_desk(a):
+    """The desk (agentboard/desk.py): its daemon, a turn to it, a fresh conversation, or its MCP server."""
+    try:
+        if a.dcmd == "serve":
+            return desk.serve()
+        if a.dcmd == "mcp":
+            return desk.mcp_main()
+        if a.dcmd == "say":
+            return desk.say(" ".join(a.text), looking=a.looking, as_json=a.json)
+        return desk.new()
+    except (desk.DeskError, ValueError, RuntimeError, OSError) as e:
+        print("agent-board desk %s: %s" % (a.dcmd, e), file=sys.stderr)
+        return 1
+
+
+def cmd_keyring_status(a):
+    """Whether the browser's keyring on the desktop (the "default" alias) is locked, and login beside it; with --wait,
+    checked every keyring.WAIT_POLL seconds until it is unlocked or --timeout seconds have passed. Exits with
+    keyring.STATUS_EXIT of the last reading; exits 3 (unknown), saying so, while the board config's keyring_unlock is
+    off."""
+    if not config.keyring_unlock():
+        print("agent-board keyring-status: %s" % keyring.OFF, file=sys.stderr)
+        return keyring.STATUS_EXIT["unknown"]
+    try:
+        bus = keyring.session_bus()
+    except keyring.KeyringError as e:
+        print("agent-board keyring-status: %s" % e, file=sys.stderr)
+        return keyring.STATUS_EXIT["unknown"]
+    st = keyring.wait(bus, a.timeout, keyring.WAIT_POLL) if a.wait else keyring.status(bus)
+    cli.out(st, a.json, show_keyring)
+    return keyring.STATUS_EXIT[st["state"]]
+
+
+def show_keyring(st):
+    print({"unlocked": "The browser's keyring on the desktop is unlocked: the desktop browser can use its passwords",
+           "locked": "The browser's keyring on the desktop is locked: the browser waits at its unlock dialog until the "
+                     "owner unlocks it from the board",
+           "unknown": "The browser's keyring on the desktop is in an unknown state: %s" % st["error"]}[st["state"]])
+    for name, c in st["collections"].items():
+        state = "unknown (%s)" % c["error"] if c["locked"] is None else "locked" if c["locked"] else "unlocked"
+        print("  %-8s %s: %s" % (name, c["label"] or c["path"] or "none", state))
+
+
+def cmd_keyring_unlock(a):
+    """Unlock the desktop's keyrings with the password on stdin (keyring.unlock_from): one JSON line, and
+    keyring.UNLOCK_EXIT of its result."""
+    res = keyring.unlock_from(sys.stdin.fileno(), keyring.STATE)
+    print(json.dumps(res))
+    return keyring.UNLOCK_EXIT[res["result"]]
+
+
 def main(argv=None):
     ap = cli.parser(__doc__, "agent-board")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -318,7 +621,8 @@ def main(argv=None):
     p.add_argument("--interval", type=float, default=3.0)
     p.add_argument("--usage-interval", type=float, default=300.0)
     p.add_argument("--max-seconds", type=float, default=12 * 3600)
-    sub.add_parser("act")
+    p = sub.add_parser("act")
+    p.add_argument("--parts", action="store_true", help="print the parts of an answer in parts as they come")
     sub.add_parser("receive")
     p = sub.add_parser("sent")
     p.add_argument("-n", type=int, default=20, help="how many, newest last (0: all)")
@@ -328,9 +632,53 @@ def main(argv=None):
     p.add_argument("-m", metavar="NOTE", help="what you did, in one line")
     p = sub.add_parser("time", help="recompute where the owner's time went (the Time page)")
     p.add_argument("--json", action="store_true", help="print the figures as written to time.json")
+    sub.add_parser("mail-web", help="serve the Mail tab to the owner's phone, on a Unix socket for tailscale serve")
+    p = sub.add_parser("transcripts", help="the archive of every agent transcript (agentboard/transcripts.py)")
+    tsub = p.add_subparsers(dest="tcmd", required=True)
+    p = tsub.add_parser("archive", help="copy what is new or changed, then rebuild the catalog and the by-group tree")
+    p.add_argument("--json", action="store_true", help="print the run's report as JSON")
+    p = tsub.add_parser("list", help="the archived sessions that match, oldest first, with their transcripts' paths")
+    p.add_argument("--group", help="a board group (Unsorted: sessions no group fits)")
+    p.add_argument("--subgroup", help="a sub-group ((none): sessions in no sub-group)")
+    p.add_argument("--since", metavar="YYYY-MM-DD", type=datetime.date.fromisoformat, help="active on or after this day")
+    p.add_argument("--query", metavar="WORDS", help="every word in its name, title, folder, project or id")
+    p.add_argument("-n", type=int, default=0, help="only the newest N (0: all)")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("agents", help="the live Claude and Codex agents the voice desk can ask")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("ask", help="ask an agent, through a read-only copy of its conversation")
+    p.add_argument("agent", help="its name (as said is fine), id, or a prefix of 6+ of its id")
+    p.add_argument("question", nargs="*")
+    p.add_argument("--stdin", action="store_true", help="read the question from stdin")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--model", help="the model for the copy (default: the session's own)")
+    p.add_argument("--effort", default=voicedesk.EFFORT, help="the copy's effort (default %(default)s; '' for the "
+                   "login's own)")
+    p.add_argument("--timeout", type=float, default=voicedesk.TIMEOUT, metavar="S",
+                   help="seconds the copy may take to answer (default %(default)s)")
+    p = sub.add_parser("looking", help="the Mac's front window and the agent behind it")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("desk", help="the desk: the owner's always-running agent, talked to by voice")
+    dsub = p.add_subparsers(dest="dcmd", required=True)
+    dsub.add_parser("serve", help="run the desk (agent-board-desk.service)")
+    p = dsub.add_parser("say", help="one turn to the running desk")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--looking", action="store_true", help="the desk reads the Mac's front window first")
+    p.add_argument("--json", action="store_true", help="each event as a JSON line")
+    dsub.add_parser("new", help="a fresh conversation")
+    dsub.add_parser("mcp", help="the desk's tools: the MCP server its Claude starts, on stdio")
+    p = sub.add_parser("voice-enrol", help="a one-time link that enrols a device's passkey on the voice page")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("keyring-status", help="whether the browser's desktop keyring is locked (agentboard/keyring.py)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--wait", action="store_true", help="wait until it is unlocked")
+    p.add_argument("--timeout", type=float, default=600.0, metavar="S", help="how long --wait waits (600 s)")
+    sub.add_parser("keyring-unlock", help="unlock the keyrings with the password on stdin; never through act")
     a = ap.parse_args(argv)
     return {"snapshot": cmd_snapshot, "stream": cmd_stream, "act": cmd_act, "receive": cmd_receive, "sent": cmd_sent,
-            "done": cmd_done, "time": cmd_time}[a.cmd](a)
+            "done": cmd_done, "time": cmd_time, "mail-web": cmd_mail_web, "transcripts": cmd_transcripts,
+            "keyring-status": cmd_keyring_status, "keyring-unlock": cmd_keyring_unlock, "agents": cmd_agents,
+            "ask": cmd_ask, "looking": cmd_looking, "voice-enrol": cmd_voice_enrol, "desk": cmd_desk}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -15,8 +15,12 @@ work. It was built on Ubuntu with systemd; anything with a systemd **user** mana
 - A dedicated user account for the agents is a good idea (see [security](08-security.md)): agents
   run with permission prompts off.
 
-A **Mac** is optional. It runs the two menu-bar apps (agent board, to-do) and can host its own
-agent sessions whose mail goes through the Linux machine. See [07-mac.md](07-mac.md).
+A **Mac** runs the agent board, where you read and answer your agents (its Mail tab), start work (its
+Orchestrator button) and enrol your phone; and the to-do app. It can also host its own agent sessions.
+See [07-mac.md](07-mac.md). Without a Mac you can still work from the shell and, with Gmail on, by email.
+
+A **phone** (Android with Chrome) can run the **Agent Mail** app: your agent mail, replies and the
+orchestrator, over your Tailscale network.
 
 ## Packages on the Linux machine
 
@@ -37,8 +41,8 @@ gh auth login                     # as the GitHub account that owns your repos a
   Node.js 18+, e.g. from nodejs.org or `nvm`; or download a release binary from the Codex GitHub page),
   then `codex login`. Version 0.149 or newer (the mailroom delivers to Codex with `codex queue`).
 - **nvidia-smi** (optional): the board shows GPU use if it is present.
-- **Tailscale** (optional, recommended with a Mac): a private network so the Mac can reach the
-  Linux machine by ssh from anywhere, with nothing exposed to the internet.
+- **Tailscale**: a private network, so the Mac reaches the Linux machine by ssh from anywhere and the
+  phone app is reachable by your own devices alone, with nothing exposed to the internet.
 
 Neither CLI is on `PATH` in cron or a non-login ssh shell. The tools look in `~/.local/bin` and
 `/opt/homebrew/bin`, then ask a login shell, so the standard installers' locations work.
@@ -47,12 +51,11 @@ Neither CLI is on `PATH` in cron or a non-login ssh shell. The tools look in `~/
 
 | Account | Why | Guide |
 |---|---|---|
-| A **new Gmail account** for your agents (e.g. `yourname.agents@gmail.com`) | the shared mailbox every agent sends from and the mailroom reads | [02-agent-gmail.md](02-agent-gmail.md) |
-| A **Google Cloud project** (free) in that or your own Google account | the OAuth client that lets the mailroom use the Gmail API | [02-agent-gmail.md](02-agent-gmail.md) |
-| Your **own email address** | the only sender agents take instructions from. Its provider must sign mail with DKIM (Gmail and most providers do) | |
 | **GitHub** (`gh` logged in) | repos, worktrees, PRs, and the private `tasks` repo behind the to-do list | [06-todo.md](06-todo.md) |
 | **Claude** plan (Pro/Max/Team/Enterprise) or an API key | Claude Code agents and the orchestrator | [04-claude-and-codex.md](04-claude-and-codex.md) |
+| **Tailscale** (the free personal plan is enough) | the private network between the Linux machine, the Mac and the phone | <https://tailscale.com> |
 | **ChatGPT/OpenAI** plan (optional) | Codex agents | [04-claude-and-codex.md](04-claude-and-codex.md) |
+| A **Gmail account for agents** and a Google Cloud project (optional) | only with `WITH_GMAIL="yes"`: agents mail you through it, and you can instruct them by email | [02-agent-gmail.md](02-agent-gmail.md) |
 
 ## Where things go
 
@@ -60,7 +63,7 @@ Neither CLI is on `PATH` in cron or a non-login ssh shell. The tools look in `~/
 |---|---|
 | the kit checkout (anywhere, e.g. `~/code/agent-board-kit`) | code; the installed commands point here, so keep it |
 | `~/.config/agent-kit/kit.env` | your values (the only personal file the installer reads) |
-| `~/.config/agent-mail/` | mailroom config, the OAuth client file and the Gmail token (mode 600) |
+| `~/.config/agent-mail/` | mailroom config (and, with Gmail on, the OAuth client file and the Gmail token, mode 600) |
 | `~/.local/bin/` | the commands (small wrappers into the kit) |
 | `~/.local/state/agent-mail/`, `agent-status/`, `agent-board/` | routing database, event log, board state |
 | `REPOS_ROOT` (e.g. `~/code`) | your repos; agent worktrees are created next to their repo |

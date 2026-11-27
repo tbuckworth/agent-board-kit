@@ -1,0 +1,23 @@
+{
+ "model": "gemini-3.8-live",
+ "api_version": "v1beta",
+ "voice": "Puck",
+ "accent": "",
+ "language_code": "",
+ "new_session_seconds": 30,
+ "conversation_minutes": 10,
+ "question_chars": 1000,
+ "answer_chars": 2000,
+ "exclude_groups": [],
+ "excluded_as": "an agent kept from voice",
+ "gemini_key_file": "~/.config/agent-board/gemini-key",
+ "gemini_key_env": null,
+ "gemini_key_command": null,
+ "limits": {
+  "start": {"in_flight": 1, "per_window": 6, "window_seconds": 600, "per_day": 40},
+  "transcript": {"in_flight": 2, "per_window": 200, "window_seconds": 600, "per_day": 3000},
+  "list_agents": {"in_flight": 2, "per_window": 60, "window_seconds": 600, "per_day": 1000},
+  "what_am_i_looking_at": {"in_flight": 1, "per_window": 60, "window_seconds": 600, "per_day": 1000},
+  "ask_agent": {"in_flight": 1, "per_window": 10, "window_seconds": 600, "per_day": 60}
+ }
+}

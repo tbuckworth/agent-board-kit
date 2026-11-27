@@ -5,6 +5,21 @@ without permission prompts on your machine. That is the point, and it is also th
 
 ## Who can instruct your agents
 
+With Gmail off (the default), no mail reaches your agents at all. You instruct them through:
+
+- **The board**, over your own ssh login to the Linux machine: your messages, your Mail-tab replies, the
+  Orchestrator button and your group-chat posts.
+- **The phone app**, on your own Tailscale network only: a request is answered only from a phone you named
+  (`devices`), logged in to Tailscale as you, with a session from a passkey sign-in; each reply and orchestrator
+  message needs the passkey (your fingerprint) again. It refuses to answer while its port is public through
+  Tailscale Funnel. Enrolling a phone needs a one-time code the Mac shows. Details: `board/README.md`, "Mail on
+  the phone (Agent Mail)".
+- **Security alerts** (a phone enrolled, fast mode unable to put an agent back as it was) are kept in the Mail tab
+  and also posted as a Mac notification, which the phone app cannot dismiss. With no Gmail they have no separate
+  channel: someone who controls both your Mac session and your phone could hide them.
+
+With Gmail on (`WITH_GMAIL="yes"`), mail adds these:
+
 - **Only `OWNER_EMAIL`**, and only when Gmail's `Authentication-Results` header shows a **DKIM pass**
   for that address's domain (`require_dkim: true`, the default). A forged `From:` is held and you
   are alerted. Keep your own email account well protected (2FA): it is now a remote control.
@@ -56,7 +71,7 @@ command your user can. Mitigations, in order of value:
 | `~/.config/agent-mail/credentials.json` | your OAuth client id/secret | mode 600; identifies your private app |
 | `~/.config/agent-mail/token.json` | the agents' Gmail refresh token (`gmail.modify`) | mode 600, dir 700; revoke at myaccount.google.com/permissions |
 | `~/.config/agent-kit/kit.env` | names and addresses only | no secrets |
-| board `gmail_credentials` (optional) | a refresh token for **your own** Gmail: `gmail.readonly` for the read-check, `gmail.modify` for the Mail tab's Sync with Gmail, which changes only the Inbox and Unread labels of the agents' mail | mode 600; checked to belong to your address before use; off unless you name it |
+| board `gmail_credentials` (optional) | a refresh token for **your own** Gmail: `gmail.readonly` for the read-check and the Time page, or a scope that can make drafts (`gmail.modify`) for the Mail tab's Forward, which only creates a draft for you to send | mode 600; checked to belong to your address before use; off unless you name it |
 | board `google_token` (optional) | a refresh token for your Google account, read-only: `calendar.readonly` (Time page, meeting alerts) and `drive.metadata.readonly` (the Time page's documents) | mode 600; off unless you name it |
 
 `kit doctor` checks that each of these files is private.

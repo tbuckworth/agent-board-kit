@@ -4,12 +4,14 @@
     agent-usage [--json] [--refresh] [--repo PATH] [--cli claude|codex]
     agent-usage --pick [--repo PATH] [--cli claude|codex]     # just the target, e.g. claude:work or codex
     agent-usage init-account NAME --config-dir DIR [--copy-mcp a,b] [--dry-run]   # prepare a second Claude login
+    agent-usage login NAME [--json]     # how to start claude on login NAME: its config dir, settings, model, options
 
 Details: README.md, section "Usage-aware routing and a second Claude login"; settings: config key "usage"
 (agentmail/usage.py DEFAULTS).
 """
 import argparse
 import json
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -67,7 +69,8 @@ def cmd_init(a):
     accts = {n: v for n, v in s["claude_accounts"].items() if n != a.name}
     accts.setdefault(dflt, {"config_dir": None})
     snippet = {"usage": {"claude_accounts": dict({a.name: {"config_dir": d, "label": a.name}}, **accts),
-                         "order": [usage.claude_target(n) for n in [a.name] + list(accts)] + [usage.CODEX]}}
+                         "order": [usage.claude_target(n) for n in [a.name] + list(accts)
+                                   if not accounts.manual(accts.get(n))] + [usage.CODEX]}}
     print("\nNext steps (you, not an agent):\n"
           "  1. CLAUDE_CONFIG_DIR=%s claude      # pick a theme, then /login with the %s account\n"
           "  2. set in ~/.config/agent-mail/config.json (rename the default login's account if you like):\n"
@@ -80,6 +83,30 @@ def cmd_init(a):
     return 0
 
 
+def cmd_login(a):
+    """One Claude login of usage.claude_accounts, for a program that starts claude on it: its config dir (null: the
+    default login), settings file, model, whether it is manual, and the options claude takes there
+    (accounts.launch_args)."""
+    s = usage.settings(config.load())
+    if a.name not in s["claude_accounts"]:
+        print("agent-usage: %r is not a Claude login (usage.claude_accounts has %s)"
+              % (a.name, ", ".join(sorted(s["claude_accounts"])) or "none"), file=sys.stderr)
+        return 1
+    acct = accounts.account(s, a.name)
+    d = accounts.expand(acct.get("config_dir"))
+    out = {"name": a.name, "label": acct.get("label") or a.name, "config_dir": d,
+           "settings": accounts.expand(acct.get("settings")), "model": accounts.fixed_model(acct),
+           "manual": accounts.manual(acct), "args": accounts.launch_args(s, d)}
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return 0
+    for k in ("name", "label", "config_dir", "settings", "model"):
+        print("%-11s %s" % (k, out[k] if out[k] is not None else "-"))
+    print("%-11s %s" % ("manual", "yes" if out["manual"] else "no"))
+    print("%-11s %s" % ("args", shlex.join(out["args"]) or "-"))
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["init-account"]:
@@ -89,6 +116,11 @@ def main(argv=None):
         ap.add_argument("--copy-mcp", help="comma-separated user MCP server names to copy from ~/.claude.json (after login)")
         ap.add_argument("--dry-run", action="store_true")
         return cmd_init(ap.parse_args(argv[1:]))
+    if argv[:1] == ["login"]:
+        ap = argparse.ArgumentParser(prog="agent-usage login")
+        ap.add_argument("name", help="a Claude login of config usage.claude_accounts")
+        ap.add_argument("--json", action="store_true")
+        return cmd_login(ap.parse_args(argv[1:]))
     ap = argparse.ArgumentParser(prog="agent-usage", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--json", action="store_true")

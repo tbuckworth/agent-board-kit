@@ -1,0 +1,10 @@
+{
+ "model": "claude-sonnet-5-5",
+ "effort": "low",
+ "claude_config_dir": null,
+ "socket": "~/.local/state/agent-board/desk/desk.sock",
+ "context_tokens": 100000,
+ "turn_seconds": 600,
+ "system_prompt": "desk-prompt.md",
+ "read_dirs": null
+}

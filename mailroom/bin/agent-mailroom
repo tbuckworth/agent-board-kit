@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""agent-mailroom: poll the agents Gmail inbox and route replies to sessions, with the replies written in the Mail tab.
+"""agent-mailroom: route the replies the owner writes in the Mail tab, and the agents Gmail inbox's mail when Gmail is
+on (a reMarkable document among it), to sessions, end fast mode on a Mail-tab thread when its time is up, and send
+the Mail tab's Researcher controls to their agents.
 
     agent-mailroom            run forever (systemd/agent-mailroom.service)
-    agent-mailroom --once     one poll, then exit
+    agent-mailroom --once     one poll (with Gmail off: one pass), then exit
     agent-mailroom --dry-run  decide and log, but deliver nothing and change no labels
-    agent-mailroom --baseline reset the history cursor to now (ignore anything older)
+    agent-mailroom --baseline reset the Gmail history cursor to now (ignore anything older); Gmail only
 
-Details: README.md, sections "The mailroom", "Sender tiers, DKIM, collaborators" and "The Mail tab's mailbox".
+With Gmail off in config ("gmail": false) it needs no token and never calls Gmail: each pass routes the Mail tab's
+replies and does everything else a poll does. Details: README.md, sections "Running without Gmail", "The mailroom",
+"Sender tiers, DKIM, collaborators", "reMarkable documents", "Researcher mode" and "The Mail tab's mailbox".
 """
 import argparse
 import fcntl
@@ -17,8 +21,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import (alerts, config, deliver, gmail, groupmail, mailroom, orchestrate, recovery,  # noqa: E402
-                       review, routing, statuslog)
+from agentmail import (alerts, config, deliver, fastmode, gmail, groupmail, mailroom, orchestrate,  # noqa: E402
+                       outbound, recovery, remarkable, researchermode, review, routing, statuslog)
 from agentmail.groups import GroupError  # noqa: E402
 from agentmail.watch import log  # noqa: E402
 from agentmail.store import Store  # noqa: E402
@@ -36,8 +40,8 @@ def on_signal(signum, frame):
 
 def process(svc, st, cfg, gid, dry_run):
     """Gmail message gid, once: read it, skip the agents account's own mail, record it (pending) with the session the
-    routing slip finds (mailroom.claim), hold a sender on neither list or without a DKIM pass, and route the rest
-    (route)."""
+    routing slip finds (mailroom.claim), put reMarkable mail through its route, hold a sender on neither list or
+    without a DKIM pass, and route the rest (route)."""
     if st.seen(gid):
         return
     msg = gmail.get_full(svc, gid)
@@ -60,8 +64,18 @@ def process(svc, st, cfg, gid, dry_run):
     inbound_id = st.record_inbound(
         gmail_id=gid, thread_id=thread_id, message_id=hdrs.get("message-id"),
         from_addr=from_addr, from_name=from_name, subject=subject,
-        matched_tag=session["tag"] if session else None, match_rule=rule, action="pending", body=body)
+        matched_tag=session["tag"] if session else None, match_rule=rule, action="pending", body=body,
+        in_reply_to=routing.direct_reply_parent(gmail.all_headers(msg)))
 
+    if remarkable.is_sender(cfg["remarkable"], from_addr):
+        status, detail = remarkable.handle(svc, cfg, inbound_id, msg, from_name, from_addr, subject, auth, dry_run)
+        log("%s #%d from %s %r: %s" % ({"started": "remark", "dry-run": "would"}.get(status, "hold  "),
+                                       inbound_id, from_addr, subject, detail))
+        if dry_run:
+            st.update_inbound(inbound_id, action="dry-run", detail=detail)
+        else:
+            remarkable.record(svc, st, cfg, inbound_id, gid, status, detail, from_addr, subject)
+        return
     refused = mailroom.sender_hold(cfg, tier, from_addr, auth, subject, inbound_id)
     if refused:
         detail, alert = refused
@@ -160,7 +174,7 @@ def route(svc, st, cfg, row, tier, dry_run):
                 log("files  #%d: %d put on %s for %s" % (inbound_id, len(files), session["origin_host"], who))
             text = routing.event_text("session", tier, inbound_id, from_name, from_addr, collab, subject, delivered,
                                       thread_txt, cfg["owner_name"],
-                                      reminder=mailroom.owner_reminder(st, cfg, tier, inbound_id, body))
+                                      reminder=mailroom.owner_reminder(st, cfg, tier, inbound_id, body, session))
             rc, out = mailroom.deliver_to_session(svc, st, cfg, inbound_id, gid, session, text, tier, True)
         if rc == 0:
             log("deliver #%d (%s) from %s %r -> %s via %s: %s" % (inbound_id, tier, from_addr, subject, who, rule, out))
@@ -266,7 +280,9 @@ def hold_after_error(svc, st, cfg, gid, e, dry_run):
     except Exception as e2:
         log("ERROR  #%d: could not label it held: %s: %s" % (row["id"], type(e2).__name__, e2))
     group = st.session_by_tag(row["matched_tag"]) if row["matched_tag"] else None
-    if group is not None and group["cli"] == routing.GROUP_CLI:   # a reply to a group's mail: nobody reruns it
+    if remarkable.is_sender(cfg["remarkable"], row["from_addr"]):
+        retry = "agent-mail remarkable %d" % row["id"]
+    elif group is not None and group["cli"] == routing.GROUP_CLI:   # a reply to a group's mail: nobody reruns it
         retry = "%s, with the reply's text" % groupmail.post_command(cfg, group["session_id"])
     else:
         retry = "agent-mail rerun %d (the orchestrator) or agent-mail release %d <session>" % (row["id"], row["id"])
@@ -313,7 +329,30 @@ def rescan(svc, st, cfg, cursor, dry_run):
 
 
 def poll(svc, st, cfg, dry_run):
+    """One poll: fast mode's pass, the agents inbox's new mail (Gmail on only: poll_gmail), the replies written in
+    the Mail tab that wait, and the watchdog. With Gmail off (svc gmail.OFF) it asks Gmail nothing, and records its
+    time as the store's meta last_pass. Returns how many mails and replies it handled."""
     started = int(time.time())
+    if not dry_run:
+        researchermode.tick(st, cfg, time.time())
+        fast_pass(svc, st, cfg, counting=True)   # first, so that it runs while Gmail cannot be reached too
+    if config.gmail_on(cfg):
+        n = poll_gmail(svc, st, cfg, dry_run, started)
+        if n is None:   # stopping: the rest of the poll waits for the next run
+            return 0
+    else:
+        n = 0
+        st.set_meta("last_pass", started)
+    local = route_tab_replies(svc, st, cfg, st.local_replies_waiting(), dry_run)   # those left for a poll
+    if not dry_run and not STOP:
+        watchdog(svc, st, cfg)
+    return n + local
+
+
+def poll_gmail(svc, st, cfg, dry_run, started):
+    """The Gmail part of a poll begun at started: each message added to the inbox since the history cursor (or found
+    by rescan once Gmail has dropped it) processed, and the cursor and last_poll moved on. Returns how many there
+    were, or None when the daemon is stopping before the last, keeping the old cursor."""
     start = st.get_meta("history_id")
     if not start:
         start = str(gmail.profile(svc)["historyId"])
@@ -327,31 +366,77 @@ def poll(svc, st, cfg, dry_run):
         if STOP:
             # Keep the old cursor: the next poll skips saved messages and picks up
             # the remainder. Advancing it here would silently drop that remainder.
-            return 0
+            return None
         try:
             process(svc, st, cfg, gid, dry_run)
         except Exception as e:  # one bad message must not stall the queue
             hold_after_error(svc, st, cfg, gid, e, dry_run)
     st.set_meta("history_id", newest)
     st.set_meta("last_poll", started)
-    local = st.local_replies_waiting()   # replies written in the Mail tab, oldest first
+    return len(ids)
+
+
+def route_tab_replies(svc, st, cfg, local, dry_run):
+    """Route local, replies the owner wrote in the Mail tab that wait (Store.local_replies_waiting's rows),
+    oldest first; one that fails is held (hold_after_error). A stopping daemon leaves the rest waiting, still "local".
+    Returns how many there were."""
     for row in local:
         if STOP:
-            return len(ids)   # the rest wait, still "local", for the next poll
+            break
         try:
             process_local(svc, st, cfg, row, dry_run)
         except Exception as e:
             hold_after_error(svc, st, cfg, row["gmail_id"], e, dry_run)
-    if not dry_run and not STOP:
-        watchdog(svc, st, cfg)
-    return len(ids) + len(local)
+    return len(local)
+
+
+def between_polls(svc, st, cfg, seconds, dry_run):
+    """The wait of `seconds` before the next poll, a second at a time, so that a stop is seen within one. After each
+    second, the replies written in the Mail tab that wait in a thread Gmail holds no mail of (with
+    config mailbox.owner_delivery "local", a thread of agent mail to the owner alone), or with Gmail off in config every
+    reply that waits, are routed (route_tab_replies), after fast mode's pass, whose failures count as no tries there:
+    one reaches its session within about a second of its writing, asking Gmail nothing, whether Gmail can be reached
+    or not. With Gmail on, a reply in a thread Gmail holds mail of waits for the next poll, as its route to the
+    orchestrator reads that thread from Gmail (mailroom.thread_messages). Routing a reply here cannot pass Gmail mail
+    of its thread not yet polled, as Gmail holds none of it. A failure is logged and tried again after the next
+    second: a reply is taken before it is routed (process_local), so none goes twice."""
+    gmail_on = config.gmail_on(cfg)
+    for _ in range(int(seconds)):
+        if STOP:
+            return
+        time.sleep(1)
+        if not dry_run and not STOP:
+            researchermode.tick(st, cfg, time.time())
+        try:
+            local = [r for r in st.local_replies_waiting()
+                     if not (gmail_on and st.thread_in_gmail(r["thread_id"]))]
+            if not local or STOP:
+                continue
+            if not dry_run:
+                fast_pass(svc, st, cfg, counting=False)
+            route_tab_replies(svc, st, cfg, local, dry_run)
+        except Exception as e:
+            log("tab replies not routed between polls: %s: %s; tried again in a second" % (type(e).__name__, e))
+
+
+def fast_pass(svc, st, cfg, counting):
+    """Fast mode's pass (fastmode.tick), at the start of each poll and before the replies routed between polls, so
+    before any mail is routed: end each fast mode whose time is up, putting the agent's effort back and telling it, and
+    press the keys that wait for a dialog to close; its failures count as tries only when `counting` (at a poll). A
+    failure is logged and tried again at the next pass."""
+    try:
+        for line in fastmode.tick(outbound.Context.opened(cfg, st, svc), time.time(), counting):
+            log(line)
+    except Exception as e:
+        log("fast mode pass failed: %s: %s; tried again at the next pass" % (type(e).__name__, e))
 
 
 def watchdog(svc, st, cfg):
     """After a poll, with no model call: alert the owner to quota events in the status log (the store's
     watchdog_quota_ts records how far it has read), retry the notices of held replies that failed to go out, mail
-    the owner about each new group (groupmail.announce), and send the drafts the pre-send review held past
-    fallback_minutes by running `agent-mail flush-drafts`."""
+    the owner about each new group (groupmail.announce), send the drafts the pre-send review held past
+    fallback_minutes by running `agent-mail flush-drafts`, and, with mail to the owner kept for the Mail tab alone and
+    Gmail on, nudge them through Gmail when some is waiting (alerts.nudge)."""
     now = time.time()
     # quota notifications written to the status log by the Notification hook
     last = float(st.get_meta("watchdog_quota_ts", now - 3600))
@@ -383,6 +468,13 @@ def watchdog(svc, st, cfg):
                 log("review " + line)
         except Exception as e:
             log("review flush-drafts failed: %s" % e)
+    # with mail to the owner kept for the Mail tab alone: a content-free nudge through Gmail when some is waiting
+    try:
+        told = alerts.nudge(svc, st, cfg, time.time())
+        if told:
+            log("nudge  told %s of %d agent mail(s) in the Mail tab" % (cfg["owner_name"], told))
+    except Exception as e:
+        log("nudge failed: %s: %s; tried again after the next poll" % (type(e).__name__, e))
 
 
 def main(argv=None):
@@ -390,18 +482,26 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--baseline", action="store_true", help="reset the history cursor to now")
+    ap.add_argument("--baseline", action="store_true", help="reset the Gmail history cursor to now (Gmail only)")
     a = ap.parse_args(argv)
 
-    cfg = config.load()
     try:
+        cfg = config.load()
         config.require_account(cfg)
     except config.ConfigError as e:
         print("agent-mailroom: %s" % e, file=sys.stderr)
         return 2
+    gmail_on = config.gmail_on(cfg)
+    if not gmail_on and a.baseline:
+        print('agent-mailroom: --baseline resets the Gmail history cursor, and Gmail is off in config ("gmail": false '
+              "in %s)" % config.CONFIG_PATH, file=sys.stderr)
+        return outbound.NEEDS_GMAIL
     if not cfg["allowlist"]:
-        print("agent-mailroom: warning: config `allowlist` is empty, so every inbound mail is held. "
-              "Add the owner's address to %s." % config.CONFIG_PATH, file=sys.stderr)
+        print("agent-mailroom: warning: config `allowlist` is empty, so %s. Add the owner's address to %s." % (
+            "every inbound mail is held" if gmail_on else "the Mail tab shows no thread and agent mail to the owner is "
+                                                          "refused", config.CONFIG_PATH), file=sys.stderr)
+    for line in outbound.gmail_ignored(cfg):
+        print("agent-mailroom: warning: Gmail is off, so this config takes no effect: %s" % line, file=sys.stderr)
     config.STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock = open(config.LOCK_PATH, "a+")
     try:
@@ -411,19 +511,24 @@ def main(argv=None):
         return 1
 
     st = Store()
-    try:
-        svc = gmail.service()
-    except gmail.NoToken as e:   # no token yet: say what to run instead of a traceback
-        print("agent-mailroom: %s" % e, file=sys.stderr)
-        return 2
-    if a.baseline:
-        hid = str(gmail.profile(svc)["historyId"])
-        st.set_meta("history_id", hid)
-        log("history cursor reset to %s" % hid)
-    for name in cfg["labels"].values():
-        gmail.ensure_label(svc, name)
-    log("mailroom up: %s, allowlist %s, poll %ss%s" % (
-        cfg["account"], ", ".join(cfg["allowlist"]), cfg["poll_seconds"], " (dry run)" if a.dry_run else ""))
+    if gmail_on:
+        try:
+            svc = gmail.service()
+        except gmail.NoToken as e:   # no token yet: say what to run instead of a traceback
+            print("agent-mailroom: %s" % e, file=sys.stderr)
+            return 2
+        if a.baseline:
+            hid = str(gmail.profile(svc)["historyId"])
+            st.set_meta("history_id", hid)
+            log("history cursor reset to %s" % hid)
+        for name in cfg["labels"].values():
+            gmail.ensure_label(svc, name)
+        log("mailroom up: %s, allowlist %s, poll %ss%s" % (
+            cfg["account"], ", ".join(cfg["allowlist"]), cfg["poll_seconds"], " (dry run)" if a.dry_run else ""))
+    else:
+        svc = gmail.OFF   # no token, no Gmail call: anything that tried one would raise gmail.GmailOff
+        log("mailroom up: Gmail off, agent mail to the owner kept for the Mail tab; allowlist %s, pass every %ss%s" % (
+            ", ".join(cfg["allowlist"]), cfg["poll_seconds"], " (dry run)" if a.dry_run else ""))
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
@@ -438,17 +543,14 @@ def main(argv=None):
         except Exception as e:
             backoff = min(300, (backoff or 15) * 2)
             log("poll error %s: %s; retrying in %ss" % (type(e).__name__, e, backoff))
-            try:
-                svc = gmail.service()
-            except Exception as e2:
-                log("re-auth failed: %s" % e2)
+            if gmail_on:
+                try:
+                    svc = gmail.service()
+                except Exception as e2:
+                    log("re-auth failed: %s" % e2)
             if a.once:
                 return 1
-        wait = backoff or cfg["poll_seconds"]
-        for _ in range(int(wait)):
-            if STOP:
-                break
-            time.sleep(1)
+        between_polls(svc, st, cfg, backoff or cfg["poll_seconds"], a.dry_run)
     log("mailroom down")
     return 0
 

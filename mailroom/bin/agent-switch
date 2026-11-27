@@ -43,6 +43,8 @@ def show_options(opts):
         "" if a["movable"] else "; cannot switch: " + a["why_not"]))
     for t in opts["targets"]:
         print("  %-18s %-9s %-11s %s" % (t["target"], "current" if t["current"] else t["kind"], t["status"], t["usage"]))
+        if t["models"] != opts["models"][t["cli"]]:   # a login with a model of its own
+            print("    its models: %s" % ", ".join(m["value"] for m in t["models"]))
     for cli, models in opts["models"].items():
         print("  %s models: %s" % (cli, ", ".join("%s [%s]" % (m["value"], "/".join(m["efforts"])) for m in models)))
 

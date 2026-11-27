@@ -1,5 +1,5 @@
 [Unit]
-Description=Agent mailroom: route Gmail replies to Claude Code and Codex sessions
+Description=Agent mailroom: route Mail-tab (and Gmail) replies to Claude Code and Codex sessions
 After=network-online.target
 Wants=network-online.target
 
