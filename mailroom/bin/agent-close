@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import close  # noqa: E402
+from agentmail import close, config  # noqa: E402
 
 
 def main(argv=None):
@@ -25,6 +25,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if bool(a.name) == a.self_:
         ap.error("give a NAME or --self")
+    try:   # which sessions there are, and which tmux server ends them, both come from it
+        config.load()
+    except (OSError, ValueError) as e:
+        print("agent-close: refusing: %s cannot be read: %s" % (config.CONFIG_PATH, e), file=sys.stderr)
+        return 2
     info, err = close.find(a.name, self_=a.self_)
     if err:
         print("agent-close: " + err, file=sys.stderr)

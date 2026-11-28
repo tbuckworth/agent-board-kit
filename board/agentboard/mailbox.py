@@ -1,15 +1,17 @@
 """The Mail tab: mail between the owner and the agents, kept by the mailroom (its README, "The Mail tab's mailbox"),
 which holds each mail's content and the owner's read, archive and snooze state. The board reads and changes it as the
-owner through
-`agent-mail mailbox ...` and hands its JSON answers to the Mac as they are. That command refuses to change anything
-inside an agent session; the collector and `agent-board act` run from the Mac's SSH login, outside any.
+owner through `agent-mail mailbox ...` and hands its JSON answers to the Mac as they are, but for the sessions and
+group colours the lists may ask for (add_sessions, add_groups), which it reads from the mailroom's store and the
+board's layout. That command refuses to change anything inside an agent session; the collector and `agent-board act`
+run from the Mac's SSH login, outside any.
 """
 import json
 import os
 import re
+import sqlite3
 import time
 
-from . import sources
+from . import colours, groups, sources
 
 REFRESH = 30             # seconds between the snapshot's reads of the summary
 # BOXES, OPS and UPTO_OPS are the mailroom's (agentmail/mailbox.py), repeated here to check a request before it goes
@@ -18,7 +20,9 @@ OPS = ("read", "unread", "archive", "inbox", "snooze")
 UPTO_OPS = ("read", "archive", "snooze")       # the ops that name the newest agent mail the owner saw (`upto`)
 # whole values (matched with fullmatch):
 THREAD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}")   # never an option
-KEY_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{15,63}")  # a reply's idempotency key, made by the Mac; not "-..."
+TAG_RE = re.compile(r"[a-z0-9]{6,12}")                       # the mailroom's routing tag (its routing.TAG_RE)
+# an idempotency key, made by the Mac or the phone's page: a reply's, or a message to the orchestrator's; not "-..."
+KEY_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{15,63}")
 MESSAGE_RE = re.compile(r"[si][0-9]{1,12}")   # s<id>: an agent's mail; i<id>: the owner's own
 MAX_QUERY = 200          # characters in a search
 MAX_LIMIT = 500          # threads in one list
@@ -27,6 +31,8 @@ MAX_REPLY = 20000        # characters in a reply (the mailroom's own limit)
 MAX_FILES = 20           # files with one reply, and their bytes together (the mailroom's MAX_ANSWER_FILES and
 MAX_FILE_BYTES = 25 << 20   # MAX_ANSWER_FILE_BYTES; the Mac's MailModel.maxFiles and maxFileBytes)
 MAX_FILE_NAME = 255      # characters in a file's name; the mailroom makes a safe name of it
+ANSWER_REFUSED = 6       # `mailbox answer`'s exit code when it refuses a reply before recording it (the mailroom's
+                         # mailbox.ANSWER_REFUSED); any other failure may come after it recorded it
 # characters (or bytes) of the largest mail_reply request: the most files as base64, and a megabyte for the rest (the
 # longest text, at most 6 bytes a character in JSON, the names and the fields)
 MAX_REPLY_REQUEST = MAX_FILE_BYTES * 4 // 3 + (1 << 20)
@@ -54,6 +60,46 @@ def listing(box, query, limit, run=sources.run):
     return _call(args, run)
 
 
+def add_sessions(listed, store):
+    """mail_list's answer `listed`, each of its threads given "sessions": the board's agents that wrote in it, [] for
+    none (`store`, a sources.MailStore: thread_sessions), so that the Mac can mark the threads of a busy agent; or,
+    when the store cannot be read, the threads as they were and "sessions_error" saying why. Changes and returns
+    `listed`."""
+    threads = listed.get("threads")
+    rows = [t for t in threads if isinstance(t, dict) and isinstance(t.get("id"), str)] if isinstance(threads, list) else []
+    try:
+        by = store.thread_sessions([t["id"] for t in rows])
+    except (sqlite3.Error, OSError) as e:
+        listed["sessions_error"] = sources.error_text(e)
+        return listed
+    for t in rows:
+        t["sessions"] = by.get(t["id"], [])
+    return listed
+
+
+def add_groups(listed, store):
+    """mail_list's answer `listed`, each of its threads given the group of the agent of its newest agent mail
+    ("newest"), as the board places it (groups.placed: the layout and each tile's latest group), with that group's
+    colours (colours.of: "group", "subgroup", "colour", "shade"), for the strip down its row on the Mac:
+    a thread with no agent mail, or whose newest is from a session on another machine, the orchestrator or a tile in no
+    group, is Ungrouped. When the store, the layout, the tiles' groups or colours.json cannot be read, the threads as
+    they were and "groups_error" saying why. Changes and returns `listed`."""
+    threads = listed.get("threads") if isinstance(listed.get("threads"), list) else []
+    rows = [t for t in threads if isinstance(t, dict) and isinstance(t.get("id"), str)
+            and isinstance(t.get("newest"), int) and not isinstance(t["newest"], bool)]
+    try:
+        layout = groups.layout()
+        place = groups.placed(groups.history(), layout)
+        coloured = colours.for_layout(layout, colours.load())
+        by = store.sent_sessions([t["newest"] for t in rows if t["newest"]])
+    except (sqlite3.Error, OSError, ValueError) as e:
+        listed["groups_error"] = sources.error_text(e)
+        return listed
+    for t in rows:
+        t.update(colours.of(coloured, place.get(by.get(t["newest"]))))
+    return listed
+
+
 def show(thread, run=sources.run):
     """One thread: its list entry, its messages, and the whole thread as one sanitized HTML page (`document`)."""
     return _call(["show", "--", thread], run)
@@ -70,11 +116,20 @@ def mark(threads, op, upto, until, run=sources.run):
 def answer(thread, key, text, files, run=sources.run):
     """The owner's reply to the newest agent mail in `thread`, `key` its idempotency key, with `files` ([{"name",
     "data": base64}], [] for none), which the agent gets as files on its own machine. The mailroom routes it as it
-    routes the owner's emailed replies, on its next poll. A reply without files goes as plain text on stdin, with them as
-    JSON (`--json`)."""
+    routes the owner's emailed replies, within a second or two. A reply without files goes as plain text on stdin,
+    with them as JSON (`--json`)."""
     if not files:
         return _call(["answer", "--key", key, "--", thread], run, stdin=text)
     return _call(["answer", "--key", key, "--json", "--", thread], run, stdin=json.dumps({"text": text, "files": files}))
+
+
+def set_mode(command, thread, on, run):
+    """Run `agent-mail mailbox COMMAND -- THREAD on|off` and return its decoded JSON.
+
+    COMMAND is the mode subcommand and its options. The mailroom changes the mode for the thread's route and
+    returns the thread. A command or decoding failure raises sources.CommandError.
+    """
+    return _call([*command, "--", thread, "on" if on else "off"], run)
 
 
 def part(key, index, run=sources.run):
@@ -82,42 +137,12 @@ def part(key, index, run=sources.run):
     return _call(["part", "--", key, str(index)], run)
 
 
-class GmailSideFailed(RuntimeError):
-    """sync brought the tab into step, but changing Gmail failed, before any change or part way through: `tab` is what
-    the tab's side changed. Syncing again makes the changes Gmail still lacks."""
-
-    def __init__(self, tab, error):
-        super().__init__("the tab is in step with Gmail (%d threads archived, %d read), but changing Gmail failed: %s; "
-                         "sync again to finish" % (tab["archived"], tab["read"], error))
-        self.tab = tab
-
-
-def sync(gmail, run=sources.run):
-    """The tab and the owner's Gmail brought into step (`agent-mail mailbox sync`), what is done in either counting as
-    done in both: the mailroom archives and marks read the tab's threads that Gmail has archived or read, then the
-    agents' mail that Gmail must archive or mark read to match the tab is changed there. gmail is
-    gmailstate.for_owner's. Answers {"archived", "read"} (threads in the tab) and {"gmail_archived", "gmail_read"}
-    (mails in Gmail). Raises sources.CommandError, RuntimeError when the Gmail login is not the owner's, and
-    GmailSideFailed when changing Gmail fails (with a read-only login, Gmail refuses the change: HTTP 403)."""
-    inbox, unread = gmail.state()
-    res = _call(["sync"], run, stdin=json.dumps({"inbox": sorted(inbox), "unread": sorted(unread)}))
-    tab = {"archived": res["archived"], "read": res["read"]}
-    archive = sorted({g for m in res["gmail"]["archive"] for g in inbox[m]})
-    read = sorted({g for m in res["gmail"]["read"] for g in unread[m]})
-    try:
-        gmail.remove_label(archive, "INBOX")
-        gmail.remove_label(read, "UNREAD")
-    except RuntimeError as e:
-        raise GmailSideFailed(tab, e) from e
-    return dict(tab, gmail_archived=len(archive), gmail_read=len(read))
-
-
 def receive(stream, now):
     """`agent-board receive`: one file too big for a reply, sent from the Mail tab, kept for the agent the reply names
     it to. `stream` (binary) holds a JSON line {"name": text, "size": bytes}, then the file's bytes. It is written to
-    BIG_FILES/<day>/<name> (made safe; " (2)" and on when taken), readable by the owner only, and its path returned. Raises
-    ValueError for a header that is not one, a file over MAX_BIG_FILE, or fewer bytes than it said, and OSError when it
-    cannot be written; either way it leaves nothing."""
+    BIG_FILES/<day>/<name> (made safe; " (2)" and on when taken), readable by the owner only, and its path returned.
+    Raises ValueError for a header that is not one, a file over MAX_BIG_FILE, or fewer bytes than it said, and OSError
+    when it cannot be written; either way it leaves nothing."""
     head = json.loads(stream.readline(4096) or b"null")
     if not (isinstance(head, dict) and isinstance(head.get("name"), str) and isinstance(head.get("size"), int)
             and not isinstance(head["size"], bool) and 0 <= head["size"] <= MAX_BIG_FILE):

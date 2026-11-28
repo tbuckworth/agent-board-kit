@@ -201,8 +201,22 @@ class Command(unittest.TestCase):
         self.assertEqual(calls[0][0][1:], ["--from", "agent-memwatch", RUN_A["id"], "hello"])
         # agent-mail runs under this interpreter (the kit's venv, which holds the Google client libraries)
         self.assertEqual(calls[1][0][0], sys.executable)
-        self.assertEqual(calls[1][0][2:], ["send", "--unrouted", "--to", "t@x", "--subject", "[agent-memwatch] subj"])
+        self.assertEqual(calls[1][0][2:], ["send", "--unrouted", "--alert", "memory", "--to", "t@x", "--subject",
+                                           "[agent-memwatch] subj"])
         self.assertEqual(calls[1][1], "body")
+
+    def test_a_ping_a_codex_agent_holds_in_its_queue_counts_as_sent(self):
+        """agent-send exits HELD: the ping is in the agent's queue and arrives at its next turn, so it is recorded as
+        sent and not sent again on the next pass."""
+        mw = load_script("agent-memwatch")
+        # agent-send, which would reach a live session
+        held = "held in Codex's queue for codex e6\nits last turn was interrupted"
+        with mock.patch.object(mw.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(["agent-send"], mw.deliver.HELD, held, "")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            done = mw.act([("ping", own()[0], 1, "hello", "k1")], dict(config.DEFAULTS))
+        self.assertEqual(done, ["k1"])
+        self.assertIn("its last turn was interrupted", out.getvalue())
 
     def test_a_pass_saves_only_the_sends_that_worked(self):
         """agent-mail fails (exit 1): the urgent email is not saved as sent, so the next pass tries it again."""

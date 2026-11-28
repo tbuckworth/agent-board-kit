@@ -16,7 +16,7 @@ import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail
 import fakes  # noqa: E402
 import homes  # noqa: E402
 from scripts import load_script  # noqa: E402
-from agentmail import config, jsonfile, launch, registry, report, statuslog, trust, worktree  # noqa: E402
+from agentmail import config, deliver, jsonfile, launch, registry, report, statuslog, trust, worktree  # noqa: E402
 
 
 class StatusLog(unittest.TestCase):
@@ -190,8 +190,9 @@ class Spawn(unittest.TestCase):
     def test_default_models(self):
         p = self.spawn_plan()
         self.assertEqual((p["cli"], p["model"], p["effort"]), ("claude", None, "xhigh"))    # Claude Code's own model
-        p = self.spawn_plan(conf={"spawn_claude_model": "claude-fable-5-2"})
-        self.assertEqual((p["cli"], p["model"], p["effort"]), ("claude", "claude-fable-5-2", "xhigh"))
+        p = self.spawn_plan(conf={"spawn_claude_model": "claude-opus-5-5"})
+        self.assertEqual((p["cli"], p["model"], p["effort"]), ("claude", "claude-opus-5-5", "xhigh"))
+        self.assertEqual(self.spawn_plan("--model", "fable")["model"], "fable")   # another model when asked for
         p = self.spawn_plan("--cli", "codex")
         self.assertEqual((p["model"], p["effort"]), ("gpt-6.1-sol", "xhigh"))
         p = self.spawn_plan("--cli", "codex", "--model", "gpt-6-astra", "--effort", "medium")
@@ -290,6 +291,20 @@ class Spawn(unittest.TestCase):
                 self.assertIn("no session matches", json.loads(out)["error"])
             self.assertIn("FAILED", statuslog.read(event="spawn")[-1]["text"])
 
+    def test_a_brief_a_codex_agent_holds_in_its_queue_is_no_failure_and_says_why(self):
+        """agent-send exits HELD: the brief is in the running agent's queue and arrives at its next turn. It must not
+        be reported as undelivered (which invites sending it again); a note says it waits there, and why."""
+        # no ' in it: the fake agent-send echoes it in '...'
+        held = (deliver.HELD, "held in the Codex queue for codex spawn-test\nits last turn was interrupted, so Codex "
+                              "holds it until another turn starts")
+        code, out, err, _ = self.run_spawn("--reuse", "--json", sessions=["spawn-test"], agent_send=held)
+        self.assertEqual(code, 0, err)
+        plan = json.loads(out)
+        self.assertNotIn("error", plan)
+        self.assertIn("the brief waits in Codex's queue: its last turn was interrupted, so Codex holds it until "
+                      "another turn starts", plan["notes"])
+        self.assertNotIn("FAILED", statuslog.read(event="spawn")[-1]["text"])
+
     def test_a_codex_agent_that_never_got_its_brief_is_a_failure(self):
         """When `codex queue` fails or no thread appears, agent-spawn exits 1 with the reason, in --json's "error"
         and the spawn event."""
@@ -339,7 +354,8 @@ class Spawn(unittest.TestCase):
                                               env={"FAKE_TMUX_DIALOG": on_it, "FAKE_TMUX_DIALOG_KEY": "Enter"})
         self.assertEqual(code, 0, err)
         typed = [c[-1] for c in bins.calls("tmux") if c[:1] == ["send-keys"]]
-        self.assertEqual(typed[1:4], ["Enter", "Enter", "/rename spawn-test"])   # the line's Enter, the confirm, rename
+        self.assertEqual(typed[0], "C-u")                              # the shell's line cleared, then the launch line
+        self.assertEqual(typed[2:5], ["Enter", "Enter", "/rename spawn-test"])   # the line's Enter, the confirm, rename
         self.assertNotIn("3", typed)
 
     def test_a_codex_hook_review_without_the_untrusted_choice_is_left_alone(self):
@@ -350,7 +366,8 @@ class Spawn(unittest.TestCase):
                                                   env={"FAKE_TMUX_DIALOG": screen, "FAKE_TMUX_DIALOG_KEY": "3"})
         plan = json.loads(out)
         typed = [c[-1] for c in bins.calls("tmux") if c[:1] == ["send-keys"]]
-        self.assertEqual(typed[1:], ["Enter"])                         # only the launch line and its Enter
+        self.assertEqual(typed[0], "C-u")                              # the shell's line cleared, then the launch line
+        self.assertEqual(typed[2:], ["Enter"])                         # only the launch line and its Enter
         self.assertEqual(plan["notes"], ["Codex asks to review its hooks and offers no 'Continue without trusting': "
                                          "answer it in the agent's window",
                                          "Codex's prompt did not show within 0.3 s, so the agent was not renamed"])

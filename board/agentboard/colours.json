@@ -1,0 +1,7 @@
+{
+ "groups": {},
+ "reserve": ["#0E8A84", "#6A5ACD", "#3E9B4F", "#CF4F7E", "#2E5C8A", "#A85551", "#9750A7", "#3A9BC9", "#AD78B9",
+             "#B08A1E"],
+ "ungrouped": "#8C877F",
+ "shades": {"lightness": 0.10, "chroma": 0.92}
+}

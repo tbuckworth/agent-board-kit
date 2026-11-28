@@ -44,10 +44,12 @@ def _lines(path):
 
 
 def record(kind, to, text, ok, **facts):
-    """Append one message the owner sent. ts: when it was sent (default now)."""
-    if not isinstance(text, str) or not text.strip():
+    """Append one message the owner sent: text, or files alone (facts' "files", their names) with no text. ts: when
+    send was pressed (default now)."""
+    text = text.strip() if isinstance(text, str) else ""
+    if not text and not facts.get("files"):
         return
-    sources.append_jsonl(PATH, dict({"ts": time.time()}, **facts, kind=kind, to=to, ok=ok, text=text.strip()))
+    sources.append_jsonl(PATH, dict({"ts": time.time()}, **facts, kind=kind, to=to, ok=ok, text=text))
 
 
 def _derived_ref(r):

@@ -115,12 +115,18 @@ def stub(bin_dir, name, out, code=0, err=""):
     script(bin_dir, name, "printf '%%s' %s\nprintf '%%s' %s >&2\nexit %d" % (shlex.quote(out), shlex.quote(err), code))
 
 
+def alert_kind(cmd):
+    """The kind an agent-mail command line gives --alert, or None without one."""
+    return cmd[cmd.index("--alert") + 1] if "--alert" in cmd else None
+
+
 class Outside:
     """What the real notify.Notifier runs, recorded instead of run: agent-send would message a real session and
     agent-mail would send real email. `run` stands in for util.run; Base.fake_op records the provider stops."""
 
     def __init__(self):
         self.pings, self.emails, self.stops = [], [], []
+        self.alerts = []   # (subject, the kind agent-mail's --alert was given, or None) of each email
         self.ping_ok, self.email_ok = True, True
 
     def run(self, cmd, env=None, timeout=120, cwd=None, input_text=None):
@@ -129,6 +135,7 @@ class Outside:
             return (0, "", "") if self.ping_ok else (1, "", "agent-send: no session %s" % cmd[-2])
         assert cmd[:2] == ["agent-mail", "send"], cmd
         self.emails.append((cmd[cmd.index("--subject") + 1], Path(cmd[cmd.index("--body-file") + 1]).read_text()))
+        self.alerts.append((cmd[cmd.index("--subject") + 1], alert_kind(cmd)))
         return (0, "", "") if self.email_ok else (1, "", "agent-mail: SMTP unavailable")
 
 
@@ -266,6 +273,7 @@ class CrashLoop(Base):
         self.assertEqual([tuple(a) for a in self.db.q("select key, actor, ok from actions where action='stop'")],
                          [(k, "watchdog", 1)])
         self.assertTrue(any("Stopped crash-looping" in s for s, _ in self.n.emails))
+        self.assertEqual({kind for s, kind in self.n.alerts if "Stopped crash-looping" in s}, {"cloud-stop"})
         self.assertIsNone(self.db.open_incident(k))
 
     def skips(self):
@@ -282,6 +290,7 @@ class CrashLoop(Base):
         self.tick(T0 + 600 + 16 * 60)
         self.assertEqual(self.n.stops, [])
         self.assertTrue(any("owner not reached" in s for s, _ in self.n.emails))
+        self.assertEqual({kind for s, kind in self.n.alerts if "owner not reached" in s}, {"cloud-idle"})
         self.assertEqual(self.skips(), [("a fresh log check does not confirm the crash loop", 1)])
         inc = self.db.open_incident(k)
         self.assertEqual((inc["state"], inc["ping_count"], inc["email_count"]), ("escalated", 1, 1))
@@ -296,6 +305,7 @@ class CrashLoop(Base):
         self.assertEqual(self.n.stops, [])
         foreign = [s for s, _ in self.n.emails if "Someone else's app" in s]
         self.assertEqual(len(foreign), 1)  # once per 24 h
+        self.assertEqual([kind for s, kind in self.n.alerts if "Someone else" in s], ["cloud-colleague"])
         self.assertEqual(self.db.q("select * from incidents"), [])   # no owner ladder for someone else's app
         self.assertEqual(self.db.meta("foreign_crash:" + k), T0 + 600)   # emailed when the crash loop was confirmed
 
@@ -616,6 +626,7 @@ class CostRules(Base):
             self.tick(t)
         cost_mails = [s for s, _ in self.n.emails if "has cost" in s]
         self.assertEqual(len(cost_mails), 2)  # $500 tier, then $1,000 tier
+        self.assertEqual([kind for s, kind in self.n.alerts if "has cost" in s], ["cloud-cost"] * 2)
         self.assertEqual(self.res(k)["cost_email_tier"], 1000)
 
     def test_failed_cost_email_is_sent_again_next_check(self):
@@ -865,11 +876,16 @@ class Cli(Base):
 
 
 class Commands(Cli):
+    def setUp(self):
+        super().setUp()
+        self.kinds = []   # what agent-mail's --alert was given (None: no --alert) for each email agent_mail took
+
     @contextlib.contextmanager
     def agent_mail(self, code):
         """agent-mail sends real email, so util.run, which runs it for these commands, returns its exit code instead."""
         def run(cmd, env=None, timeout=120, cwd=None, input_text=None):
             self.assertEqual(cmd[:2], ["agent-mail", "send"])
+            self.kinds.append(alert_kind(cmd))
             return code, "", "" if code == 0 else "agent-mail: SMTP unavailable"
         with mock.patch.object(util, "run", run):
             yield
@@ -912,6 +928,7 @@ class Commands(Cli):
         with self.agent_mail(0):
             self.assertEqual(self.cw("heartbeat")[0], 0)
         self.assertTrue(self.db.meta("heartbeat_alerted"))
+        self.assertEqual(self.kinds, ["cloud-heartbeat"] * 2)
 
     def unit_failed(self):
         """systemctl and journalctl would read this host's units and journal: stubs first on the PATH answer that the
@@ -931,12 +948,14 @@ class Commands(Cli):
         self.assertIsNotNone(self.db.meta("failure_alerted_at"))
         emails = self.db.q("select detail from actions where action='email'")
         self.assertEqual([a["detail"].split(":")[0] for a in emails], ["[cloud-watchdog] Check failed (exit-code)"] * 2)
+        self.assertEqual(self.kinds, ["cloud-check"] * 2)
 
     def test_digest_send_failure_exits_nonzero(self):
         with self.agent_mail(1):
             code, out, err = self.cw("digest", "--send")
         self.assertEqual(code, 1)
         self.assertIn("not sent", err)
+        self.assertEqual(self.kinds, [None])   # the digest is no alert
 
     def checks(self, times):
         """Run a check at each time, as `cloud-watch check --account none`: it collects no account, so it calls no
@@ -1191,6 +1210,7 @@ class Commands(Cli):
         self.assertEqual(alerted(), 1)
         sent = self.db.q("select ok from actions where action='email' and detail like '[cloud-watchdog] Can''t see%'")
         self.assertEqual([a["ok"] for a in sent], [0, 1])
+        self.assertEqual(self.kinds, ["cloud-blind", None] * 2)   # each check tries the day's digest too, no alert
 
     def launch(self, command, provider_cli, started, extra_args=()):
         """Run `cloud-watch launch --expect 6h --reason sweep ... -- COMMAND` through the real gather.op, collect.main
@@ -1318,17 +1338,19 @@ class Notifying(Base):
     def test_email_result_tells_sent_folded_and_failed_apart(self):
         n = self.notifier(T0)
         self.n.email_ok = False
-        self.assertEqual(n.email("[cloud-watchdog] one", "body"), "failed")
+        self.assertEqual(n.email("[cloud-watchdog] one", "body", alert="cloud-cost"), "failed")
         self.n.email_ok = True
-        self.assertEqual(n.email("[cloud-watchdog] two", "body"), "sent")
-        self.assertEqual(self.notifier(T0, cfg=dict(self.cfg, max_emails_per_day=1)).email("three", "body"), "folded")
-        self.assertEqual(self.notifier(T0, shadow=True).email("four", "body"), "shadow")
+        self.assertEqual(n.email("[cloud-watchdog] two", "body", alert="cloud-cost"), "sent")
+        self.assertEqual(self.notifier(T0, cfg=dict(self.cfg, max_emails_per_day=1)).email("three", "body",
+                                                                                          alert="cloud-cost"), "folded")
+        self.assertEqual(self.notifier(T0, shadow=True).email("four", "body", alert="cloud-cost"), "shadow")
         self.assertEqual([s for s, _ in self.n.emails], ["[cloud-watchdog] one", "[cloud-watchdog] two"])
 
     def test_every_sent_email_ends_with_the_reply_footer(self):
         n = self.notifier(T0, cfg=dict(self.cfg, shadow_days=3))
-        n.email("[cloud-watchdog wd-7] x", "body", incident_id=7)
-        n.send("[cloud-watchdog] Daily", "digest body")
+        n.email("[cloud-watchdog wd-7] x", "body", alert="cloud-idle", incident_id=7)
+        n.send("[cloud-watchdog] Daily", "digest body", alert=None)
+        self.assertEqual(self.n.alerts, [("[cloud-watchdog wd-7] x", "cloud-idle"), ("[cloud-watchdog] Daily", None)])
         (_, with_incident), (_, without) = self.n.emails
         self.assertIn("`cloud-watch close wd-7 --by human", with_incident)
         self.assertIn("`cloud-watch close <id> --by human", without)
@@ -1337,19 +1359,19 @@ class Notifying(Base):
 
     def test_email_over_the_daily_cap_goes_into_the_digest(self):
         n = self.notifier(T0, cfg=dict(self.cfg, max_emails_per_day=2))
-        got = [n.email("[cloud-watchdog] %d" % i, "body", key="k") for i in range(3)]
+        got = [n.email("[cloud-watchdog] %d" % i, "body", alert="cloud-cost", key="k") for i in range(3)]
         self.assertEqual((got, len(self.n.emails)), (["sent", "sent", "folded"], 2))
         self.assertEqual([tuple(i) for i in self.db.q("select kind, key, text from digest_items")],
                          [("capped_email", "k", "[cloud-watchdog] 2 (held back: daily email cap)")])
         later = self.notifier(T0 + 86401, cfg=dict(self.cfg, max_emails_per_day=2))   # a day on: the cap is free
-        self.assertEqual(later.email("[cloud-watchdog] 3", "body"), "sent")
+        self.assertEqual(later.email("[cloud-watchdog] 3", "body", alert="cloud-cost"), "sent")
 
     def test_shadow_notifier_runs_nothing_and_logs_what_it_would_do(self):
         inc, res = self.owned_box()
         n = self.notifier(T0, shadow=True)
         self.assertEqual(n.ping(inc, res, "Is this yours?\nmore"), (True, "shadow"))
         self.assertEqual(n.ping(inc, res, "Is this yours?", resume=True), (True, "shadow"))
-        self.assertEqual(n.email("[cloud-watchdog] x", "body"), "shadow")
+        self.assertEqual(n.email("[cloud-watchdog] x", "body", alert="cloud-cost"), "shadow")
         self.assertEqual(n.stop(res, "watchdog", inc["id"]), (True, "shadow"))
         self.assertEqual((self.n.pings, self.n.emails, self.n.stops), ([], [], []))
         logged = self.db.q("select action, detail, shadow from actions where action!='register' order by id")

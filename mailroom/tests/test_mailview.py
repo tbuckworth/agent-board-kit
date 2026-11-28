@@ -216,7 +216,24 @@ class SafeHtml(unittest.TestCase):
         self.assertIn('<p align="center">t</p>', out)
         self.assertNotIn("srcset", out)
         self.assertIn('<ol type="a" start="3" reversed=""><li type="i">x</li></ol><p>y</p>', out)
-        self.assertIn('<font size="3" face="Arial" color="red">f</font><td>c</td>', out)
+        self.assertIn('<font size="3" color="red">f</font><td>c</td>', out)
+
+    def test_nothing_shows_text_in_another_order_or_font_than_it_reads(self):
+        """No dir (right-to-left on English shows its words in another order), no face (a symbol font shows
+        pictures for words), no <q>, <bdo> or <bdi> (their text kept), and no bidi control or other character shown
+        as nothing in the text or an attribute."""
+        rlo, rli, pdi, zwsp, tag = "\U0000202E", "\U00002067", "\U00002069", "\U0000200B", "\U000E0041"
+        out = mailview.safe_html('<p dir="rtl">Delete it.</p><div dir="rtl" data-agentmail-widget="0">w</div>'
+                                 '<font face="Webdings" color="red">f</font><q>quoted</q><bdo dir="rtl">bdo</bdo>'
+                                 '<bdi>bdi</bdi><p title="t%sitle">%skeep%s %snot%s Do%s</p><img alt="a%slt">'
+                                 % (rlo, rli, pdi, rlo, zwsp, tag, rlo), {}, "s7", 1)
+        self.assertEqual(out, '<div class="mail"><p>Delete it.</p><div class="widget" data-widget="s7-0">w</div>'
+                              '<font color="red">f</font>quotedbdobdi<p title="title">keep not Do</p>'
+                              "[image not shown: alt]</div>")
+
+    def test_details_keep_open(self):
+        self.assertEqual(self.clean('<details open><summary>s</summary>x</details><p open>y</p>'),
+                         '<div class="mail"><details open=""><summary>s</summary>x</details><p>y</p></div>')
 
     def test_bypasses(self):
         cases = {
@@ -319,8 +336,78 @@ class Css(unittest.TestCase):
 
     def test_ordinary_declarations_stay(self):
         self.assertEqual(self.style_attr("font-family: 'Segoe UI', Arial; color:#333 !important; --gap: 4px"),
-                         "font-family: 'Segoe UI', Arial; color:#333 !important; --gap: 4px;")
+                         "font-family: 'Segoe UI', Arial; color: #333 !important;")
         self.assertEqual(self.style_attr("color: red /* comment */; nonsense; {x}"), "color: red;")
+
+    def test_css_that_could_hide_text_or_write_its_own_is_dropped(self):
+        """Anything that moves, scales, clips, covers, fades or hides text, or writes text the mail does not hold:
+        the owner would read one thing and quote another. Gone from a style attribute and from a <style> block, nested
+        or not."""
+        for css in ("position: absolute", "position: fixed", "top: -9999px", "left: -9999px", "inset: 0",
+                    "z-index: 9", "transform: scale(0)", "scale: 0", "rotate: 90deg", "translate: -9999px",
+                    "zoom: 0.01", "filter: opacity(0)", "backdrop-filter: blur(9px)", "mask: linear-gradient(#000,#0)",
+                    "mask-image: linear-gradient(transparent,transparent)", "clip: rect(0 0 0 0)",
+                    "clip-path: inset(50%)", "mix-blend-mode: screen", "opacity: 0", "visibility: hidden",
+                    "content-visibility: hidden", "overflow: hidden", "overflow-x: auto", "text-overflow: clip",
+                    "text-indent: -9999px", "word-spacing: -99px", "letter-spacing: -1em", "float: left",
+                    "display: none", "display: contents", "background-image: linear-gradient(#fff,#fff)",
+                    "background: linear-gradient(#fff,#fff)", "background: #fff linear-gradient(#fff,#fff)",
+                    "color: transparent", "color: #ffffff00", "color: rgba(0,0,0,0)", "font-size: var(--x)",
+                    "--x: 1px", "font-size: calc(1px)", "font-size: smaller", "line-height: -1",
+                    "margin: -50px", "margin-left: -9999px", "padding-left: 9999px", "width: 9999px",
+                    "min-width: 200%", "height: 9999px", "border-left: 9999px solid #fff", "max-height: 0",
+                    "-webkit-text-fill-color: transparent", "-webkit-text-security: disc", "-webkit-line-clamp: 1",
+                    "content: 'not '", "CONTENT: open-quote", "quotes: 'Do not ' ''", "counter-reset: item 5",
+                    "counter-increment: list-item -1", "counter-set: item 9", "list-style-type: 'not '",
+                    "list-style: 'not ' inside", "list-style-type: var(--x)", "list-style-type: symbols(cyclic 'no')",
+                    "text-emphasis-style: 'x'", "hyphenate-character: ' not'", "unicode-bidi: bidi-override",
+                    "direction: rtl", "vertical-align: 9999px", "font: 0/0 a", "font: 1px var(--x)",
+                    "font-family: Webdings", "font-family: 'Segoe UI', Wingdings", "font: 12px Webdings",
+                    "font-family: Symbol, serif", "height: 0", "width: 0", "max-width: 0", "width: 0.5px",
+                    "max-width: 0.01em", "height: 0%", "min-width: 0.5%", "max-width: 0.5pt"):
+            with self.subTest(css=css):
+                self.assertEqual(self.style_attr("color: red; %s; margin: 0" % css), "color: red; margin: 0;")
+                sheet = "<style>li { color: red; %s } @media screen { li::before { %s } }</style>" % (css, css)
+                self.assertEqual(style_block(mailview.safe_html(sheet, {}, "s7", 0)),
+                                 "#s7 .mail { li { color: red; } }")
+
+    def test_the_formatting_agents_use_stays(self):
+        """The properties and values stored agent mail uses (the renderer's own among them), as they were."""
+        css = ("font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 15px; "
+               "line-height: 1.5; color: #1f2328; max-width: 42em; margin: 0 auto; padding: 16px; "
+               "background: #f6f8fa; padding: 10px 12px; border-radius: 6px; white-space: pre-wrap; font-size: 90%; "
+               "border-collapse: collapse; border: 1px solid #d0d7de; padding: 4px 6px; vertical-align: top; "
+               "text-align: right; color: #0969da; border-bottom: 2px solid white; border-left: 4px solid #2953a6; "
+               "font: 700 22px/1.3 Georgia, serif; font-weight: 600; font-style: italic; "
+               "font-variant-numeric: tabular-nums; text-decoration: line-through; text-transform: uppercase; "
+               "letter-spacing: 0.05em; overflow-wrap: anywhere; word-break: break-all; display: inline-block; "
+               "display: table-header-group; width: 100%; width: 210px; width: 1px; min-width: 24px; height: auto; "
+               "height: 9px; max-width: 1200px; table-layout: fixed; list-style: none; list-style-type: lower-alpha; "
+               "margin-top: 0; padding-left: 2em; border-top: 0; border: none; box-sizing: border-box; "
+               "background-color: #fff; color: #333 !important;")
+        self.assertEqual(self.style_attr(css), css)
+        out = mailview.safe_html("<style>td { %s }</style>" % css, {}, "s7", 0)
+        self.assertEqual(style_block(out), "#s7 .mail { td { %s } }" % css)
+
+    def test_small_fonts_and_line_heights_are_raised(self):
+        """A size too small to see is raised to the least (LEAST_FONT_PX and the rest), in its own unit, so that a
+        spacer cell keeps its look and text in it shows."""
+        for css, kept in (("font-size: 1px", "font-size: 8px;"), ("font-size: 4pt", "font-size: 6pt;"),
+                          ("font-size: 0.1em", "font-size: 0.5em;"), ("font-size: 10%", "font-size: 50%;"),
+                          ("font-size: 0.2rem", "font-size: 0.5rem;"), ("font-size: 9px", "font-size: 9px;"),
+                          ("font-size: 0", ""),                          # a bare number is no font size
+                          ("line-height: 1px", "line-height: 8px;"), ("line-height: 0", "line-height: 1;"),
+                          ("line-height: 0.5", "line-height: 1;"), ("line-height: 10%", "line-height: 100%;"),
+                          ("line-height: 0.1em", "line-height: 1em;"), ("line-height: 1.2", "line-height: 1.2;"),
+                          ("font: 1px/0 Arial", "font: 8px/1 Arial;")):
+            with self.subTest(css=css):
+                self.assertEqual(self.style_attr(css), kept)
+
+    def test_at_rules_that_write_text_are_dropped(self):
+        out = mailview.safe_html("<style>@counter-style no { system: cyclic; symbols: 'not '; suffix: ' ' } "
+                                 "ol { list-style-type: no } @page { @top-center { content: 'x' } }</style>",
+                                 {}, "s7", 0)
+        self.assertEqual(style_block(out), "#s7 .mail { ol { list-style-type: no; } }")   # an unknown style: numbers
 
     def test_an_unclosed_quote_takes_the_rest_of_the_declarations(self):
         self.assertEqual(self.style_attr("color: red; font-family: 'a; margin: 0"), "color: red;")
@@ -328,8 +415,8 @@ class Css(unittest.TestCase):
     def test_style_blocks_are_scoped_to_the_message(self):
         out = mailview.safe_html("<style>p { color: red } body{margin:0;font-family:Georgia} td, th {padding:4px}"
                                  "</style><p>x</p>", {}, "s7", 0)
-        self.assertEqual(out, '<div class="mail"><style>#s7 .mail { p { color: red; } & { margin:0; '
-                              'font-family:Georgia; } td, th { padding:4px; } }</style><p>x</p></div>')
+        self.assertEqual(out, '<div class="mail"><style>#s7 .mail { p { color: red; } & { margin: 0; '
+                              'font-family: Georgia; } td, th { padding: 4px; } }</style><p>x</p></div>')
 
     def test_every_style_block_is_kept_and_parsed_on_its_own(self):
         out = mailview.safe_html("<style>a { color: red</style><p>x</p><style>b { color: blue }</style>", {}, "s7", 0)
@@ -345,10 +432,10 @@ class Css(unittest.TestCase):
                                            "@media (max-width: 600px) { p { font-size: 12px; } } }")
 
     def test_selectors_that_could_match_outside_the_message_are_dropped(self):
-        for css in ("~ * { display: none }", "+ details { display: none }", "> * { display: none }",
-                    "|| td { display: none }", "& ~ * { display: none }", ":root :not(&) { display: none }",
-                    "p:has(&) { display: none }", "p, ~ * { display: none }", ", p { display: none }",
-                    "color: red; display: none", "@media screen { display: none }"):
+        for css in ("~ * { color: red }", "+ details { color: red }", "> * { color: red }",
+                    "|| td { color: red }", "& ~ * { color: red }", ":root :not(&) { color: red }",
+                    "p:has(&) { color: red }", "p, ~ * { color: red }", ", p { color: red }",
+                    "color: red; margin: 0", "@media screen { color: red }"):
             with self.subTest(css=css):
                 self.assertIsNone(style_block(mailview.safe_html("<style>%s</style>" % css, {}, "s7", 0)))
 
@@ -429,6 +516,20 @@ class Document(unittest.TestCase):
         self.assertIn("<ul>\n<li>one</li>\n<li>two</li>\n</ul>", page)
         self.assert_self_contained(page)
 
+    def test_a_bare_address_stays_a_link_through_the_sanitizer(self):
+        """An agent's plain-text mail (its HTML rendered when sent) and a mail with no HTML (rendered here) both."""
+        text = "The page: https://claude.ai/artifact/abc-123?x=1&y=2. Or (https://x.y/z)."
+        link = ('<a href="%s" style="color: #0969da;" rel="noreferrer noopener">%s</a>'
+                % (("https://claude.ai/artifact/abc-123?x=1&amp;y=2",) * 2))
+        for key, raw in (("s1", agent_mail(text)), ("s2", text_only_mail(text))):
+            with self.subTest(key=key):
+                page = mailview.document("E6", [], [entry(key, raw=raw)])
+                self.assertIn("The page: %s. Or (" % link, page)
+                self.assertIn('<a href="https://x.y/z" style="color: #0969da;" rel="noreferrer noopener">'
+                              "https://x.y/z</a>).", page)
+                self.assertEqual(Shape(page).problems, [])
+                self.assert_self_contained(page)
+
     def test_sender_recipients_text_and_status_are_escaped(self):
         page = mailview.document("Run A", [], [entry("i4", sender="<b>Alex</b> & co", recipients='"x" <x@example.com>',
                                         mine=True, text="keep <b>this</b> & that\n  indented",
@@ -481,15 +582,40 @@ class Document(unittest.TestCase):
             mailview.document("Run A", [], [entry("s9")])
 
     def test_one_message_cannot_style_another_or_the_page(self):
-        hostile = ("<style>} body, details, summary { display: none } ~ * { display: none }</style>"
+        hostile = ("<style>} body, details, summary { color: red } ~ * { color: red }</style>"
                    '<p style="position: fixed; inset: 0">cover</p></div></div></details><details open><p>forged</p>')
         page = mailview.document("Run A", [], [entry("s1", raw=agent_mail("x", hostile)), entry("s2", text="next")])
         body = page.split("<body>", 1)[1]
         blocks = re.findall(r"<style>(.*?)</style>", body, re.S)
-        self.assertEqual(blocks, ["#s1 .mail { &, details, summary { display: none; } }"])
+        self.assertEqual(blocks, ["#s1 .mail { &, details, summary { color: red; } }"])
         self.assertEqual(Shape(page).problems, [])
         self.assertEqual(re.findall(r'<details id="(\w+)"', page), ["s1", "s2"])
         self.assertRegex(page, r"body > \.msg > \.card \{[^}]*contain: content;")   # a fixed element stays on its card
+
+    def test_no_text_the_page_takes_from_an_entry_keeps_a_bidi_control(self):
+        rlo = "\U0000202E"
+        page = mailview.document("Re%s: plan" % rlo, ["al%sice (claude)" % rlo], [
+            entry("s1", sender="al%sice" % rlo, recipients="al%sex" % rlo, status="held%s" % rlo,
+                  text="keep%s it" % rlo)])
+        self.assertNotIn(rlo, page)
+        for text in ("Re: plan", "alice (claude)", "to alex", "held", "keep it"):
+            self.assertIn(text, page)
+
+    def test_a_wide_table_scrolls_with_the_card_and_code_wraps(self):
+        """The sanitizer drops the renderer's own overflow-x: auto (a mail could copy it to clip text), so only the
+        card scrolls. A table's cells break no word, so its columns are no narrower than their longest word, and a
+        table wider than the card scrolls with it instead of squeezing to a letter a line (a ten-column table on a
+        phone); code still wraps to fit."""
+        page = mailview.document("E6", [], [entry("s1", raw=agent_mail(
+            "| run | loss |\n|---|---|\n| %s | 1.9 |\n\n```\n%s\n```" % ("x" * 300, "y" * 300)))])
+        self.assertIn("<table", page)
+        self.assertIn("<pre", page)
+        self.assertNotIn("overflow", page.split("<body>", 1)[1])          # only the card itself scrolls
+        card = re.search(r"^body > \.msg > \.card \{([^}]*)\}", mailview.PAGE_CSS, re.M).group(1)
+        self.assertIn("overflow-x: auto", card)
+        self.assertIn("body > .msg > .card > .mail pre { overflow-wrap: anywhere; }", mailview.PAGE_CSS)
+        self.assertIn("body > .msg > .card > .mail td, body > .msg > .card > .mail th { overflow-wrap: normal; }",
+                      mailview.PAGE_CSS)
 
     def test_the_page_css_styles_only_its_own_messages(self):
         """Every page rule but :root and body is anchored at one of the page's own top-level elements (a message,

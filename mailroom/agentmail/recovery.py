@@ -210,7 +210,9 @@ def notify(svc, st, cfg, inb):
             "Open email: %s\n\n"
             "For diagnosis: %s\nSaved mail: agent-mail show %s\n") % (
                 happened, routing.saved_where(inb["gmail_id"]), action, inb["subject"], inb["from_addr"],
-                gmail.web_url(cfg["account"], "all/%s" % inb["thread_id"]),
+                gmail.web_url(cfg["account"], "all/%s" % inb["thread_id"])
+                if config.gmail_on(cfg) and st.thread_in_gmail(inb["thread_id"])
+                else "in the Mail tab on the Agent Board (its thread is not in Gmail)",
                 inb["detail"] or "recipient unknown", inb["id"])
     if origin:
         body += "Original session: %s (%s)\n" % (origin["session_id"], origin["origin_host"])

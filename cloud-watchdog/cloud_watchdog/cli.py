@@ -378,7 +378,7 @@ def cmd_check(args, db, cfg, now):
 def cmd_digest(args, db, cfg, now):
     subject, md, _, _ = digest.build(db, cfg, now)
     if args.send:
-        if not notifier(db, cfg, now).send(subject, md):
+        if not notifier(db, cfg, now).send(subject, md, alert=None):
             die("digest not sent: agent-mail failed (its output is in the audit log)")
         print("sent")
     else:
@@ -417,7 +417,7 @@ def cmd_heartbeat(args, db, cfg, now):
         sent = notifier(db, cfg, now).send(
             NOT_RUNNING, "The last successful check was %s (%s ago). Check "
             "`systemctl --user status cloud-watchdog.timer` and `journalctl --user -u cloud-watchdog`." % (
-                util.iso(last, local=True), util.age(now - last)))
+                util.iso(last, local=True), util.age(now - last)), alert="cloud-heartbeat")
         if not sent:
             die("\"Not running\" email not sent: agent-mail failed (its output is in the audit log); the next "
                 "heartbeat tries again")
@@ -481,7 +481,7 @@ def cmd_alert_failure(args, db, cfg, now):
                shadow=False, now=now)
         return
     subject, md = failure_report(args.unit, cfg)
-    if not notifier(db, cfg, now).send(subject, md):
+    if not notifier(db, cfg, now).send(subject, md, alert="cloud-check"):
         die("failure email not sent: agent-mail failed (its output is in the audit log); the next failure tries again")
     db.set_meta("failure_alerted_at", now)
 

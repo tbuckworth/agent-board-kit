@@ -55,11 +55,11 @@ class GoogleError(webapi.ApiError):
     """A Google API request that failed (webapi.ApiError: `status` is the HTTP status)."""
 
 
-def http(method, url, data=None, headers=None, timeout=20, body=None):
-    """One request, `data` URL-encoded or `body` as JSON; JSON back, or GoogleError naming the status only, never the
-    request (it may carry the token)."""
+def http(method, url, data=None, headers=None, timeout=20, body=None, raw=None):
+    """One request, `data` URL-encoded, `body` as JSON or `raw` bytes as they are (webapi.request); JSON back, or
+    GoogleError naming the status only, never the request (it may carry the token)."""
     return webapi.request(method, url, "Google API", GoogleError, form=data, body=body, headers=headers,
-                          timeout=timeout)
+                          timeout=timeout, raw=raw)
 
 
 def header(message, name):
@@ -95,9 +95,11 @@ class Client:
         return self.http("PATCH", _with_query(url, params), headers={"Authorization": "Bearer " + self.token()},
                          body=body)
 
-    def post(self, url, body):
-        """Ask the thing at `url` to act on `body` (sent as JSON); its answer, {} when it has none."""
-        return self.http("POST", url, headers={"Authorization": "Bearer " + self.token()}, body=body)
+    def upload(self, url, raw, content_type, timeout):
+        """Send the bytes `raw`, of `content_type`, to an upload endpoint at `url`, allowing `timeout` seconds to send
+        them; its answer."""
+        return self.http("POST", url, headers={"Authorization": "Bearer " + self.token(), "Content-Type": content_type},
+                         raw=raw, timeout=timeout)
 
     def pages(self, url, params, key, max_pages=None):
         """Every item under `key` across the result pages (nextPageToken), at most `max_pages` pages if given."""

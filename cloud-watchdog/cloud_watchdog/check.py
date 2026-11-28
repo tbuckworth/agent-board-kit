@@ -76,7 +76,7 @@ def _run(db, cfg, dry_run, force_slow, only, now):
             "; it never stops anything itself (identity.owner_modal_users is empty)"
         notifier.send(messages.subject("Now live"),
                       "The shadow period is over: from now on the watchdog messages the agents that own resources, "
-                      "emails you%s. Reply \"stay in shadow\" or \"turn it off\" to change that." % stops)
+                      "emails you%s. Reply \"stay in shadow\" or \"turn it off\" to change that." % stops, alert=None)
 
     # 1. collect, in parallel, one credentialed child per account
     jobs = {}
@@ -146,7 +146,7 @@ def alert_blind(db, cfg, notifier, live, now):
             continue
         subject, md = messages.blind(h["account"], h)
         if live:
-            if notifier.email(subject, md, key=h["account"]) == "failed":
+            if notifier.email(subject, md, alert="cloud-blind", key=h["account"]) == "failed":
                 continue   # not marked alerted: the next check sends it again
         else:
             text = "%s: check failing (%s)" % (h["account"], (h["last_error"] or "")[:120])

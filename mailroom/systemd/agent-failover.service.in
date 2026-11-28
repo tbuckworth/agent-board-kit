@@ -1,5 +1,5 @@
 [Unit]
-Description=agent-failover: move Claude agents to another login when theirs hits a usage limit, and back after it resets
+Description=agent-failover: move Claude agents off a login at its usage limit, and up to a better one with headroom
 
 [Service]
 Type=simple

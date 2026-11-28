@@ -358,8 +358,10 @@ def cancelled():
 
 
 def mail(subject, body):
-    """Email the owner (mailroom config owner_email; sources.mail_owner), and log whether it went."""
-    sent, why = sources.mail_owner(subject, body)
+    """Email the owner (mailroom config owner_email; sources.mail_owner), and log whether it went. An ordinary notice,
+    of a restart the owner said yes to, whose progress the board's Desktop chip shows: no alert kind, so the mailroom
+    may keep it for the Mail tab alone."""
+    sent, why = sources.mail_owner(subject, body, alert=None)
     log("mail '%s': %s" % (subject, "sent" if sent else "NOT SENT: " + why))
 
 
@@ -460,10 +462,11 @@ def worker(run=sources.run, sleep=time.sleep, collector=None):
 
 
 # ------------------------------------------------------------------ restore
-def launch_line(a):
-    """Resume exactly as it ran: its own login (no re-placement), model and effort."""
+def launch_line(a, inherited=()):
+    """Resume exactly as it ran: its own login (no re-placement), model and effort (a per-token login's own model and
+    settings: relaunch.login_flags). inherited: the tmux server's variable names (relaunch.resume_command)."""
     return relaunch.resume_command(a["cli"], a["id"], a["cwd"], a.get("config_dir") or None, a.get("model"),
-                                   a.get("effort"), a.get("name") or a["display"])
+                                   a.get("effort"), a.get("name") or a["display"], inherited)
 
 
 def nudge_text(a, at, tmux, why):
@@ -494,8 +497,10 @@ def restore_one(a, why=""):
     if name in sources.tmux_sessions():
         name = relaunch.tmux_name_for(dict(a, name=name), set(sources.tmux_sessions()))
     wait = RESTORE_WAIT + (30 if a["cli"] == "codex" else 0)
-    up, memory, err, note = relaunch.launch_in_tmux(a, launch_line(a), name, run=sources.run_merged,
-                                                    live=sources.is_live, wait=wait)
+    line = launch_line(a, relaunch.tmux_env_names(sources.find_bin("tmux"), sources.run_merged) if a["cli"] == "claude"
+                       else ())
+    up, memory, err, note = relaunch.launch_in_tmux(a, line, name, run=sources.run_merged, live=sources.is_live,
+                                                    wait=wait)
     res = {"id": a["id"], "name": a["display"], "tmux": name, "ok": up, "choice": a["choice"]}
     note = "; " + note if note else ""
     if err or not up:

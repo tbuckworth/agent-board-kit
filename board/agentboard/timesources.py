@@ -47,14 +47,6 @@ class NotUploaded(SourceError):
     broken (timeuse.default_sources leaves screen time out until the Mac has uploaded, so it is not even waiting)."""
 
 
-def _text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") in ("text", "input_text"))
-    return ""
-
-
 # ------------------------------------------------------------------ transcripts
 
 def _note(out, ts, text):
@@ -91,7 +83,7 @@ def parse_claude(lines, out, path):
         if out["interactive"] is None:
             out["interactive"] = d.get("entrypoint") == "cli"
             out["cwd"] = d.get("cwd", "")
-        _note(out, sources.iso_ts(d["timestamp"]), _text(d.get("message", {}).get("content")).lstrip())
+        _note(out, sources.iso_ts(d["timestamp"]), sources.message_text(d.get("message", {}).get("content")).lstrip())
     return out
 
 
@@ -118,7 +110,7 @@ def parse_codex(lines, out, path):
             continue
         p = d.get("payload", {})
         if p.get("type") == "message" and p.get("role") == "user" and d.get("timestamp"):
-            _note(out, sources.iso_ts(d["timestamp"]), _text(p.get("content")).lstrip())
+            _note(out, sources.iso_ts(d["timestamp"]), sources.message_text(p.get("content")).lstrip())
     return out
 
 

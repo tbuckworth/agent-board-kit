@@ -1,4 +1,5 @@
 """agent-close: refuses unlanded work, removes only linked worktrees, ends the session. No tmux."""
+import io
 import os
 import re
 import shutil
@@ -13,6 +14,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
 import homes  # noqa: E402
+import fakes  # noqa: E402
+from scripts import load_script  # noqa: E402
 from agentmail import close, commands, statuslog  # noqa: E402
 
 
@@ -146,6 +149,53 @@ class Close(unittest.TestCase):
         self.assertEqual(code, 0, lines)
         self.assertFalse(self.wt.exists())
         self.assertIn("NOT ended", lines[-1])
+
+    def test_self_in_a_pane_of_another_tmux_server_is_refused_without_asking_tmux(self):
+        # pane ids restart at %0 on each server: the server agent-close ends sessions on may hold another agent's %3
+        sock = os.path.join(os.environ["TMUX_TMPDIR"], "tmux-%d" % os.getuid(), "default")
+        bins = fakes.install(self, TMUX="/elsewhere/tmux.sock,4242,0", TMUX_PANE="%3")
+        info, err = close.find(self_=True)
+        self.assertIsNone(err)
+        self.assertIsNone(info["tmux"])
+        self.assertEqual(bins.calls("tmux"), [])
+        code, lines = close.close(dict(info, cwd=str(self.wt)), self_=True)
+        self.assertEqual(code, 2)
+        self.assertIn("this session runs in a pane of the tmux server at /elsewhere/tmux.sock, not the one agent-close "
+                      "ends sessions on (%s)" % sock, lines[0])
+        self.assertTrue(self.wt.exists())
+        bins = fakes.install(self, TMUX="%s,4242,0" % sock, TMUX_PANE="%3",   # its own server: asked about that pane
+                             FAKE_TMUX_PANE_PID=str(os.getppid()))              # whose shell started this process
+        self.assertEqual(close.tmux_self(), ("#S", ""))                          # the fake prints the format back
+        self.assertEqual(bins.calls("tmux"), [["display-message", "-p", "-t", "%3", "#{pane_pid}\t#S"]])
+
+    def test_self_names_a_pane_only_by_its_id_and_only_one_whose_shell_started_it(self):
+        sock = os.path.join(os.environ["TMUX_TMPDIR"], "tmux-%d" % os.getuid(), "default")
+        for pane in ("", "mysession", "=x:"):   # tmux would answer for the session used last, perhaps another agent's
+            with self.subTest(pane=pane):
+                bins = fakes.install(self, TMUX="%s,4242,0" % sock, TMUX_PANE=pane)
+                name, why = close.tmux_self()
+                self.assertIsNone(name)
+                self.assertIn("not a pane id such as %3, so this session's pane is not known", why)
+                self.assertEqual(bins.calls("tmux"), [])
+        stray = subprocess.Popen(["true"])   # a pid that is not among this process's ancestors
+        stray.wait()
+        fakes.install(self, TMUX="%s,4242,0" % sock, TMUX_PANE="%3", FAKE_TMUX_PANE_PID=str(stray.pid))
+        self.assertEqual(close.tmux_self(), (None, "the shell of pane %%3 (pid %d) did not start this process, so it "
+                                                   "is not this session's pane" % stray.pid))
+
+    def test_a_config_that_cannot_be_read_or_names_no_server_is_refused_with_the_reason(self):
+        fakes.install(self, TMUX="/tmp/tmux-1000/default,4242,0", TMUX_PANE="%3")
+        cfg = homes.config_file(self, {})
+        for text, said in (("{not json", "agent-close: refusing: %s cannot be read: Expecting property name" % cfg),
+                           ('{"tmux_socket": 3}', "the tmux server agent-close ends sessions on is not known: config "
+                                                  "tmux_socket must be null or a socket's path, not 3")):
+            with self.subTest(config=text):
+                cfg.write_text(text)
+                with patch("sys.stderr", new_callable=io.StringIO) as err:
+                    code = load_script("agent-close").main(["--self", "--dry-run"])
+                self.assertEqual(code, 2, err.getvalue())
+                self.assertIn(said, err.getvalue())
+                self.assertTrue(self.wt.exists())
 
     def test_worktree_deleted_by_hand_is_pruned_and_landed_branch_dropped(self):
         shutil.rmtree(self.wt)

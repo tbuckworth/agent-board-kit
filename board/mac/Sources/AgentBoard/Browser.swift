@@ -22,6 +22,16 @@ enum Browser {
         return nil
     }
 
+    /// Gmail at `view` (the part after #, such as "all/THREAD" or "drafts?compose=MESSAGE") in the Google account
+    /// `email`, else in the first account signed in.
+    static func gmail(_ view: String, account email: String?) -> URL? {
+        // ?authuser=EMAIL picks the account (Gmail redirects to its /u/N/); a literal /u/EMAIL/ path gives
+        // "Temporary Error (404): your account is temporarily unavailable"
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "@.-_"))   // `+` would read as a space
+        let account = email.flatMap { $0.isEmpty ? nil : $0.addingPercentEncoding(withAllowedCharacters: safe) }
+        return URL(string: "https://mail.google.com/mail/" + (account.map { "?authuser=" + $0 } ?? "u/0/") + "#" + view)
+    }
+
     /// Why there is no Chrome profile to open a link in.
     struct NoProfile: Error, LocalizedError {
         var errorDescription: String?

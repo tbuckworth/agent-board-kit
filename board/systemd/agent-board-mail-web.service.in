@@ -1,0 +1,13 @@
+[Unit]
+Description=agent-board: the Mail tab for your phone, on a Unix socket for tailscale serve (tailnet only)
+
+[Service]
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
+# Python in isolated mode (-I): nothing from a user site, PYTHONPATH or the current folder loads in the process that
+# holds the page's sessions and mail; the kit venv's own packages (cryptography, for the passkeys) still do.
+ExecStart={{PYTHON}} -I {{KIT_DIR}}/board/bin/agent-board mail-web
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -81,9 +81,9 @@ def fable_snaps(personal=0, work=25, personal_resets=None):
     return s
 
 
-def win(kind, remaining):
+def win(kind, remaining, resets_at=NOW + 3600):
     return {"kind": kind, "name": kind, "used_pct": 100 - remaining, "remaining_pct": remaining,
-            "resets_at": NOW + 3600, "model": None}
+            "resets_at": resets_at, "model": None}
 
 
 def snaps(personal=90, work=90, work_extra=False):
@@ -255,14 +255,24 @@ class Ladder(unittest.TestCase):
         s["claude:personal"]["windows"][0] = win("session", 0)
         self.assertEqual(self.place(dict(sess(), model=OPUS), s)[0], [("work", None)])
 
-    def test_an_agent_switched_by_hand_keeps_its_model(self):
-        state = {"sessions": {SID: {"switched_at": NOW - 3600}}}
-        got, _, notes = self.place(dict(sess(), model=FABLE), fable_snaps(personal=0, work=0), state)
-        self.assertEqual(got, [])
-        self.assertIn("headroom for claude-fable-5-2 (work: weekly Fable window used up", notes[0][2])
-        self.assertNotIn("bills extra usage", notes[0][2])                     # nor does it go where it would
-        self.assertEqual(self.place(dict(sess(), model=FABLE), fable_snaps(personal=0, work=25), state)[0],
-                         [("work", None)])                                    # another login, the same model
+    def test_a_fable_agent_kept_on_fable_takes_the_other_login_then_bills_there(self):
+        """A Fable agent switched to Fable by hand, or left on Fable when it is not on the model order, goes to the
+        other login when Fable runs out, then bills extra usage there on Fable (spend_watch mails the owner, who can
+        switch it); it never moves onto another model."""
+        by_hand = {"sessions": {SID: {"switched_at": NOW - 3600}}}
+        fable_agent = dict(sess(), model=FABLE)
+        for cfg, state in ((LADDER, by_hand), (CFG, by_hand), (CFG, {})):
+            def place(s):
+                moves, notes = failover.decide([fable_agent], self.LIMIT, s, state, cfg, NOW)
+                return [(m["to"], m["model"]) for m in moves], notes
+            self.assertEqual(place(fable_snaps(personal=0, work=25))[0], [("work", None)])   # the other login
+            got, notes = place(fable_snaps(personal=0, work=0))
+            self.assertEqual(got, [])
+            self.assertIn("headroom for claude-fable-5-2 (work: weekly Fable window used up", notes[0][2])
+            self.assertIn("and none bills extra usage for claude-fable-5-2; it waits", notes[0][2])
+            s = fable_snaps(personal=0, work=0)
+            s["claude:work"]["extra_usage"] = {"enabled": True}
+            self.assertEqual(place(s)[0], [("work", None)])                    # work's extra usage, on Fable
 
     def test_back_to_fable_on_its_first_login_once_that_has_reset(self):
         state = {"sessions": {SID: {"home": "personal", "home_model": FABLE, "current": "work", "model": OPUS,
@@ -271,7 +281,8 @@ class Ladder(unittest.TestCase):
         got, moves, _ = self.place(idle, fable_snaps(personal=96, work=0), state, limits={})
         self.assertEqual(got, [("personal", FABLE)])
         self.assertEqual(moves[0]["prompt"], None)
-        self.assertEqual(self.place(idle, fable_snaps(personal=0, work=0), state, limits={})[0], [])
+        self.assertEqual(self.place(idle, fable_snaps(personal=0, work=0), state, limits={})[0],
+                         [("personal", None)])     # no Fable anywhere: up to personal on the Opus it runs
         busy = dict(sess("work", "busy", 600), model=OPUS)
         self.assertEqual(self.place(busy, fable_snaps(personal=96, work=0), state, limits={})[0], [])
         # the next pass, before it replies: its transcript still shows Opus, but it runs the Fable the move gave it
@@ -481,12 +492,48 @@ class Decide(unittest.TestCase):
         state = {"sessions": {SID: {"home": "work", "current": "personal", "moves": []}}}
         self.assertEqual(self.decide([sess("personal", "idle", 600)], state=state)[0], [])
 
-    def test_idle_agent_billing_extra_usage_is_rebalanced(self):
-        moves, _ = self.decide([sess("work", "idle", 600)], s=snaps(personal=80, work=0, work_extra=True))
+    def test_an_idle_agent_started_lower_in_the_order_moves_up_once_there_is_headroom(self):
+        """An agent started or resumed on work while personal had no headroom, so never moved off personal, goes
+        there too once personal has headroom, the same way as one moved back."""
+        moves, _ = self.decide([sess("work", "idle", 600)])
         self.assertEqual([(m["to"], m["prompt"]) for m in moves], [("personal", None)])
+        self.assertEqual(moves[0]["reason"], "move up: personal has headroom")
+        self.assertEqual(self.decide([sess("work", "idle", 600)], s=snaps(personal=0))[0], [])
+        self.assertEqual(self.decide([sess("work", "busy", 600)])[0], [])
+        moved_by_hand = {"sessions": {SID: {"home": "work", "current": "personal", "moves": []}}}
+        self.assertEqual(self.decide([sess("personal", "idle", 600)], state=moved_by_hand)[0], [])   # at the top
+
+    def test_a_move_goes_only_to_a_login_the_repos_owner_may_use(self):
+        cfg = json.loads(json.dumps(CFG))
+        cfg["usage"]["claude_accounts"]["personal"]["exclude_owners"] = ["Example-Org"]
+        work = dict(sess("work", "idle", 600), owner="example-org")
+        self.assertEqual(self.decide([work], cfg=cfg)[0], [])                                 # not up to personal
+        self.assertEqual([m["to"] for m in self.decide([dict(work, owner="example-user")], cfg=cfg)[0]], ["personal"])
+        limited = dict(work, status="busy")
+        moves, notes = self.decide([limited], {SID: {"window": "five_hour", "resets_at": NOW + 60, "text": ""}},
+                                   snaps(work=0), cfg=cfg)
+        self.assertEqual(moves, [])                                                           # nor there on a limit
+        self.assertIn("(personal: repos owned by example-org are excluded from this account)", notes[0][2])
+
+    def test_an_agent_switched_by_hand_moves_up_only_to_where_a_limit_took_it_from(self):
+        switched = {"sessions": {SID: {"switched_at": NOW - 3600}}}
+        self.assertEqual(self.decide([sess("work", "idle", 600)], state=switched)[0], [])      # the owner's choice
+        limited = {"sessions": {SID: {"switched_at": NOW - 3600, "home": "personal", "current": "work",
+                                       "resets_at": NOW - 60, "moves": []}}}
+        moves, _ = self.decide([sess("work", "idle", 600)], state=limited)
+        self.assertEqual([(m["to"], m["reason"]) for m in moves], [("personal", "switch back: personal has reset")])
+
+    def test_idle_agent_billing_extra_usage_is_rebalanced(self):
+        billing = snaps(personal=0, work=80)
+        billing["claude:personal"]["extra_usage"] = {"enabled": True}
+        moves, _ = self.decide([sess("personal", "idle", 600)], s=billing)
+        self.assertEqual([(m["to"], m["prompt"]) for m in moves], [("work", None)])   # down: no place above it
         self.assertIn("extra usage", moves[0]["reason"])
-        self.assertEqual(self.decide([sess("work", "idle", 600)], s=snaps(personal=80, work=0))[0], [])
-        self.assertEqual(self.decide([sess("work", "busy", 600)], s=snaps(personal=80, work=0, work_extra=True))[0], [])
+        moves, _ = self.decide([sess("personal", "idle", 600)], s=snaps(personal=0, work=80))   # extra usage off:
+        self.assertTrue(moves[0]["reason"].startswith("spent: "), moves[0]["reason"])          # IdleOnUsedUpLogin
+        self.assertEqual(self.decide([sess("personal", "busy", 600)], s=billing)[0], [])
+        moves, _ = self.decide([sess("work", "idle", 600)], s=snaps(personal=80, work=0, work_extra=True))
+        self.assertEqual([m["to"] for m in moves], ["personal"])                          # up, as any idle agent
 
     def test_ping_pong_guard(self):
         state = {"sessions": {SID: {"moves": [[NOW - 60 * i, "a", "b", "r"] for i in range(4)]}}}
@@ -511,6 +558,162 @@ class Decide(unittest.TestCase):
         e = st["sessions"][SID]
         self.assertEqual((e["home"], e["current"], len(e["moves"])), ("personal", "personal", 2))
         self.assertNotIn("resets_at", e)
+
+
+WEEK_RESET = NOW + 3 * 86400   # when personal's used-up weekly window resets
+
+
+def used_up(work=90, **kw):
+    """snaps() with personal's weekly window used up (its 5-hour one has room)."""
+    s = snaps(work=work, **kw)
+    s["claude:personal"]["windows"].append(win("weekly", 0, WEEK_RESET))
+    return s
+
+
+class IdleOnUsedUpLogin(unittest.TestCase):
+    """An idle agent, which has hit no limit itself, leaves a login whose fresh usage reading is used up for its model,
+    as a limit would move it, with no prompt and only where there is headroom; with that login's extra usage on, the
+    same move is a rebalance. It comes back after the window's reset and not before."""
+
+    def decide(self, sessions, s=None, state=None, cfg=CFG, now=NOW, limits=None):
+        return failover.decide(sessions, limits or {}, used_up() if s is None else s, state or {}, cfg, now)
+
+    def test_it_moves_to_the_next_login_with_headroom_and_waits_there(self):
+        moves, notes = self.decide([sess("personal", "idle", 600)])
+        self.assertEqual([(m["to"], m["model"], m["prompt"], m["resets_at"], m["idle"]) for m in moves],
+                         [("work", None, None, WEEK_RESET, True)])
+        self.assertEqual(moves[0]["reason"], "spent: personal has no headroom (weekly window used up, resets %s)"
+                         % usage.fmt_reset(WEEK_RESET, NOW))
+        self.assertEqual(notes, [])
+        e = failover.record({}, moves[0], NOW)["sessions"][SID]
+        self.assertEqual((e["home"], e["current"], e["resets_at"]), ("personal", "work", WEEK_RESET))
+        s = used_up()
+        s["claude:personal"]["windows"][0] = win("session", 0)     # both used up: it waits for the later reset
+        moves, _ = self.decide([sess("personal", "idle", 600)], s)
+        self.assertIn("(session and weekly windows used up, resets ", moves[0]["reason"])
+        self.assertEqual(moves[0]["resets_at"], WEEK_RESET)
+
+    def test_a_fable_agent_steps_down_the_ladder_as_on_a_limit(self):
+        agent = dict(sess("personal", "idle", 600), model=FABLE)
+        s = fable_snaps(personal=0, work=0, personal_resets=WEEK_RESET)   # Fable used up on both, Opus has room
+        moves, _ = failover.decide([agent], {}, s, {}, LADDER, NOW)
+        self.assertEqual([(m["to"], m["model"], m["prompt"]) for m in moves], [("personal", OPUS, None)])
+        self.assertIn("(weekly Fable window used up, resets ", moves[0]["reason"])
+        self.assertTrue(moves[0]["reason"].endswith("(model claude-opus-5-5)"), moves[0]["reason"])
+        e = failover.record({}, moves[0], NOW)["sessions"][SID]
+        self.assertEqual((e["home"], e["home_model"], e["model"], e["resets_at"]),
+                         ("personal", FABLE, OPUS, WEEK_RESET))
+
+    def test_a_login_billing_extra_usage_is_left_by_the_same_rule(self):
+        s = used_up(work=90)
+        s["claude:personal"]["extra_usage"] = {"enabled": True}
+        moves, _ = self.decide([sess("personal", "idle", 600)], s)
+        self.assertEqual([(m["to"], m["prompt"], m["resets_at"]) for m in moves], [("work", None, WEEK_RESET)])
+        self.assertEqual(moves[0]["reason"], "rebalance: personal bills extra usage (weekly window used up, resets %s)"
+                         % usage.fmt_reset(WEEK_RESET, NOW))
+        stale = json.loads(json.dumps(s))
+        stale["claude:personal"].update(stale=True, error="timed out", observed_at=NOW - 3 * 3600)
+        self.assertEqual(self.decide([sess("personal", "idle", 600)], stale), ([], []))   # an old reading: no move
+        s["claude:work"]["windows"] = [win("session", 0)]
+        moves, notes = self.decide([sess("personal", "idle", 600)], s)
+        self.assertEqual(moves, [])
+        self.assertIn("is idle on personal, which bills extra usage (weekly window used up, resets ", notes[0][2])
+        self.assertTrue(notes[0][2].endswith("; it stays there, billing extra usage when it works"), notes[0][2])
+
+    def test_a_busy_agent_or_one_not_idle_long_enough_or_in_a_dialog_stays(self):
+        for agent in (sess("personal", "busy", 600), sess("personal", "idle", 60),
+                      dict(sess("personal", "idle", 600), waiting_for="permission")):
+            self.assertEqual(self.decide([agent]), ([], []))
+        off = dict(CFG, failover={"switch_back": False})
+        self.assertEqual(self.decide([sess("personal", "idle", 600)], cfg=off), ([], []))
+        # a busy agent's limit, when it hits one, moves it as a limit always moves it, with its prompt
+        hit = {SID: {"window": "seven_day", "resets_at": WEEK_RESET, "text": ""}}
+        moves, _ = self.decide([sess("personal", "busy", 600)], limits=hit)
+        self.assertEqual([(m["to"], m["idle"]) for m in moves], [("work", False)])
+        self.assertIn("hit its usage limit", moves[0]["prompt"])
+
+    def test_a_pinned_agent_stays_and_so_does_one_moved_too_often(self):
+        self.assertEqual(self.decide([sess("personal", "idle", 600, name="nightly-research")]), ([], []))
+        busy_hour = {"sessions": {SID: {"moves": [[NOW - 60 * i, "a", "b", "r"] for i in range(4)]}}}
+        self.assertEqual(self.decide([sess("personal", "idle", 600)], state=busy_hour), ([], []))
+
+    def test_a_login_whose_usage_is_unknown_or_stale_is_not_used_up(self):
+        failed = used_up()
+        failed["claude:personal"] = {"windows": [], "error": "claude usage read timed out after 30s", "cli": "claude",
+                                     "account": "personal"}
+        stale = used_up()
+        stale["claude:personal"].update(stale=True, error="timed out", observed_at=NOW - 3 * 3600)
+        missing = used_up()
+        del missing["claude:personal"]
+        for s in (failed, stale, missing):
+            self.assertEqual(self.decide([sess("personal", "idle", 600)], s), ([], []))
+        self.assertEqual(self.decide([sess("personal", "idle", 600)], snaps(personal=5)), ([], []))   # low, not out
+
+    def test_nowhere_with_headroom_it_stays_noted_once_with_no_limit_wait(self):
+        s = used_up(work=0, work_extra=True)    # work used up too: it would bill there, so it does not go
+        moves, notes = self.decide([sess("personal", "idle", 600)], s)
+        self.assertEqual(moves, [])
+        [(sid, key, text, event)] = notes
+        self.assertEqual((sid, event), (SID, None))   # no limit-wait: the board must not show it stopped
+        self.assertIn("agent-x (3d3d3d3d) is idle on personal, which has no headroom (weekly window used up, resets ",
+                      text)
+        self.assertIn("and no other Claude login has headroom for claude-opus-5-5 (work: session window used up "
+                      "until ", text)
+        self.assertTrue(text.endswith("; it stays there"), text)
+        self.assertEqual(self.decide([sess("personal", "idle", 600)], s, {"sessions": {SID: {"stuck_until": key}}}),
+                         ([], []))
+
+    def test_it_comes_back_after_the_reset_and_not_before(self):
+        moves, _ = self.decide([sess("personal", "idle", 600)])
+        state = failover.record({}, moves[0], NOW)
+        there = sess("work", "idle", 600)
+        self.assertEqual(self.decide([there], state=state, now=NOW + 1200), ([], []))   # personal still used up
+        # personal reads as having headroom again before the recorded reset: still no move back
+        self.assertEqual(self.decide([there], snaps(), state=state, now=NOW + 1200), ([], []))
+        back, _ = self.decide([there], snaps(), state=state, now=WEEK_RESET + 60)
+        self.assertEqual([(m["to"], m["reason"], m["prompt"]) for m in back],
+                         [("personal", "switch back: personal has reset", None)])
+        self.assertNotIn("resets_at", failover.record(state, back[0], WEEK_RESET + 60)["sessions"][SID])
+
+    def test_an_agent_started_lower_down_never_bounces_up_onto_the_used_up_login(self):
+        moves, _ = self.decide([sess("work", "idle", 600)])   # no record: the move up looks at once
+        self.assertEqual(moves, [])
+
+    def test_one_switched_by_hand_keeps_its_model_and_comes_back_only_home(self):
+        by_hand = {"sessions": {SID: {"switched_at": NOW - 3600}}}
+        agent = dict(sess("personal", "idle", 600), model=FABLE)
+        s = fable_snaps(personal=0, work=25, personal_resets=WEEK_RESET)
+        moves, _ = failover.decide([agent], {}, s, by_hand, LADDER, NOW)
+        self.assertEqual([(m["to"], m["model"]) for m in moves], [("work", None)])   # Fable kept
+        state = failover.record(by_hand, moves[0], NOW)
+        self.assertEqual(state["sessions"][SID]["home"], "personal")
+        moves, notes = failover.decide([agent], {}, fable_snaps(personal=0, work=0, personal_resets=WEEK_RESET),
+                                       by_hand, LADDER, NOW)
+        self.assertEqual(moves, [])                                                  # never onto Opus
+        self.assertIn("no other Claude login has headroom for claude-fable-5-2 (", notes[0][2])
+        back, _ = failover.decide([dict(sess("work", "idle", 600), model=FABLE)], {},
+                                  fable_snaps(personal=96, work=25), state, LADDER, WEEK_RESET + 60)
+        self.assertEqual([(m["to"], m["reason"]) for m in back], [("personal", "switch back: personal has reset")])
+
+    def test_only_to_a_login_the_repos_owner_may_use(self):
+        cfg = json.loads(json.dumps(CFG))
+        cfg["usage"]["claude_accounts"]["work"]["only_owners"] = ["employer-org"]
+        moves, notes = self.decide([dict(sess("personal", "idle", 600), owner="example-user")], cfg=cfg)
+        self.assertEqual(moves, [])
+        self.assertIn("(work: ", notes[0][2])
+        self.assertEqual([m["to"] for m in self.decide([dict(sess("personal", "idle", 600), owner="employer-org")],
+                                                       cfg=cfg)[0]], ["work"])
+
+    def test_a_pass_makes_a_few_idle_moves_and_every_limit_move(self):
+        agents = [sess("personal", "idle", 600, sid="s%d" % i, name="idle-%d" % i) for i in range(5)]
+        limited = sess("personal", "busy", 0, sid="stuck", name="stuck")
+        moves, _ = failover.decide(agents + [limited], {"stuck": {"window": "seven_day", "resets_at": WEEK_RESET,
+                                                                   "text": ""}}, used_up(), {}, CFG, NOW)
+        go, later = failover.pace(moves, failover.settings(CFG))
+        self.assertEqual([m["session"]["name"] for m in go], ["idle-0", "idle-1", "idle-2", "stuck"])
+        self.assertEqual([m["session"]["name"] for m in later], ["idle-3", "idle-4"])
+        go, later = failover.pace(moves, failover.settings(dict(CFG, failover={"idle_moves_per_pass": 0})))
+        self.assertEqual(([m["session"]["name"] for m in go], len(later)), (["stuck"], 5))
 
 
 class Move(unittest.TestCase):
@@ -539,13 +742,17 @@ class Move(unittest.TestCase):
             claude_session.copy_transcript(self.src, self.work, SID)
 
     def run_migrate(self, live_after, dry_run=False, copy_error=None, live_on="work", jobs=(), pid_reused=False,
-                    tmux_error=None):
+                    tmux_error=None, to="work", argv=None, session=None, overrides=None):
         """tmux is the boundary (the agent's pane): its calls are recorded, and tmux_error fails every one. With
-        live_after, the relaunched claude is live on login live_on."""
+        live_after, the relaunched claude is live on login live_on. self.locked gets, for the SIGKILL and each tmux
+        call, whether the keys lock was taken then. The move is of session (default: sess() on personal), whose
+        claude runs argv, to login `to`, with overrides."""
         calls, killed, trusted = [], [], []
+        self.locked = []
 
         def tmux(*args, check):
             calls.append(args)
+            self.locked.append(fakes.keys_taken())
             if tmux_error and check:
                 raise commands.CommandError(tmux_error)
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -553,15 +760,16 @@ class Move(unittest.TestCase):
         def kill(pid, sig):
             if sig:
                 killed.append((pid, sig))
+                self.locked.append(fakes.keys_taken())
             elif (pid, failover.signal.SIGKILL) in killed and not pid_reused:
                 raise ProcessLookupError(pid)
-        s = dict(sess(), cwd=str(self.base))
+        s = dict(session or sess(), cwd=str(self.base))
         if live_after:
             self.h.claude(SID, "agent-x", login=live_on)
         # the agent's process is made up: its signals (os.kill), its argv and background jobs (/proc) and its pane
         patches = [mock.patch.object(claude_session, "movable", return_value=("%5", "")),
-                   mock.patch.object(procs, "cmdline", return_value=["claude", "--model", "m", "--effort", "high",
-                                                                        "--dangerously-skip-permissions", "brief"]),
+                   mock.patch.object(procs, "cmdline", return_value=argv or [
+                       "claude", "--model", "m", "--effort", "high", "--dangerously-skip-permissions", "brief"]),
                    mock.patch.object(failover.os, "kill", side_effect=kill),
                    mock.patch.object(claude_session, "wait_dead", return_value=True),
                    mock.patch.object(claude_session.commands, "tmux", side_effect=tmux),
@@ -572,8 +780,8 @@ class Move(unittest.TestCase):
         with contextlib.ExitStack() as st:
             for p in patches:
                 st.enter_context(p)
-            ok, detail = failover.migrate(s, "work", "carry on", self.cfg, trust=lambda c, d: trusted.append((c, d)),
-                                          claude="/bin/claude", dry_run=dry_run)
+            ok, detail = failover.migrate(s, to, "carry on", self.cfg, trust=lambda c, d: trusted.append((c, d)),
+                                          claude="/bin/claude", dry_run=dry_run, overrides=overrides)
         return ok, detail, calls, killed, trusted
 
     def test_migrate_kills_copies_trusts_and_relaunches_in_the_pane(self):
@@ -586,12 +794,15 @@ class Move(unittest.TestCase):
         self.assertEqual(trusted, [(str(self.base), str(self.work.resolve()))])
         self.assertEqual(os.readlink(self.work / "projects" / memory.parent.name / "memory"), str(memory))
         self.assertEqual(calls[0], ("set-environment", "-t", "%5", "CLAUDE_CONFIG_DIR", str(self.work.resolve())))
-        typed = calls[1][-1]
+        self.assertEqual(calls[1], ("send-keys", "-t", "%5", "C-u"))   # a stray key typed meanwhile is cleared
+        typed = calls[2][-1]
         self.assertTrue(typed.startswith("stty sane; export CLAUDE_CONFIG_DIR=%s; /bin/claude --resume %s --name agent-x"
                                          % (self.work.resolve(), SID)), typed)
         self.assertIn("--model m --effort high --dangerously-skip-permissions 'carry on'", typed)
         self.assertNotIn("brief", typed)
-        self.assertEqual(calls[2], ("send-keys", "-t", "%5", "Enter"))
+        self.assertEqual(calls[3], ("send-keys", "-t", "%5", "Enter"))
+        self.assertEqual(self.locked, [True] * 5)   # the keys lock from the kill until the line's Enter
+        self.assertFalse(fakes.keys_taken())
 
     def registry_dir(self, *entries):
         d = self.personal / "sessions"
@@ -616,10 +827,22 @@ class Move(unittest.TestCase):
         self.assertTrue(self.run_migrate(live_after=True, pid_reused=True)[0])
         self.assertEqual(len(list(d.iterdir())), 2)
 
+    def test_a_keys_lock_not_had_in_time_stops_nothing_and_is_reported(self):
+        jobs = [{"pid": 77, "command": "sleep 900", "output": ""}]
+        self.cfg["failover"]["background"] = "kill"
+        with fakes.keys_held_elsewhere(), mock.patch.object(commands, "LOCK_WAIT_SECONDS", 0.2), \
+                mock.patch.object(failover, "stop_jobs") as stop:
+            ok, detail, calls, killed, _ = self.run_migrate(live_after=True, jobs=jobs)
+        self.assertFalse(ok)
+        self.assertIn("not moved, nothing stopped: ", detail)
+        self.assertIn("held by another program after 0.2 s of waiting", detail)
+        self.assertEqual((killed, calls), ([], []))   # the agent and its jobs left running, nothing typed
+        stop.assert_not_called()
+
     def test_background_jobs_are_named_in_the_note(self):
         jobs = [{"pid": 77, "command": "python train.py", "output": "/t/a.output"}]
         ok, detail, calls, killed, _ = self.run_migrate(live_after=True, jobs=jobs)
-        typed = calls[1][-1]
+        typed = calls[2][-1]
         self.assertIn("still running", typed)
         self.assertIn("pid 77: python train.py (output: /t/a.output)", typed)
         self.assertEqual(killed, [(999, failover.signal.SIGKILL)])   # only claude: the job keeps running
@@ -631,7 +854,7 @@ class Move(unittest.TestCase):
         with mock.patch.object(failover, "stop_jobs") as stop:
             ok, detail, calls, killed, _ = self.run_migrate(live_after=True, jobs=jobs)
         stop.assert_called_once_with(jobs)
-        self.assertIn("were stopped", calls[1][-1])
+        self.assertIn("were stopped", calls[2][-1])
         self.assertTrue(detail.endswith("; its background jobs stopped: pid 77"), detail)
 
     def test_dry_run_touches_nothing(self):
@@ -658,10 +881,91 @@ class Move(unittest.TestCase):
         ok, detail, calls, killed, _ = self.run_migrate(live_after=True, live_on="personal", copy_error=OSError("disk full"))
         self.assertFalse(ok)   # it runs again, but on the login that is out: still a failed move
         self.assertIn("moving it to work failed (OSError: disk full); relaunched on personal instead", detail)
-        typed = [c for c in calls if c[0] == "send-keys" and c[-1] != "Enter"][0][-1]
+        typed = [c for c in calls if c[0] == "send-keys" and c[-1] not in ("C-u", "Enter")][0][-1]
         self.assertIn("unset CLAUDE_CONFIG_DIR", typed)
         self.assertIn("--model m --effort high", typed)
         self.assertIn(("set-environment", "-t", "%5", "-r", "CLAUDE_CONFIG_DIR"), calls)
+
+    def test_onto_a_login_with_its_own_settings_and_model(self):
+        g = add_gemini(self, self.cfg, self.h)
+        gdir, settings = str(Path(g["config_dir"]).resolve()), str(Path(g["settings"]).resolve())
+        argv = ["claude", "--model", "claude-opus-5-5", "--settings", "/elsewhere.json", "--effort", "high",
+                "--dangerously-skip-permissions"]
+        ok, detail, calls, *_ = self.run_migrate(live_after=True, live_on="gemini", to="gemini", argv=argv,
+                                                 overrides={"--model": None, "--effort": None})
+        self.assertTrue(ok, detail)
+        typed = calls[2][-1]
+        self.assertTrue(typed.startswith("stty sane; export CLAUDE_CONFIG_DIR=%s; /bin/claude --resume %s"
+                                         % (gdir, SID)), typed)
+        self.assertIn("--effort high --dangerously-skip-permissions --settings %s --model %s 'carry on'"
+                      % (settings, homes.NEON), typed)   # its own model, not the one carried
+        self.assertEqual(typed.count("--model"), 1)
+        self.assertNotIn("elsewhere", typed)
+        # another model asked for: refused before anything is stopped (as agent-switch and agent-spawn refuse it)
+        ok, detail, calls, killed, _ = self.run_migrate(live_after=False, to="gemini", argv=argv,
+                                                        overrides={"--model": "claude-opus-5-5"})
+        self.assertEqual((ok, detail), (False, "not moved: Claude login gemini runs only %s, not claude-opus-5-5: "
+                                               "leave out the model" % homes.NEON))
+        self.assertEqual((calls, killed), ([], []))
+
+    def test_off_it_the_agent_runs_what_a_new_agent_gets_there(self):
+        g = add_gemini(self, self.cfg, self.h)
+        gdir = Path(g["config_dir"]).resolve()
+        proj = gdir / "projects" / "-work"
+        proj.mkdir(parents=True)
+        (proj / (SID + ".jsonl")).write_text(entry("user") + "\n")
+        argv = ["claude", "--settings", str(g["settings"]), "--model", homes.NEON, "--effort", "high",
+                "--dangerously-skip-permissions"]
+        on = on_gemini(g)
+        for overrides, model in ((None, "--model claude-opus-5-5"),   # what a new agent gets on work
+                                 ({"--model": "claude-sonnet-5-5"}, "--model claude-sonnet-5-5")):   # asked for
+            ok, detail, calls, *_ = self.run_migrate(live_after=True, session=on, argv=argv, overrides=overrides)
+            self.assertTrue(ok, detail)
+            typed = calls[2][-1]
+            self.assertIn(model, typed)
+            self.assertIn("--effort high --dangerously-skip-permissions", typed)
+            self.assertEqual(typed.count("--model"), 1)
+            self.assertNotIn("--settings", typed)
+            self.assertNotIn(homes.NEON, typed)
+        # asked for gemini's own model, which work cannot run: refused before anything is stopped (as agent-switch)
+        ok, detail, calls, killed, _ = self.run_migrate(live_after=False, session=on, argv=argv,
+                                                        overrides={"--model": homes.NEON})
+        self.assertFalse(ok)
+        self.assertEqual(detail, "not moved: Claude login work cannot run %s, the model of a login that runs no "
+                                 "other: leave out the model" % homes.NEON)
+        self.assertEqual((calls, killed), ([], []))
+        self.cfg["spawn_claude_model"] = None   # the CLI's own model: no --model at all
+        ok, detail, calls, *_ = self.run_migrate(live_after=True, session=on, argv=argv)
+        self.assertIn("--effort high --dangerously-skip-permissions 'carry on'", calls[2][-1])
+        self.assertNotIn("--model", calls[2][-1])
+
+    def test_a_failed_move_onto_it_relaunches_where_it_was_on_its_own_model(self):
+        """gemini's model must not reach the Claude login it stays on: every request there would fail."""
+        g = add_gemini(self, self.cfg, self.h)
+        ok, detail, calls, *_ = self.run_migrate(live_after=True, live_on="personal", to="gemini",
+                                                 copy_error=OSError("disk full"),
+                                                 overrides={"--model": homes.NEON, "--effort": "low"})
+        self.assertFalse(ok)
+        self.assertIn("moving it to gemini failed (OSError: disk full); relaunched on personal instead", detail)
+        typed = [c for c in calls if c[0] == "send-keys" and c[-1] not in ("C-u", "Enter")][0][-1]
+        self.assertIn("unset CLAUDE_CONFIG_DIR", typed)
+        self.assertIn("--model m --effort low --dangerously-skip-permissions 'carry on'", typed)   # the effort asked
+        self.assertNotIn(homes.NEON, typed)
+        self.assertNotIn(str(Path(g["settings"]).resolve()), typed)
+
+    def test_a_background_session_onto_it_resumes_with_its_settings_and_model(self):
+        g = add_gemini(self, self.cfg, self.h)
+        ok, detail, runs, *_ = self.run_bg_migrate(to="gemini")
+        self.assertTrue(ok, detail)
+        launch = runs[1][0]
+        self.assertEqual(launch[4:12], ["--name", "nightly report r7k2m9xq", "--effort", "high",
+                                        "--permission-mode", "bypassPermissions", "--settings",
+                                        str(Path(g["settings"]).resolve())])
+        self.assertEqual(launch[12:14], ["--model", homes.NEON])   # not the Fable 5.1 its transcript recorded
+        self.assertEqual(runs[1][1]["env"]["CLAUDE_CONFIG_DIR"], str(Path(g["config_dir"]).resolve()))
+        ok, detail, runs, *_ = self.run_bg_migrate(to="gemini", dry_run=True, live_after=False)
+        self.assertEqual((ok, runs), (True, []))
+        self.assertIn("--settings %s --model %s 'carry on'" % (Path(g["settings"]).resolve(), homes.NEON), detail)
 
     def test_refuses_what_it_cannot_move(self):
         with mock.patch.object(claude_session, "pane_pid", return_value=None), \
@@ -674,16 +978,16 @@ class Move(unittest.TestCase):
         self.assertIn("not ready", failover.migrate(sess(), "work", None, cfg)[1])
 
     def run_bg_migrate(self, stop_rc=0, launch_rc=0, live_after=True, dry_run=False, jobs=(), dead=True,
-                       launch_out=(), overrides=None, copy_rc=None):
-        """A Claude Code background session on personal, out of Fable credits. The claude CLI is the
-        boundary: stop_rc answers `claude stop` of the session, copy_rc {"stop" or "rm": exit code} the same for a
-        copy, launch_rc and launch_out (one per resume) `claude --resume --bg`."""
+                       launch_out=(), overrides=None, copy_rc=None, to="work"):
+        """A Claude Code background session on personal, out of Fable credits, moved to login `to`.
+        The claude CLI is the boundary: stop_rc answers `claude stop` of the session, copy_rc {"stop" or "rm": exit
+        code} the same for a copy, launch_rc and launch_out (one per resume) `claude --resume --bg`."""
         self.src.write_text("\n".join([json.dumps({"type": "permission-mode", "permissionMode": "bypassPermissions"}),
                                        reply("claude-fable-5-1", "high"), credits_record()]) + "\n")
         runs, stopped, capped = [], [], []
         s = dict(sess(), kind="bg", tmux=None, cwd=str(self.base), name="nightly report r7k2m9xq")
         if live_after:   # the session the login's daemon resumed
-            self.h.claude(SID, s["name"], login="work", kind="bg")
+            self.h.claude(SID, s["name"], login=to, kind="bg")
 
         outs = list(launch_out)
         real_run = subprocess.run
@@ -717,7 +1021,7 @@ class Move(unittest.TestCase):
         with contextlib.ExitStack() as st:
             for p in patches:
                 st.enter_context(p)
-            ok, detail = failover.migrate(s, "work", "carry on", self.cfg, trust=lambda c, d: None,
+            ok, detail = failover.migrate(s, to, "carry on", self.cfg, trust=lambda c, d: None,
                                           claude="/bin/claude", dry_run=dry_run, overrides=overrides)
         return ok, detail, runs, stopped, capped
 
@@ -939,6 +1243,26 @@ class PlaceResume(unittest.TestCase):
     def test_no_transcript_resumes_where_it_was(self):
         self.assertEqual(self.place(snaps()), (str(self.work), ""))
 
+    def test_a_session_on_a_manual_login_resumes_there_and_none_is_placed_on_one(self):
+        h = homes.Homes(self, logins=("personal", "work"))
+        self.cfg["usage"]["claude_accounts"]["work"]["config_dir"] = str(h.homes["work"])
+        Path(h.homes["work"], ".credentials.json").write_text("{}")
+        g = add_gemini(self, self.cfg, h)
+        gdir = str(Path(g["config_dir"]).resolve())
+        self.copy(h.homes["personal"], "before", 3600)
+        self.copy(Path(gdir), "on gemini", 0)
+        sess = {"id": SID, "cwd": str(self.base), "config_dir": gdir}
+        config_dir, note = failover.place_resume(sess, self.cfg, snaps=snaps(), now=NOW)
+        self.assertEqual(config_dir, gdir)            # though personal has headroom
+        self.assertIn("on login gemini, where its newest copy is: a manual login, which nothing moves it off", note)
+        os.utime(self.copy(h.homes["personal"], "newest", 0), (NOW + 60, NOW + 60))
+        gem = dict(usage.per_token(g), cli="claude", account="gemini")
+        config_dir, note = failover.place_resume(dict(sess, config_dir=None), self.cfg,
+                                                 snaps=dict(snaps(personal=0, work=0), **{"claude:gemini": gem}),
+                                                 now=NOW)
+        self.assertIsNone(config_dir)                 # every plan used up: where its newest copy is, never gemini
+        self.assertIn("no login with known headroom", note)
+
 
 class BackgroundJobs(unittest.TestCase):
     def test_lists_bash_tool_commands_with_their_output_files(self):
@@ -1083,14 +1407,19 @@ class Watch(unittest.TestCase):
     """The watch's passes, with the usage probes (they ask Anthropic), the move (failover.migrate, driven by Move)
     and the folder trust in the user's files made up."""
 
-    def agent(self, *lines, login="personal", name="agent-x"):
-        """A live background agent on login, busy, its transcript these lines: a registry entry and a transcript
-        in temporary Claude homes, which the watch's sample() reads."""
-        h = homes.Homes(self, logins=(login,))
-        h.claude(SID, name, cwd="/work", updated_at=NOW, kind="bg", status="busy")
-        t = h.default / "projects" / "-work" / (SID + ".jsonl")
-        t.parent.mkdir(parents=True)
+    @staticmethod
+    def put(h, sid, name, lines, status, updated_at):
+        """A live background agent in the temporary Claude homes h, in status since updated_at, its transcript these
+        lines: a registry entry and a transcript, which the watch's sample() reads. Returns the entry's path."""
+        entry_path = h.claude(sid, name, cwd="/work", updated_at=updated_at, kind="bg", status=status)
+        t = h.default / "projects" / "-work" / (sid + ".jsonl")
+        t.parent.mkdir(parents=True, exist_ok=True)
         t.write_text("\n".join(lines) + "\n")
+        return entry_path
+
+    def agent(self, *lines, login="personal", name="agent-x"):
+        """A live background agent on login, busy, its transcript these lines (put)."""
+        self.put(homes.Homes(self, logins=(login,)), SID, name, lines, "busy", NOW)
 
     def test_one_pass_moves_a_limited_agent_and_saves_state(self):
         af = load_script("agent-failover")
@@ -1101,15 +1430,33 @@ class Watch(unittest.TestCase):
                 mock.patch.object(af.failover, "migrate", side_effect=lambda s, to, prompt, cfg, **k:
                                   moved.append((s["id"], to, prompt)) or (True, "moved")), \
                 mock.patch.object(af, "trust", return_value=None), contextlib.redirect_stdout(io.StringIO()):
-            state, moves, _ = af.one_pass(CFG, {}, False, {"rebalance": 0, "spend": NOW}, NOW)
+            state, moves, _ = af.one_pass(CFG, {}, False, {"idle": 0, "spend": NOW}, NOW)
         self.assertEqual([(m[0], m[1]) for m in moved], [(SID, "work")])
         self.assertEqual(state["sessions"][SID]["home"], "personal")
         [e] = statuslog.read(event="failover")
         self.assertEqual((e["session_id"], e["account"]), (SID, "work"))
         self.assertTrue(e["text"].startswith("personal -> work ("), e["text"])
 
+    def test_a_pass_reads_each_agents_repo_owner_for_the_logins_owner_rules(self):
+        af = load_script("agent-failover")
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:Example-Org/x.git"],
+                       check=True)
+        broken = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q", str(broken)], check=True)
+        with open(broken / ".git" / "config", "a") as fh:
+            fh.write("[broken\n")                                       # git cannot tell its owner
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            got = af.with_owners([dict(sess(), cwd=str(repo)), dict(sess(sid="other"), cwd="/no/such/folder"),
+                                  dict(sess(sid="broken-one", name="agent-broken"), cwd=str(broken))])
+        self.assertEqual([(a["id"], a["owner"]) for a in got], [(SID, "Example-Org"), ("other", None)])
+        self.assertIn("agent-broken (broken-o) not moved in this pass: git ls-remote --get-url origin in",
+                      out.getvalue())
+
     def test_a_fable_agent_out_of_credits_end_to_end(self):
-        """A background agent on personal, Fable 5.1, out of Fable credits (weekly Fable 0%, extra usage off). The watch must see it and move it to work, which has Fable left."""
+        """A background agent on personal, Fable 5.1, out of Fable credits (weekly Fable 0%, extra usage off). The
+        watch must see it and move it to work, which has Fable left."""
         af = load_script("agent-failover")
         homes.status_log(self)
         self.agent(reply(), entry("user", "[email from Alex] carry on"), credits_record(),
@@ -1119,7 +1466,7 @@ class Watch(unittest.TestCase):
                 mock.patch.object(af.failover, "migrate", side_effect=lambda s, to, prompt, cfg, **k:
                                   moved.append((s["id"], s["model"], to, prompt)) or (True, "moved")), \
                 mock.patch.object(af, "trust", return_value=None), contextlib.redirect_stdout(io.StringIO()) as out:
-            state, moves, _ = af.one_pass(CFG, {}, False, {"rebalance": NOW, "spend": NOW}, NOW)
+            state, moves, _ = af.one_pass(CFG, {}, False, {"idle": NOW, "spend": NOW}, NOW)
         self.assertEqual([m[:3] for m in moved], [(SID, "claude-fable-5-1", "work")])
         self.assertIn("out of Fable 5.1 usage credits", moved[0][3])
         self.assertIn("moved nightly report r7k2m9xq", out.getvalue())
@@ -1136,7 +1483,7 @@ class Watch(unittest.TestCase):
                 mock.patch.object(af.failover, "migrate", side_effect=lambda s, to, prompt, cfg, **k:
                                   moved.append((to, k["overrides"], prompt)) or (True, "moved")), \
                 mock.patch.object(af, "trust", return_value=None), contextlib.redirect_stdout(io.StringIO()):
-            state, _, _ = af.one_pass(LADDER, {}, False, {"rebalance": NOW, "spend": NOW}, NOW)
+            state, _, _ = af.one_pass(LADDER, {}, False, {"idle": NOW, "spend": NOW}, NOW)
         self.assertEqual([m[:2] for m in moved], [("personal", {"--model": "claude-opus-5-5"})])
         self.assertIn("moved to login 'personal' on model claude-opus-5-5", moved[0][2])
         e = state["sessions"][SID]
@@ -1158,15 +1505,79 @@ class Watch(unittest.TestCase):
         self.assertEqual(state.read()["sessions"][SID]["stuck_until"], NOW + 600)
         self.assertEqual(len(statuslog.read(event="limit-wait")), 1)
 
+    def idle_agents(self, n):
+        """n live background agents idle for 10 minutes on personal, with work as a second login (put). Returns (the
+        homes, {session id: its registry entry's path})."""
+        h = homes.Homes(self, logins=("personal", "work"))
+        return h, {sid: self.put(h, sid, "agent-x" if n == 1 else "idle-%d" % i, [reply("claude-opus-5-5")], "idle",
+                                 NOW - 600)
+                   for i, sid in enumerate([SID] if n == 1 else ["s%d" % i for i in range(n)])}
+
+    def test_idle_agents_leave_a_used_up_login_a_few_each_pass(self):
+        """Agents idle on a used-up login: each pass moves idle_moves_per_pass of them, one after another, and with
+        some left looks again at the next pass rather than after the usual wait."""
+        af = load_script("agent-failover")
+        homes.status_log(self)
+        h, entries = self.idle_agents(5)
+        moved = []
+
+        def move(s, to, prompt, cfg, **k):
+            """As a move leaves the registry: the session's entry under the login it went to."""
+            entries[s["id"]].rename(h.homes[to] / "sessions" / entries[s["id"]].name)
+            moved.append(s["id"])
+            return True, "moved"
+        (h.homes["work"] / "sessions").mkdir()
+        with mock.patch.object(af.usage, "snapshots", return_value=used_up()), \
+                mock.patch.object(af.failover, "migrate", side_effect=move), \
+                mock.patch.object(af, "trust", return_value=None), contextlib.redirect_stdout(io.StringIO()) as out:
+            state, moves, last = af.one_pass(CFG, {}, False, {"idle": 0, "spend": NOW}, NOW)
+            self.assertEqual(len(moved), 3)                                      # in the registry's order
+            self.assertEqual(last["idle"], NOW - af.IDLE_LOOK_SECONDS)         # due again at the next pass
+            said = out.getvalue().split("2 idle move(s) left for the next pass (failover.idle_moves_per_pass: 3): ")
+            self.assertEqual(sorted(said[1].splitlines()[0].split(", ")),
+                             ["idle-%s -> work" % sid[1:] for sid in sorted(set(entries) - set(moved))])
+            state, moves, last = af.one_pass(CFG, state, False, last, NOW + 20)
+            self.assertEqual(sorted(moved), ["s0", "s1", "s2", "s3", "s4"])
+            self.assertEqual(last["idle"], NOW + 20)                            # nothing left: the usual wait
+            state, moves, last = af.one_pass(CFG, state, False, {"idle": 0, "spend": NOW}, NOW + 40)
+        self.assertEqual(moves, [])                                              # all on work now: nothing to do
+        self.assertEqual({e["resets_at"] for e in state["sessions"].values()}, {WEEK_RESET})
+        self.assertTrue(all(e["text"].startswith("personal -> work (spent: personal has no headroom")
+                            for e in statuslog.read(event="failover")))
+        self.assertEqual(statuslog.read(event="limit-wait"), [])
+
+    def test_a_pass_whose_every_idle_move_fails_waits_the_usual_time(self):
+        """So that a move that keeps failing is not tried again every pass."""
+        af = load_script("agent-failover")
+        homes.status_log(self)
+        self.idle_agents(5)
+        with mock.patch.object(af.usage, "snapshots", return_value=used_up()), \
+                mock.patch.object(af.failover, "migrate", return_value=(False, "not moved: no transcript")), \
+                mock.patch.object(af, "trust", return_value=None), contextlib.redirect_stdout(io.StringIO()):
+            _, moves, last = af.one_pass(CFG, {}, False, {"idle": 0, "spend": NOW}, NOW)
+        self.assertEqual((len(moves), last["idle"]), (3, NOW))
+
+    def test_an_idle_agent_with_nowhere_to_go_is_journaled_once_and_not_shown_stopped(self):
+        af = load_script("agent-failover")
+        homes.status_log(self)
+        self.idle_agents(1)
+        with mock.patch.object(af.usage, "snapshots", return_value=used_up(work=0)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            state, moves, _ = af.one_pass(CFG, {}, False, {"idle": 0, "spend": NOW}, NOW)
+            af.one_pass(CFG, state, False, {"idle": 0, "spend": NOW}, NOW + 20)
+        self.assertEqual(moves, [])
+        self.assertEqual(out.getvalue().count("waiting: agent-x (3d3d3d3d) is idle on personal"), 1, out.getvalue())
+        self.assertEqual(statuslog.read(event="limit-wait"), [])
+
     def test_no_usage_read_when_nothing_is_limited_or_idle_and_no_spend_check_is_due(self):
         af = load_script("agent-failover")
         self.agent(entry("user"), reply())
-        last = {"rebalance": NOW, "spend": NOW - 299}
+        last = {"idle": NOW, "spend": NOW - 299}
         with mock.patch.object(af.usage, "snapshots", side_effect=AssertionError("no usage read needed")):
             self.assertEqual(af.one_pass(CFG, {}, False, last, NOW), ({}, [], last))
         with mock.patch.object(af.usage, "snapshots", return_value=snaps()) as read:
             state, moves, done = af.one_pass(CFG, {}, False, last, NOW + 1)
-        self.assertEqual((read.call_count, moves, done), (1, [], {"rebalance": NOW, "spend": NOW + 1}))
+        self.assertEqual((read.call_count, moves, done), (1, [], {"idle": NOW, "spend": NOW + 1}))
 
 
 def billing(work=0, extra=True, used=211.41, limit=None, personal=80):
@@ -1180,6 +1591,72 @@ def billing(work=0, extra=True, used=211.41, limit=None, personal=80):
 
 def on(account, name, model="claude-opus-5-5", sid=None):
     return dict(sess(account, name=name, sid=sid or name), model=model)
+
+
+def add_gemini(test, cfg, h=None):
+    """The per-token login gemini (homes.per_token_login) beside the others: in cfg and, with h (a homes.Homes), in
+    its homes and config.json, so the registry reads it. Returns its account entry."""
+    g = homes.per_token_login(test, h.base if h else None)
+    cfg["usage"]["claude_accounts"]["gemini"] = g
+    if h:
+        h.homes["gemini"] = Path(g["config_dir"])
+        d = json.loads(h.config.read_text())
+        d["usage"]["claude_accounts"]["gemini"] = g
+        h.config.write_text(json.dumps(d))
+    return g
+
+
+def on_gemini(g, **kw):
+    return dict(sess(**kw), account="gemini", config_dir=str(Path(g["config_dir"]).resolve()))
+
+
+class PerTokenLogin(unittest.TestCase):
+    """A manual login (gemini: billed per token, with a settings file and a model of its own) is a person's choice:
+    nothing moves an agent onto it or off it, and a move onto or off it runs the right model."""
+
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(CFG))
+        self.g = add_gemini(self, self.cfg)
+        self.snaps = dict(snaps(), **{"claude:gemini": dict(usage.per_token(self.g), cli="claude", account="gemini")})
+
+    def decide(self, sessions, limits=None, s=None, state=None):
+        return failover.decide(sessions, limits or {}, s or self.snaps, state or {}, self.cfg, NOW)
+
+    def test_an_agent_on_it_is_never_moved_off(self):
+        hit = {SID: {"window": "five_hour", "resets_at": NOW + 3600, "text": ""}}
+        moves, notes = self.decide([on_gemini(self.g)], hit)
+        self.assertEqual(moves, [])
+        self.assertIn("hit its limit on gemini (five-hour limit, resets %s); that is a manual login "
+                      "(usage.claude_accounts), which nothing moves it off, so it waits for the reset"
+                      % usage.fmt_reset(NOW + 3600, NOW), notes[0][2])
+        self.assertEqual(self.decide([on_gemini(self.g, status="idle", idle_for=3600)]), ([], []))   # no move up
+        moved_once = {"sessions": {SID: {"home": "personal", "current": "gemini", "resets_at": NOW - 60, "moves": []}}}
+        self.assertEqual(self.decide([on_gemini(self.g, status="idle", idle_for=3600)], state=moved_once), ([], []))
+
+    def test_nothing_moves_an_agent_onto_it(self):
+        hit = {SID: {"window": "five_hour", "resets_at": NOW + 3600, "text": ""}}
+        moves, notes = self.decide([sess()], hit, dict(self.snaps, **snaps(personal=0, work=0)))
+        self.assertEqual(moves, [])                      # though it is the one login with room
+        self.assertIn("no other Claude login has headroom", notes[0][2])
+        self.assertNotIn("gemini", notes[0][2])
+        # nor back to it, after a move by hand off it (agent-failover move records it as the first login)
+        state = {"sessions": {SID: {"switched_at": NOW - 7200, "home": "gemini", "home_model": homes.NEON,
+                                    "current": "work", "resets_at": NOW - 60, "moves": []}}}
+        self.assertEqual(self.decide([sess("work", "idle", 3600)], s=dict(self.snaps, **snaps(personal=0)),
+                                     state=state)[0], [])
+
+    def test_an_idle_agent_leaving_a_used_up_login_never_goes_to_it(self):
+        s = dict(self.snaps, **used_up(work=0))
+        moves, notes = self.decide([sess("personal", "idle", 600)], s=s)
+        self.assertEqual(moves, [])                      # though it is the one login with room
+        self.assertIn("is idle on personal, which has no headroom", notes[0][2])
+        self.assertNotIn("gemini", notes[0][2])
+        self.assertEqual(self.decide([on_gemini(self.g, status="idle", idle_for=3600)], s=s), ([], []))
+
+    def test_no_extra_usage_mail_for_it(self):
+        s = dict(billing(), **{"claude:gemini": self.snaps["claude:gemini"]})
+        out, unreadable = failover.spend_watch([dict(on_gemini(self.g), model=homes.NEON)], s, {}, self.cfg, NOW)
+        self.assertEqual((out, unreadable), ([], {}))
 
 
 class Spend(unittest.TestCase):
@@ -1201,13 +1678,16 @@ class Spend(unittest.TestCase):
     def test_agents_starting_to_bill_get_one_mail_naming_them_the_login_and_the_month(self):
         [(login, st, mail)] = self.watch([on("work", "board-sync"), on("work", "eval-3"), on("personal", "mail")],
                                          billing())
-        self.assertEqual((login, st["since"], st["spent"], st["agents"]), ("work", NOW, 0.0, ["board-sync", "eval-3"]))
+        self.assertEqual((login, st["since"], st["spent"], st["agents"]),
+                         ("work", NOW, 0.0, ["board-sync (claude-opus-5-5)", "eval-3 (claude-opus-5-5)"]))
         kind, key, subject, body = mail
-        self.assertEqual((kind, subject), ("extra-usage", "2 agents now bill extra usage on Claude login work"))
+        self.assertEqual((kind, subject), ("extra-usage-spend", "2 agents now bill extra usage on Claude login work"))
         self.assertIn("2 agents are running on the Claude login work, whose session window is used up until %s. Its "
                       "extra usage is on" % usage.fmt_reset(NOW + 3600, NOW), body)
         self.assertIn("Extra usage on work this month: $211.41 used, no monthly cap.", body)
-        self.assertIn("Agents on it: board-sync, eval-3.", body)
+        self.assertIn("Agents on it: board-sync (claude-opus-5-5), eval-3 (claude-opus-5-5).", body)
+        self.assertIn("To stop one billing, switch it to another model or login: right-click it on the agent board, "
+                      "or run agent-switch NAME --model MODEL or --to claude:LOGIN.", body)
         self.assertIn("another mail at each further $100.00 they spend", body)
 
     def test_no_mail_without_extra_usage_billed(self):
@@ -1220,7 +1700,7 @@ class Spend(unittest.TestCase):
         s = billing(work=50)
         s["claude:work"]["windows"].append(fable(0))
         [(_, st, mail)] = self.watch([on("work", "fab", model="claude-fable-5-1"), on("work", "op")], s)
-        self.assertEqual(st["agents"], ["fab"])
+        self.assertEqual(st["agents"], ["fab (claude-fable-5-1)"])
         self.assertIn("1 agent is running on the Claude login work, whose weekly Fable window is used up", mail[3])
 
     def test_a_mail_each_further_step_and_one_for_two_steps_at_once(self):
@@ -1231,9 +1711,10 @@ class Spend(unittest.TestCase):
         self.assertEqual([m[2] for m in mails[1:]],
                          ["$108.59 of extra usage spent on Claude login work since %s" % usage.fmt_reset(NOW, NOW),
                           "$313.59 of extra usage spent on Claude login work since %s" % usage.fmt_reset(NOW, NOW)])
-        self.assertIn("Still on it: a.", mails[1][3])
+        self.assertIn("Still on it: a (claude-opus-5-5).", mails[1][3])
         self.assertEqual((state["spend"]["work"]["spent"], state["spend"]["work"]["mailed"]), (313.59, 300))
         self.assertEqual(len({m[1] for m in mails}), 3)        # each its own alert key, so none is deduplicated
+        self.assertEqual({m[0] for m in mails}, {"extra-usage-spend"})
 
     def test_the_step_comes_from_config(self):
         cfg = dict(CFG, failover=dict(CFG["failover"], spend_step=50))
@@ -1255,7 +1736,8 @@ class Spend(unittest.TestCase):
             state, _ = self.run_stretch([(NOW, billing(used=211.41))], [on("work", "a")])
             [(login, st, mail)] = self.watch(sessions, end, state, NOW + 3600)
             self.assertEqual((login, st), ("work", None))
-            self.assertEqual(mail[2], "Agents stopped billing extra usage on Claude login work: $142.10 spent")
+            self.assertEqual(mail[:3:2], ("extra-usage-end",
+                                          "Agents stopped billing extra usage on Claude login work: $142.10 spent"))
             self.assertIn("any more: %s. From %s to %s they spent $142.10 of extra usage." % (
                 why, usage.fmt_reset(NOW, NOW), usage.fmt_reset(NOW + 3600, NOW)), mail[3])
             self.assertIn("Extra usage on work this month: $353.51 used, no monthly cap.", mail[3])
@@ -1379,7 +1861,7 @@ class SpendWatch(unittest.TestCase):
         self.assertEqual([(c.args[0]["id"], c.args[1]) for c in migrate.call_args_list],
                          [("idle-agent-0000", "personal")])
         self.assertIn("mailed Alex: 1 agent now bills extra usage on Claude login work", out)
-        self.assertIn("Agents on it: board-sync.", self.mails()[0].get_body(("plain",)).get_content())
+        self.assertIn("Agents on it: board-sync (claude-opus-5-5).", self.mails()[0].get_body(("plain",)).get_content())
         self.assertEqual(self.state.read()["spend"]["work"]["ids"], [SID])
 
     def test_a_dry_run_says_what_it_would_mail_and_sends_nothing(self):

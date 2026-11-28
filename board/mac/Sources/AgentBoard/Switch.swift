@@ -81,12 +81,17 @@ struct SwitchSheet: View {
 
     func pickers(_ o: SwitchOptions) -> some View {
         let cli = selectedTarget?.cli ?? o.agent.cli
-        let models = o.models[cli] ?? []
+        let models = selectedTarget?.models ?? o.models[cli] ?? []
         let sameCLI = cli == o.agent.cli
         let def = o.defaults?[cli]
-        let keepModel = sameCLI ? "Keep current (\(o.agent.model ?? "?"))" : "Default (\(def?.model ?? "?"))"
+        // as agent-switch does it: a login with a model of its own (per token, through OpenRouter) runs that one;
+        // leaving one, an agent takes what a new agent gets; otherwise it keeps its own model on its own CLI
+        let only = selectedTarget?.onlyModel
+        let keepsOwn = sameCLI && o.targets.first { $0.current ?? false }?.onlyModel == nil
+        let keepModel = only.map { "Its login's model (\($0))" }
+            ?? (keepsOwn ? "Keep current (\(o.agent.model ?? "?"))" : "Default (\(def?.model ?? "?"))")
         let keepEffort = sameCLI ? "Keep current (\(o.agent.effort ?? "?"))" : "Default (\(def?.effort ?? "?"))"
-        let efforts = effortList(models: models, current: sameCLI ? o.agent.model : def?.model)
+        let efforts = effortList(models: models, current: only ?? (keepsOwn ? o.agent.model : def?.model))
         return VStack(alignment: .leading, spacing: 6) {
             Picker("Model", selection: $modelChoice) {
                 Text(keepModel).tag("")

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 TMP = tempfile.mkdtemp()
 import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
+import homes  # noqa: E402
 from agentmail import config, headless, registry  # noqa: E402
 
 
@@ -94,6 +95,22 @@ class Logins(unittest.TestCase):
         for off in ("", None):   # None: the default, no API-key fallback
             got = headless.logins(dict(self.cfg, orchestrator_fallback_secret=off), ["claude", "-p"], {}, None)
             self.assertEqual([g[0] for g in got], ["personal"], off)
+
+    def test_a_manual_login_is_never_run_and_a_login_s_own_options_are(self):
+        self.cfg["usage"]["claude_accounts"]["gemini"] = homes.per_token_login(self)
+        self.cfg["usage"]["order"].insert(0, "claude:gemini")          # even listed first
+        got = headless.logins(dict(self.cfg, orchestrator_fallback_secret=""), ["claude", "-p", "--model", "haiku"],
+                              {}, None)
+        self.assertEqual([g[0] for g in got], ["personal", "work"])
+        settings = Path(self.work, "s.json")
+        settings.write_text('{"env": {"OWN_ENDPOINT": "x"}}')
+        self.cfg["usage"]["claude_accounts"]["work"].update(settings=str(settings), model="work-model")
+        got = {g[0]: g for g in headless.logins(dict(self.cfg, orchestrator_fallback_secret=""),
+                                                ["claude", "-p", "--model", "haiku"], {"OWN_ENDPOINT": "x"}, None)}
+        self.assertEqual(got["work"][1],
+                         ["claude", "-p", "--settings", str(settings.resolve()), "--model", "work-model"])
+        self.assertEqual(got["personal"][1], ["claude", "-p", "--model", "haiku"])
+        self.assertNotIn("OWN_ENDPOINT", got["personal"][2])           # a settings file's variables, for no login
 
     def test_api_key_wrapping(self):
         cmd = headless.api_key_command(self.cfg, ["claude", "-p"])

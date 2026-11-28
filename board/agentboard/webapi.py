@@ -16,12 +16,16 @@ class ApiError(RuntimeError):
         self.status = status
 
 
-def request(method, url, name, error, form=None, body=None, headers=None, timeout=20):
-    """One request to the API that errors call `name`: `form` goes URL-encoded, `body` as JSON. The answer's JSON,
-    {} for an empty answer. Raises error(message, status), an ApiError, whose message names the status only."""
+def request(method, url, name, error, form=None, body=None, headers=None, timeout=20, raw=None):
+    """One request to the API that errors call `name`: `form` goes URL-encoded, `body` as JSON, `raw` (bytes) as it
+    is, under the Content-Type `headers` give it. `timeout`: the seconds each step may take, sending the whole request
+    being one step. The answer's JSON, {} for an empty answer. Raises error(message, status), an ApiError, whose
+    message names the status only."""
     headers = dict(headers or {})
     data = None
-    if body is not None:
+    if raw is not None:
+        data = raw
+    elif body is not None:
         data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
     elif form:
         data = urllib.parse.urlencode(form).encode()

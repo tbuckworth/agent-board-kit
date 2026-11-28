@@ -1,0 +1,9 @@
+#!/bin/sh
+# agent-keyring-unlock: `agent-board keyring-unlock` as it must be run, on the system's Python in isolated mode, so
+# that nothing from a virtualenv, a user site or PYTHONPATH loads beside the password it reads (agentboard/lockdown.py).
+# The password goes on stdin only; one JSON line comes out (README, "Unlock the desktop"). The kit's wrapper in
+# ~/.local/bin runs this file from the checkout, so the agent-board beside it is the checkout's. A shell script on
+# purpose: the kit wraps a Python tool with its venv's Python, which keyring-unlock refuses to run on. (The Mac app
+# runs the same line itself, on the script the agent-board wrapper names.)
+here=$(dirname "$(readlink -f "$0")")
+exec /usr/bin/python3 -I "$here/agent-board" keyring-unlock

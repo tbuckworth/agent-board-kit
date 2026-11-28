@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-kit",
+  "description": "Plugins the agent kit's mailroom can drive: the researcher plugin, for the Mail tab's Researcher switch",
+  "owner": {
+    "name": "agent-board-kit"
+  },
+  "plugins": [
+    {
+      "name": "researcher",
+      "description": "A structured research workflow, from literature search through results audit and paper writing",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/tbuckworth/ai-safety-researcher.git"
+      },
+      "category": "development"
+    }
+  ]
+}

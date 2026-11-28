@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""One-time authorisation of the agents Gmail account for the mailroom.
+"""One-time authorisation of the agents Gmail account for the mailroom, when it uses Gmail.
 
     agent-mail-auth [--account AGENTS_ADDRESS] [--client-secrets PATH] [--port N] [--no-browser]
 
 (`agent-mail-auth` is the installed wrapper; it runs this file with the kit's Python.)
+
+With Gmail off in config ("gmail": false; the mailroom's README, "Running without Gmail") no token is needed, and
+it refuses: set "gmail": true and `account` first.
 
 Asks for gmail.modify only (read, label, send; no permanent delete) and stores the
 refresh token at ~/.config/agent-mail/token.json (mode 600). The expected account is
@@ -45,10 +48,19 @@ def main(argv=None):
                     help="do not try to open a browser; print the URL to open elsewhere (headless/SSH)")
     a = ap.parse_args(argv)
 
+    try:
+        cfg = config.load()
+    except config.ConfigError as e:
+        print(e, file=sys.stderr)
+        return 2
+    if not config.gmail_on(cfg):
+        print('Gmail is off in %s ("gmail": false), so the mailroom needs no Gmail token. To use Gmail, set "gmail": '
+              'true and "account" (the agents Gmail address) there first.' % config.CONFIG_PATH, file=sys.stderr)
+        return 2
+
     config.CONF_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(config.CONF_DIR, 0o700)
 
-    cfg = config.load()
     expected = (a.account or cfg.get("account") or "").strip().lower()
     if not expected:
         print("No agents account: pass --account ADDRESS or set `account` in %s." % config.CONFIG_PATH, file=sys.stderr)

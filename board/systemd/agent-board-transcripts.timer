@@ -1,0 +1,12 @@
+[Unit]
+Description=agent-board: archive the agent transcripts once a day
+
+[Timer]
+# mid-morning, when a Mac is usually awake: a run that finds it asleep skips it until the next day, and the Mac keeps
+# its transcripts until then. Persistent: a run missed while the desktop was off happens at the next boot.
+OnCalendar=*-*-* 10:30
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

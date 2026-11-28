@@ -18,18 +18,26 @@ struct Snapshot: Decodable {
     var worktrees: [FreeWorktree]
     var owner: String?
     var desktop: DesktopUpdates?
+    /// Chrome's keyring on the desktop (Keyring.swift); none from a desktop with the keyring unlock off.
+    var keyring: KeyringStatus?
     var restart: RestartStatus?
     var sent: SentCounts?
     var chats: ChatsInfo?
     var meetings: MeetingsInfo?
     var mailbox: MailboxSummary?
+    /// The mailroom's security alerts of the last 7 days that it kept for the Mail tab rather than sent through Gmail,
+    /// oldest first (SecurityAlerts.swift notifies of each new one); none from a desktop that sends no section.
+    var securityAlerts: [SecurityAlert]
+    /// The logins a new agent can be started on by name, besides Automatic (the start dialog's choice): the
+    /// mailroom's manual ones, such as a model through OpenRouter billed per token (sources.manual_logins).
+    var spawnLogins: [SpawnLogin]
     /// What failed this poll: the board sources the desktop lists (collector: Collector.problems), then the parts of
     /// the snapshot this app could not decode. The top bar's ProblemsChip lists them.
     var problems: [Problem]
 
     enum CodingKeys: String, CodingKey {
         case generated, host, agents, timeline, summary, mail, usage, metrics, gmail, worktrees, owner, desktop, restart, sent, chats,
-             meetings, mailbox, problems
+             meetings, mailbox, keyring, securityAlerts, spawnLogins, problems
     }
 
     /// Lossy where it matters: one odd agent, timeline row, usage or metrics field never blanks the board, and what
@@ -70,6 +78,7 @@ struct Snapshot: Decodable {
         worktrees = rows(FreeWorktree.self, .worktrees, "worktree")
         owner = part(String.self, .owner)
         desktop = part(DesktopUpdates.self, .desktop)
+        keyring = part(KeyringStatus.self, .keyring)
         restart = part(RestartStatus.self, .restart)
         sent = part(SentCounts.self, .sent)
         let ch = part(ChatsInfo.self, .chats)
@@ -79,8 +88,17 @@ struct Snapshot: Decodable {
         note(mt?.dropped ?? [], "meeting")
         meetings = mt
         mailbox = part(MailboxSummary.self, .mailbox)
+        securityAlerts = rows(SecurityAlert.self, .securityAlerts, "security alert")
+        spawnLogins = rows(SpawnLogin.self, .spawnLogins, "login")
         problems = rows(Problem.self, .problems, "problem") + failed
     }
+}
+
+/// A login a new agent can be started on by name: its name in the mailroom's config (agent-spawn --account) and
+/// its label there.
+struct SpawnLogin: Decodable, Equatable, Hashable {
+    var name: String
+    var label: String
 }
 
 /// The meetings that start within the desktop's look-ahead (agentboard/meetings.py), and how long before a start
@@ -350,6 +368,8 @@ struct AgentMail: Decodable, Equatable {
     var gmailThread: String?
     /// The Mail tab's thread of its latest mail to the owner; "" when it has none (collector: classify.mail_state).
     var lastOutThread: String?
+    /// Its latest mail to the owner is kept for the Mail tab alone, so Gmail has no copy (collector: classify.mail_state).
+    var lastOutKept: Bool?
     var held: Int?
     var threads: [MailThread]?
 }
@@ -479,6 +499,10 @@ struct UsageAccount: Decodable, Identifiable, Equatable {
     var cached: Bool?
     var error: String?
     var creditsMeter: CreditsMeter?
+    /// "per_token" for a login with no plan (a model through OpenRouter): no windows, and its spend instead.
+    var billing: String?
+    /// What a login billed per token spent this week, against its weekly budget (agentboard/allowance.py).
+    var spend: UsageSpend?
     /// The targets of the Claude logins before this one that are signed in to the same account (one allowance).
     var sameAccountAs: [String]?
     var loginDir: String?          // that login's folder, with ~ for the desktop's home folder
@@ -492,7 +516,9 @@ struct UsageAccount: Decodable, Identifiable, Equatable {
         return String(label[..<cut]).trimmingCharacters(in: .whitespaces)
     }
 
-    enum CodingKeys: String, CodingKey { case target, label, plan, windows, observedAt, stale, cached, error, creditsMeter, sameAccountAs, loginDir }
+    enum CodingKeys: String, CodingKey {
+        case target, label, plan, windows, observedAt, stale, cached, error, creditsMeter, billing, spend, sameAccountAs, loginDir
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -506,9 +532,32 @@ struct UsageAccount: Decodable, Identifiable, Equatable {
         cached = c.lossyValue(Bool.self, forKey: .cached, failures: &why)
         error = c.lossyValue(String.self, forKey: .error, failures: &why)
         creditsMeter = c.lossyValue(CreditsMeter.self, forKey: .creditsMeter, failures: &why)
+        billing = c.lossyValue(String.self, forKey: .billing, failures: &why)
+        spend = c.lossyValue(UsageSpend.self, forKey: .spend, failures: &why)
         sameAccountAs = c.lossyValue([String].self, forKey: .sameAccountAs, failures: &why)
         loginDir = c.lossyValue(String.self, forKey: .loginDir, failures: &why)
         dropped = why
+    }
+}
+
+/// A per-token login's spend (allowance.weekly_spend): dollars since `since`, the week's start as the desktop counts
+/// it (the hover text says it), of its weekly budget, and what was left out of them.
+struct UsageSpend: Decodable, Equatable {
+    var dollars: Double
+    var budget: Double
+    var since: Double?
+    var notes: [String]?
+
+    /// The meter's text, "$12.34 of $500 this week": cents below $100, whole dollars above (it counts on past the budget).
+    var text: String {
+        "\(Self.money(dollars, cents: dollars < 100)) of \(Self.money(budget, cents: budget.rounded() != budget)) this week"
+    }
+    /// How full its meter is: the share of the budget spent, at most all of it.
+    var fraction: Double { budget > 0 ? min(1, max(0, dollars / budget)) : 1 }
+    var over: Bool { dollars > budget }
+
+    static func money(_ v: Double, cents: Bool) -> String {
+        cents ? String(format: "$%.2f", v) : "$" + Fmt.count(v)
     }
 }
 
@@ -577,7 +626,12 @@ struct SwitchTarget: Decodable, Identifiable, Hashable {
     var status: String?
     var usage: String?
     var available: Bool?
+    /// The models it offers (a newer mailroom's): one alone for a login that runs one model (a per-token login through
+    /// OpenRouter), else its CLI's.
+    var models: [SwitchModel]?
     var id: String { target }
+    /// The one model a login with a model of its own runs, or nil.
+    var onlyModel: String? { models?.count == 1 ? models?.first?.value : nil }
 }
 
 struct SwitchModel: Decodable, Identifiable, Hashable {
@@ -640,6 +694,45 @@ enum DecodeTest {
             check(snap.mailbox == MailboxSummary(unread: 3, inbox: 12), "the mailbox's counts: \(String(describing: snap.mailbox))")
         } catch {
             fails.append("a clean snapshot did not decode: \(describeDecodeError(error))")
+        }
+
+        // a login billed per token: its spend this week (agentboard/allowance.py), its meter's text and fill, and the
+        // logins the start dialog offers
+        let perToken = #"{"generated":1800000000,"agents":[],"timeline":[],"mail":{"held":[],"held_count":0},"#
+            + #""spawn_logins":[{"name":"openrouter","label":"Model X (OpenRouter)"}],"#
+            + #""usage":{"source":"agent-usage","accounts":[{"target":"claude:openrouter","label":"Model X (OpenRouter)","#
+            + #""billing":"per_token","windows":[],"weekly_budget_usd":500,"#
+            + #""spend":{"dollars":12.3,"budget":500,"since":1799900000,"notes":[]}}]}}"#
+        do {
+            let snap = try JSON.decoder.decode(Snapshot.self, from: Data(perToken.utf8))
+            check(snap.problems.isEmpty, "a per-token login decodes whole: \(snap.problems)")
+            check(snap.spawnLogins == [SpawnLogin(name: "openrouter", label: "Model X (OpenRouter)")],
+                  "the start dialog's logins: \(snap.spawnLogins)")
+            let acct = snap.usage?.accounts.first
+            check(acct?.billing == "per_token" && acct?.shortLabel == "Model X", "its billing and title")
+            let sp = acct?.spend
+            check(sp?.text == "$12.30 of $500 this week" && sp?.over == false && abs((sp?.fraction ?? 0) - 0.0246) < 1e-9,
+                  "under budget: cents, the normal tint, filled by its share (\(sp?.text ?? "none"))")
+        } catch {
+            fails.append("a per-token login's snapshot did not decode: \(describeDecodeError(error))")
+        }
+        let over = UsageSpend(dollars: 612.4, budget: 500, since: nil, notes: nil)
+        check(over.text == "$612 of $500 this week" && over.over && over.fraction == 1,
+              "over budget: whole dollars, counting on, red, the meter full (\(over.text))")
+        check(UsageSpend(dollars: 0, budget: 49.5, since: nil, notes: nil).text == "$0.00 of $49.50 this week",
+              "a budget with cents keeps them")
+        // agent-switch's options: a login with a model of its own offers that one alone
+        let options = #"{"agent":{"cli":"claude","account":"default","model":"claude-opus-5-5"},"targets":["#
+            + #"{"target":"claude:default","label":"Claude Code default","cli":"claude","current":true},"#
+            + #"{"target":"claude:openrouter","label":"Claude Code openrouter","cli":"claude","account":"openrouter","#
+            + #""models":[{"value":"vendor/model-x","label":"vendor/model-x","efforts":["low","high"]}]}],"#
+            + #""models":{"claude":[{"value":"claude-opus-5-5","label":"Opus"},{"value":"claude-fable-5-2","label":"Fable"}]}}"#
+        do {
+            let o = try JSON.decoder.decode(SwitchOptions.self, from: Data(options.utf8))
+            check(o.targets.map { $0.onlyModel } == [nil, "vendor/model-x"],
+                  "the per-token login's one model, and none for a login of the CLI's catalog")
+        } catch {
+            fails.append("switch options with a target's models did not decode: \(describeDecodeError(error))")
         }
 
         // an action's answer: the value under a key or the whole answer, the desktop's error, nothing, or a bad payload

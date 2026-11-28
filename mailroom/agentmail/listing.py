@@ -18,11 +18,12 @@ def timestamp(v):
 
 def sent(st, limit, host_id):
     """The latest `limit` sent mails, one line each; a session on another machine than host_id (config host_id, where
-    the store is) shows as cli@host."""
-    return "".join("%s  %-6s %-28s -> %-30s %s\n" % (
+    the store is) shows as cli@host, and mail kept for the Mail tab alone (no Gmail id) says so."""
+    return "".join("%s  %-6s %-28s -> %-30s %s%s\n" % (
         timestamp(r["sent_at"]),
         (r["cli"] or "?") + ("@" + r["origin_host"] if r["origin_host"] and r["origin_host"] != host_id else ""),
-        (r["session_name"] or (r["session_id"] or "")[:8])[:28], r["to_addr"], r["subject"])
+        (r["session_name"] or (r["session_id"] or "")[:8])[:28], r["to_addr"], r["subject"],
+        "" if r["gmail_id"] else "  (in the Mail tab)")
         for r in st.list_sent(limit))
 
 

@@ -43,21 +43,36 @@ def session_model(lines):
     return last_reply(lines)[0]
 
 
-def transcript_flags(lines):
-    """--model, --effort and --permission-mode as the transcript last recorded them: what a background session
-    resumes with, since its process (a daemon's spare) has none on its command line."""
-    model, effort, mode = session_model(lines), None, None
+def session_effort(lines):
+    """The session's effort as the newest reply in these transcript lines records it, or None: its "effort", the
+    level the session runs at, which a turn's own ultrathink does not change; on a line from an older Claude Code
+    that records none, its "perTurnEffort". A change made since that reply, by /effort or its keys, is not recorded
+    until the next one. Fast mode reads it, and transcript_flags resumes a session with it."""
     for line in reversed(lines):
-        if effort and mode:
+        if '"assistant"' not in line or 'ffort"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") == "assistant" and (d.get("effort") or d.get("perTurnEffort")):
+            return d.get("effort") or d["perTurnEffort"]
+    return None
+
+
+def transcript_flags(lines):
+    """--model, --effort (session_effort) and --permission-mode as the transcript last recorded them: what a
+    background session resumes with, since its process (a daemon's spare) has none on its command line."""
+    model, effort, mode = session_model(lines), session_effort(lines), None
+    for line in reversed(lines):
+        if mode:
             break
         try:
             d = json.loads(line)
         except ValueError:
             continue
-        if not mode and d.get("type") == "permission-mode":
+        if d.get("type") == "permission-mode":
             mode = d.get("permissionMode")
-        if not effort and d.get("type") == "assistant":
-            effort = d.get("perTurnEffort") or d.get("effort")
     out = []
     for flag, value in (("--model", model), ("--effort", effort), ("--permission-mode", mode)):
         if value:
@@ -112,6 +127,8 @@ def movable(sess):
     shell, parent = pane_pid(pane), procs.ppid(int(sess["pid"]))
     if shell is None or parent is None:
         return None, "pane or process gone"
+    # The registry's pane id is from the server of claude's own $TMUX, and pane ids restart at %0 on each server: the
+    # shell's pid matching claude's parent is what proves it is this pane of the server commands.tmux reaches.
     if shell != parent:
         return None, "claude is not the pane shell's child (not agent-spawn's layout)"
     return pane, ""
@@ -142,23 +159,25 @@ def wait_dead(pid, timeout=10.0):
     return False
 
 
-def claude_env(config_dir):
+def claude_env(config_dir, s=None):
     """The environment for a claude command run for one login: that login's config dir (none: the default
-    login), and nothing inherited from a session this may run inside (agent-switch from an agent)."""
-    return accounts.claude_env({"config_dir": config_dir})
+    login), and nothing inherited from a session this may run inside (agent-switch from an agent), nor a settings
+    file's variables (accounts.claude_env; s: usage.settings, None: config.json's)."""
+    return accounts.claude_env({"config_dir": config_dir}, None, s)
 
 
 def bg_command(claude, sid, name, flags, prompt):
+    """`claude --resume SID --bg [--name NAME] FLAGS [PROMPT]`; FLAGS as the login takes them (bg_resume)."""
     return [claude, "--resume", sid, "--bg"] + (["--name", name] if name else []) + list(flags) + \
         ([prompt] if prompt else [])
 
 
-def bg_job(claude, verb, sid, config_dir):
+def bg_job(claude, verb, sid, config_dir, s=None):
     """`claude VERB ID` (stop, rm) for a background session or copy under the login config_dir: runs the claude
     CLI. (ok, output). It takes the short id that `claude agents` lists; a full session id is "No job matching"."""
     try:
         r = subprocess.run([claude, verb, sid[:8]], capture_output=True, text=True, timeout=60,
-                           env=claude_env(config_dir))
+                           env=claude_env(config_dir, s))
     except (OSError, subprocess.SubprocessError) as e:
         return False, "%s: %s" % (type(e).__name__, e)
     return r.returncode == 0, (r.stdout + r.stderr).strip()[:300]
@@ -178,20 +197,24 @@ def bg_saved_flags(config_dir, sid):
 COPY_RE = re.compile(r"started a copy as ([0-9a-f]{8})")
 
 
-def bg_resume(claude, sess, flags, config_dir, prompt):
-    """`claude --resume ID --bg` under config_dir, in the session's folder. (ok, output). A login whose daemon has
-    run the session before gets no flags (see bg_saved_flags); if claude starts a copy anyway, the copy is
-    stopped and removed (bg_job) and the session resumed once more with no flags, and the output says so. A copy
-    that will not stop fails the resume, naming it."""
+def bg_resume(claude, sess, flags, config_dir, prompt, s=None):
+    """`claude --resume ID --bg` under config_dir, in the session's folder. (ok, output). The flags are as that
+    login takes them (accounts.login_flags; s: usage.settings, None: config.json's), except that a login whose daemon
+    has run the session before gets none (see bg_saved_flags); if claude starts a copy anyway, the copy is stopped and
+    removed (bg_job) and the session resumed once more with no flags, and the output says so. A copy that will not
+    stop fails the resume, naming it."""
     cwd = sess.get("cwd") if sess.get("cwd") and os.path.isdir(sess["cwd"]) else None
     name = sess.get("name")
+    s = accounts.current_settings() if s is None else s
     if bg_saved_flags(config_dir, sess["id"]) is not None:
         flags, name = [], None   # --name is a flag too: the saved options keep its name
+    else:
+        flags = accounts.login_flags(s, config_dir, flags)
     out, dropped = "", ""
     for a_flags, a_name in [(flags, name)] + ([([], None)] if flags or name else []):
         try:
             r = subprocess.run(bg_command(claude, sess["id"], a_name, a_flags, prompt),
-                               capture_output=True, text=True, timeout=120, cwd=cwd, env=claude_env(config_dir))
+                               capture_output=True, text=True, timeout=120, cwd=cwd, env=claude_env(config_dir, s))
         except (OSError, subprocess.SubprocessError) as e:
             return False, "%s: %s" % (type(e).__name__, e)
         said = " ".join((r.stdout + r.stderr).split())
@@ -205,11 +228,11 @@ def bg_resume(claude, sess, flags, config_dir, prompt):
             break
         if a_flags or a_name:   # it started a copy because of the flags: drop the copy, resume the session itself
             cid = copy.group(1)
-            stopped, said_stop = bg_job(claude, "stop", cid, config_dir)
+            stopped, said_stop = bg_job(claude, "stop", cid, config_dir, s)
             if not stopped:
                 return False, "claude started a copy %s and `claude stop %s` failed: %s; the copy may still be " \
                               "running" % (cid, cid, said_stop)
-            removed, said_rm = bg_job(claude, "rm", cid, config_dir)
+            removed, said_rm = bg_job(claude, "rm", cid, config_dir, s)
             dropped = "claude started a copy %s, which was stopped %s; " % (
                 cid, "and removed" if removed else "but not removed: " + said_rm)
             continue
@@ -229,12 +252,12 @@ def claude_probe_cmd(claude):
 
 def claude_control(claude, acct, request, timeout, cwd, run):
     """Put one control request (its body, {"subtype": ...}) to Claude Code on login acct and return the body of
-    its answer. It runs claude_probe_cmd through run (subprocess.run) and sends no prompt, so no model runs.
-    Raises ControlError if claude answers with an error or not at all; a failure to run it (OSError,
-    subprocess.TimeoutExpired) is the caller's to handle."""
+    its answer. It runs claude_probe_cmd, with the login's own options (accounts.account_args), through run
+    (subprocess.run) and sends no prompt, so no model runs. Raises ControlError if claude answers with an error or
+    not at all; a failure to run it (OSError, subprocess.TimeoutExpired) is the caller's to handle."""
     req = {"type": "control_request", "request_id": "agent-mailroom", "request": request}
-    r = run(claude_probe_cmd(claude), input=json.dumps(req) + "\n", capture_output=True, text=True,
-            timeout=timeout, env=accounts.claude_env(acct), cwd=cwd)
+    r = run(claude_probe_cmd(claude) + accounts.account_args(acct), input=json.dumps(req) + "\n", capture_output=True,
+            text=True, timeout=timeout, env=accounts.claude_env(acct), cwd=cwd)
     for line in (r.stdout or "").splitlines():
         try:
             d = json.loads(line)

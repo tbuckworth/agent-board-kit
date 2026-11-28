@@ -77,7 +77,7 @@ enum Kitty {
         for a in snap.agents where a.live {
             print("  \(a.display): " + (command(for: a).map { $0.joined(separator: " ") } ?? "(nothing to attach to)"))
             let url = MainActor.assumeIsolated { model.latestMailURL(for: a) }
-            var mail = "(none in the last week)"
+            var mail = a.mail.lastOutKept == true ? "(in the Mail tab alone)" : "(none in the last week)"
             if let u = url {
                 do {
                     mail = try Browser.command(u, signedInAs: snap.owner).joined(separator: " ")

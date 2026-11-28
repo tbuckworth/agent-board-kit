@@ -1,0 +1,292 @@
+/* The phone's Mail app (web/mail/index.html): the Mac's Mail tab in Android's shapes. Light or dark as the system is;
+   the thread's ground is the desktop document's own, so the frame blends into the app. */
+:root {
+  color-scheme: light dark;
+  --font: -apple-system, system-ui, Roboto, "Segoe UI", Helvetica, Arial, sans-serif;
+  --bg: #ffffff; --bar: #f6f8fc; --docbg: #f6f8fc; --sheet: #ffffff; --fg: #1f1f1f; --muted: #5f6368; --line: #e3e5e8;
+  --field: rgba(0, 0, 0, 0.055); --readbg: #f4f4f5; --skel: rgba(0, 0, 0, 0.08);
+  --accent: #2f6fdb; --on-accent: #ffffff; --fab: #d3e3fd; --on-fab: #041e49;
+  --dot: #3d8bd9; --busy: #ad7d48; --draft: #da3633; --snooze: #b97a0f; --error: #b3261e;
+  --fast: #8250df; --on-fast: #ffffff; --locked: #c5221f; --unlocked: #188038;
+  --swipe-archive: #2e7d4f; --swipe-inbox: #2f6fdb;
+  --scrim: rgba(0, 0, 0, 0.32); --snack: #303134; --on-snack: #f1f3f4; --snack-action: #a8c7fa;
+  --shadow: 0 2px 6px rgba(0, 0, 0, 0.16), 0 1px 2px rgba(0, 0, 0, 0.12);
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131314; --bar: #131314; --docbg: #131314; --sheet: #232425; --fg: #e3e3e3; --muted: #9aa0a6; --line: #34363a;
+    --field: rgba(255, 255, 255, 0.08); --readbg: #1b1b1d; --skel: rgba(255, 255, 255, 0.09);
+    --accent: #8ab4f8; --on-accent: #0b1d3a; --fab: #004a77; --on-fab: #c2e7ff;
+    --dot: #5aa2ea; --draft: #f26d6a; --snooze: #e8b04a; --error: #f2b8b5;
+    --fast: #b393f7; --on-fast: #1d0c3d; --locked: #f28b82; --unlocked: #81c995;
+    --swipe-archive: #2f6f4a; --swipe-inbox: #3a62a8;
+    --scrim: rgba(0, 0, 0, 0.5); --snack: #e3e3e3; --on-snack: #1f1f1f; --snack-action: #0b57d0;
+    --shadow: 0 2px 8px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: var(--bg); color: var(--fg);
+  font: 15px/1.4 var(--font); -webkit-text-size-adjust: 100%; }
+button, input, textarea { font: inherit; color: inherit; }
+button { background: none; border: 0; padding: 0; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+.icon { width: 24px; height: 24px; flex: none; }
+.icon-button { width: 48px; height: 48px; display: inline-grid; place-items: center; border-radius: 50%; flex: none;
+  color: var(--fg); }
+.icon-button:active { background: var(--field); }
+.grow { flex: 1 1 auto; }
+.filled { min-height: 44px; padding: 0 22px; border-radius: 22px; background: var(--accent); color: var(--on-accent);
+  font-weight: 600; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+.filled .icon { width: 20px; height: 20px; }
+.filled:disabled { opacity: 0.45; }
+.error { color: var(--error); margin: 0; padding: 10px 16px; font-size: 14px; overflow-wrap: anywhere; }
+
+/* ---- the two panes: the list, and a thread sliding over it ---- */
+.pane { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--bg); }
+#listview { transition: transform 280ms var(--ease); }
+body.reading #listview { transform: translateX(-22%); }
+.thread { z-index: 2; background: var(--docbg); transform: translateX(100%); transition: transform 280ms var(--ease);
+  box-shadow: -6px 0 24px rgba(0, 0, 0, 0.14); }
+.thread.in { transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  #listview, .thread, .sheet, .scrim, .snackbar, li .row { transition: none !important; }
+}
+.appbar { flex: none; background: var(--bar);
+  padding: calc(env(safe-area-inset-top) + 8px) max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left)); }
+
+/* the list's bar: search, the boxes, the counts */
+.listbar { border-bottom: 1px solid var(--line); }
+.searchbox { display: flex; align-items: center; height: 48px; border-radius: 24px; background: var(--field);
+  padding-left: 14px; }
+.searchbox > .icon { color: var(--muted); width: 22px; height: 22px; }
+#query { flex: 1; min-width: 0; height: 48px; border: 0; background: none; outline: none; font-size: 16px;
+  padding: 0 8px 0 10px; }
+#query::-webkit-search-cancel-button { display: none; }
+.segments { display: flex; gap: 2px; margin-top: 10px; padding: 3px; border-radius: 12px; background: var(--field); }
+.segments button { flex: 1 1 0; min-width: 0; height: 40px; border-radius: 9px; font-size: 14px; font-weight: 500;
+  color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 4px; }
+.segments button.on { background: var(--sheet); color: var(--fg); font-weight: 600; box-shadow: var(--shadow); }
+.tabcount { margin-left: 5px; font-size: 12px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+/* the desktop keyring's mark, as on the Mac's top bar: red while it is locked, grey while its state is unknown */
+.keymark { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px; margin-top: 10px;
+  padding: 0 14px; border-radius: 12px; font-size: 14px; font-weight: 600; text-align: left; color: var(--locked);
+  background: color-mix(in srgb, var(--locked) 12%, transparent); }
+.keymark .icon { width: 20px; height: 20px; }
+.keymark span { min-width: 0; overflow-wrap: anywhere; }
+.keymark.unknown { color: var(--muted); background: var(--field); }
+.summary, .searching { margin: 8px 4px 0; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.searching { color: var(--fg); font-weight: 500; }
+.menu { position: fixed; z-index: 12; top: calc(env(safe-area-inset-top) + 58px); right: max(12px, env(safe-area-inset-right));
+  min-width: 168px; padding: 6px 0; border-radius: 12px; background: var(--sheet); box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22); }
+.menu button { display: block; width: 100%; height: 48px; padding: 0 18px; text-align: left; font-size: 15px; }
+.menu button:active { background: var(--field); }
+
+/* the list */
+.scroller { flex: 1; min-height: 0; position: relative; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain;
+  touch-action: pan-y; }
+#threads, .skeleton { list-style: none; margin: 0; padding: 0; }
+#threads { padding-bottom: calc(88px + env(safe-area-inset-bottom)); }   /* the last row scrolls clear of the button */
+#threads li { position: relative; overflow: hidden; }
+#threads li.gone { transition: height 220ms var(--ease), opacity 220ms; opacity: 0; }
+#threads li::after { content: ""; position: absolute; left: 38px; right: 0; bottom: 0; height: 1px; background: var(--line); }
+.row { position: relative; z-index: 1; display: flex; gap: 10px; min-height: 76px; background: var(--bg);
+  padding: 11px max(14px, env(safe-area-inset-right)) 11px max(10px, env(safe-area-inset-left));
+  transition: transform 220ms var(--ease); }
+li.read .row { background: var(--readbg); }
+/* a thread's group (threadItem): a 5 px strip of its sub-group's shade down the row's left edge, and nothing else, so
+   the row is otherwise a plain one (README, "Group colours") */
+li.grouped .row { box-shadow: inset 5px 0 0 var(--shade); }
+li.swiping .row { transition: none; }
+.row:active { filter: brightness(0.97); }
+.under { position: absolute; inset: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  padding-right: 24px; color: #ffffff; font-weight: 600; font-size: 14px; background: var(--swipe-archive); }
+.under.to-inbox { background: var(--swipe-inbox); }
+.dots { flex: none; display: flex; gap: 3px; padding-top: 7px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+li.unread .dot.new { background: var(--dot); }
+.main { flex: 1 1 auto; min-width: 0; }
+.top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.who { min-width: 0; flex: 0 1 auto; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.count { flex: none; font-size: 11.5px; font-weight: 600; line-height: 18px; padding: 0 6px; border-radius: 9px;
+  background: var(--field); font-variant-numeric: tabular-nums; }
+.draftmark { flex: none; color: var(--draft); font-size: 13px; font-weight: 600; }
+.fastmark { flex: none; display: inline-flex; align-items: center; gap: 2px; color: var(--fast); font-size: 12.5px;
+  font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.fastmark .icon { width: 14px; height: 14px; fill: currentColor; stroke-width: 1.5; }
+.clip { flex: none; width: 16px; height: 16px; color: var(--muted); }
+.when { flex: none; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.when.snoozed { color: var(--snooze); font-weight: 600; }
+.subj { font-size: 14.5px; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.snip { font-size: 13.5px; color: var(--muted); margin-top: 2px; overflow: hidden; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+li.unread .who, li.unread .subj { font-weight: 700; color: var(--fg); }
+li.unread .when:not(.snoozed) { color: var(--fg); font-weight: 600; }
+li.read .who, li.read .subj { color: var(--muted); }
+.chip { display: inline-block; margin-top: 5px; font-size: 11px; font-weight: 600; color: var(--muted);
+  background: var(--field); border-radius: 8px; padding: 1px 7px; }
+#threads li.empty { padding: 56px 24px; text-align: center; color: var(--muted); }
+#threads li.empty::after { display: none; }
+.listmore { margin: 0; padding: 0 16px 16px; text-align: center; font-size: 12.5px; color: var(--muted); }
+.skeleton li { position: relative; height: 76px; padding: 15px 16px 0 38px; }
+.skeleton li::before, .skeleton li::after { content: ""; display: block; border-radius: 6px; background: var(--skel); }
+.skeleton li::before { height: 12px; width: 42%; }
+.skeleton li::after { height: 10px; width: 84%; margin-top: 14px; }
+.skeleton li:nth-child(3n)::before { width: 30%; }
+.skeleton li:nth-child(2n)::after { width: 70%; }
+.skeleton, .docload .bar { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.5; } }
+
+/* pull to refresh */
+.ptr { position: absolute; z-index: 3; top: 0; left: 50%; width: 40px; height: 40px; margin-left: -20px; border-radius: 50%;
+  display: grid; place-items: center; background: var(--sheet); box-shadow: var(--shadow); pointer-events: none;
+  opacity: 0; transform: translateY(-48px); }
+.ptr.settle { transition: transform 220ms var(--ease), opacity 220ms; }
+.ptr-spin { width: 20px; height: 20px; border-radius: 50%; border: 2.5px solid var(--accent); border-right-color: transparent; }
+.ptr.spinning .ptr-spin { animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- a thread ---- */
+.threadbar { background: var(--docbg); display: flex; align-items: center; padding-left: max(4px, env(safe-area-inset-left));
+  padding-right: max(4px, env(safe-area-inset-right)); padding-top: calc(env(safe-area-inset-top) + 4px); padding-bottom: 4px; }
+.progress { position: relative; z-index: 1; height: 3px; margin-bottom: -3px; background-size: 40% 100%;
+  background-repeat: no-repeat; background-image: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: travel 1s linear infinite; }
+@keyframes travel { from { background-position: -40% 0; } to { background-position: 140% 0; } }
+.docwrap { position: relative; flex: 1; min-height: 0; }
+/* Mode buttons share a row, including when the phone is too narrow to fit the other thread actions. */
+.threadmodes { display: flex; justify-content: flex-end; gap: 4px; margin-right: 2px; }
+@media (max-width: 414px) {
+  .threadbar:has(#researcher:not([hidden])) { flex-wrap: wrap; }
+  .threadmodes:has(#researcher:not([hidden])) { order: 1; flex-basis: 100%; }
+}
+.modeswitch { flex: none; height: 40px; padding: 0 13px 0 9px; border-radius: 20px; display: inline-flex;
+  align-items: center; gap: 4px; border: 1.5px solid var(--line); color: var(--fg); font-size: 14px; font-weight: 600;
+  white-space: nowrap; font-variant-numeric: tabular-nums; }
+.fastswitch .icon { width: 18px; height: 18px; fill: none; }
+.fastswitch.on { background: var(--fast); border-color: var(--fast); color: var(--on-fast); }
+.fastswitch.on .icon { fill: currentColor; }
+.researcherswitch { padding: 0 12px; }
+.researcherswitch.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.modeswitch:disabled { opacity: 0.6; }
+.modenote { flex: none; margin: 0; padding: 0 max(16px, env(safe-area-inset-right)) 8px max(16px, env(safe-area-inset-left));
+  background: var(--docbg); color: var(--muted); font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.fastnote { color: var(--fast); }
+#doc { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: var(--docbg); }
+.docload { position: absolute; inset: 0; padding: 16px max(16px, env(safe-area-inset-right)) 0 max(16px, env(safe-area-inset-left));
+  background: var(--docbg); }
+.docload h1 { margin: 4px 0 14px; font-size: 20px; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+.docload .bar { height: 64px; border-radius: 10px; background: var(--skel); margin-bottom: 10px; }
+.docload .bar.short { width: 60%; height: 40px; }
+.fab { position: absolute; z-index: 3; right: max(16px, env(safe-area-inset-right)); bottom: calc(16px + env(safe-area-inset-bottom));
+  height: 56px; padding: 0 22px 0 18px; border-radius: 16px; display: flex; align-items: center; gap: 10px;
+  background: var(--fab); color: var(--on-fab); font-weight: 600; font-size: 15px; box-shadow: var(--shadow);
+  transition: transform 120ms; }
+.fab:active, .extrasbutton:active { transform: scale(0.96); }
+.extrasbutton { position: absolute; z-index: 3; left: max(16px, env(safe-area-inset-left)); bottom: calc(22px + env(safe-area-inset-bottom));
+  max-width: calc(100% - 164px); height: 44px; padding: 0 16px 0 12px; border-radius: 22px; display: flex; align-items: center;
+  gap: 6px; background: var(--sheet); color: var(--fg); font-size: 14px; font-weight: 600; box-shadow: var(--shadow); }
+.extrasbutton .icon { width: 20px; height: 20px; color: var(--accent); }
+#extraslabel { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+/* ---- sheets: what is in the thread, snoozing, the reply, a message to the orchestrator ---- */
+.scrim { position: fixed; inset: 0; z-index: 10; background: var(--scrim); opacity: 0; transition: opacity 220ms; }
+.scrim.on { opacity: 1; }
+.sheet { position: fixed; z-index: 11; left: 0; right: 0; bottom: 0; max-height: 88dvh; display: flex; flex-direction: column;
+  border-radius: 20px 20px 0 0; background: var(--sheet); box-shadow: 0 -2px 16px rgba(0, 0, 0, 0.2);
+  padding: 0 max(16px, env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  transform: translateY(105%); transition: transform 260ms var(--ease); }
+.sheet.up { transform: none; }
+.grab { flex: none; width: 36px; height: 4px; margin: 10px auto 2px; border-radius: 2px; background: var(--muted); opacity: 0.4; }
+.sheethead { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sheethead h2 { margin: 0; min-width: 0; font-size: 17px; font-weight: 600; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+.sheethead .icon-button { margin-right: -10px; }
+.sheetbody { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-bottom: 8px; }
+.notice { margin: 4px 0 8px; font-size: 13px; color: var(--muted); }
+/* options, plots and code blocks are drawn on white cards, as the document draws each mail; an option takes a long
+   press (its comment) rather than selecting its words */
+.extras section { margin: 8px 0; padding: 2px 14px 10px; border-radius: 12px; border: 1px solid var(--line);
+  background: #ffffff; color: #1f2328; color-scheme: light; overflow-x: auto; }
+.extras .abw-opt { -webkit-user-select: none; user-select: none; }
+.extras h2 { margin: 10px 0 0; font-size: 13px; font-weight: 600; color: #5f6368; }
+.code { position: relative; margin: 8px 0; }
+.code pre { margin: 0; padding: 34px 10px 8px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px;
+  overflow-x: auto; font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace; white-space: pre; color: #1f2328; }
+.code .copy { position: absolute; top: 4px; right: 4px; min-height: 32px; padding: 0 12px; border-radius: 8px;
+  background: #ffffff; border: 1px solid #d0d7de; color: #1f2328; font-size: 13px; font-weight: 600; }
+.attachments { list-style: none; margin: 8px 0 0; padding: 0; }
+.attachments button { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 48px; padding: 6px 4px;
+  text-align: left; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.attachments .icon { color: var(--muted); }
+.choices button { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px;
+  padding: 0 4px; border-bottom: 1px solid var(--line); font-size: 15px; text-align: left; }
+.choices .at { color: var(--muted); font-size: 14px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pick { display: flex; flex-direction: column; gap: 6px; margin: 16px 0 12px; font-size: 14px; color: var(--muted); }
+.pick input { height: 48px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg);
+  color: var(--fg); font-size: 16px; }
+#snoozepicked { width: 100%; }
+.keyfield { width: 100%; height: 48px; margin: 8px 0 4px; padding: 0 12px; border-radius: 10px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg); font-size: 16px; }
+#keyringsaid { margin: 4px 0 12px; font-size: 14px; }
+#keyringsaid.ok { color: var(--unlocked); font-weight: 600; }
+#keyringsaid.bad { color: var(--error); font-weight: 600; }
+#keyringunlock { width: 100%; }
+.composer { gap: 8px; }
+.composer textarea { width: 100%; min-height: 120px; max-height: 42dvh; field-sizing: content; resize: none;
+  padding: 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+  font-size: 16px; line-height: 1.4; }
+/* the answers above the reply's text, each as it is sent: the agent's words quoted, beside the Mac's yellow mark for
+   them (MailComments.highlight), then the owner's answer; past their room (less when the keyboard is up) they scroll, and the
+   line under them says so until they have */
+:root { --quote: #ffe08a; }
+@media (prefers-color-scheme: dark) { :root { --quote: #a68a2e; } }
+.answers { flex: 0 1 auto; min-height: 0; max-height: 34dvh; overflow-y: auto; overscroll-behavior: contain;
+  display: flex; flex-direction: column; gap: 10px; padding: 2px 0; }
+.answer .line { display: flex; align-items: flex-start; gap: 4px; }
+.answer .words { flex: 1; min-width: 0; }
+.answer .asked { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; font-style: italic;
+  color: var(--muted); border-left: 3px solid var(--quote); padding-left: 9px; }
+.answer .mine { margin-top: 3px; font-size: 14px; font-weight: 600; }
+.answer .icon-button { width: 40px; height: 40px; margin-top: -6px; color: var(--muted); }
+.answer .icon-button .icon { width: 20px; height: 20px; }
+.answer .note { display: block; width: calc(100% - 14px); margin: 6px 0 0 14px; min-height: 48px; max-height: 24dvh;
+  field-sizing: content; resize: none; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--fg); font-size: 16px; line-height: 1.35; }
+.more { margin: 0; font-size: 13px; font-weight: 600; color: var(--snooze); }
+#files { list-style: none; margin: 0; padding: 0; font-size: 14px; color: var(--muted); }
+#files li { display: flex; align-items: center; gap: 8px; min-height: 44px; overflow-wrap: anywhere; }
+#files li span { flex: 1; min-width: 0; }
+.composebar { display: flex; align-items: center; gap: 2px; }
+.filebutton { cursor: pointer; }
+.composebar .icon-button:disabled, .filebutton:has(input:disabled), .answer .icon-button:disabled,
+#files .icon-button:disabled { opacity: 0.4; cursor: default; }
+.status { margin: 0; min-height: 1.2em; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+/* what the desktop said of the draft (it changed on the Mac), and the versions it keeps, a tap bringing one back */
+.draftnote { margin: 0; font-size: 13px; font-weight: 600; color: var(--snooze); overflow-wrap: anywhere; }
+.versions { list-style: none; margin: 0; padding: 0; max-height: 30dvh; overflow-y: auto; overscroll-behavior: contain;
+  border: 1px solid var(--line); border-radius: 12px; }
+.versions li + li { border-top: 1px solid var(--line); }
+.versions button { display: block; width: 100%; min-height: 48px; padding: 8px 12px; text-align: left; font-size: 14px;
+  overflow-wrap: anywhere; }
+
+/* the snackbar: what was just done, with Undo; above the floating button of the list or the thread */
+.snackbar { position: fixed; z-index: 20; left: max(12px, env(safe-area-inset-left)); right: max(12px, env(safe-area-inset-right));
+  bottom: calc(88px + env(safe-area-inset-bottom)); max-width: 560px; margin: 0 auto; min-height: 48px;
+  display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 16px; border-radius: 10px; background: var(--snack);
+  color: var(--on-snack); font-size: 14px; box-shadow: var(--shadow); transform: translateY(160%); transition: transform 220ms var(--ease); }
+.snackbar.on { transform: none; }
+#snacktext { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+#snackaction { flex: none; min-height: 40px; padding: 0 12px; border-radius: 8px; color: var(--snack-action); font-weight: 700; }
+
+/* signing in */
+.gate { position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 24px; text-align: center; background: var(--bg); }
+.gate-icon { border-radius: 18px; box-shadow: var(--shadow); }
+.gate h1 { margin: 18px 0 6px; font-size: 24px; font-weight: 600; }
+.gate p { margin: 6px 0; max-width: 28em; color: var(--muted); }
+.gate .filled { margin-top: 18px; min-height: 52px; padding: 0 28px; border-radius: 26px; font-size: 16px; }
+.gate .error { padding: 12px 0 0; }

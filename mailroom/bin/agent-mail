@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """agent-mail: send email from the agents account so that replies route back to you.
 
-    agent-mail send --to ADDR [--cc ADDR] --subject S [--unrouted] MAIL-OPTIONS
-      ADDR: an address, or owner (or config owner_name) for the owner's address
+    agent-mail send --to ADDR [--cc ADDR] --subject S [--unrouted [--alert KIND]] MAIL-OPTIONS
+      ADDR: an address, or owner (or config owner_name) for the owner's address; with Gmail off (config
+      "gmail": false) mail is kept for the Mail tab, and goes only to the owner
+      KIND: the kind of notice an unrouted mail is (agentmail/outbound.py ALERT_KINDS), which decides whether it goes
+      through Gmail while mail to the owner is kept for the Mail tab, and, with Gmail off, whether it is also recorded
+      as a security alert for the board
     agent-mail reply INBOUND_ID [--subject S] MAIL-OPTIONS
       without --subject, in that mail's thread; with it, as a new thread under S that links back, for a thread
       whose subject no longer fits
@@ -14,34 +18,44 @@
     agent-mail sent [--limit N]
     agent-mail inbox [--held] [--limit N]
     agent-mail show INBOUND_ID
+    agent-mail researcher-state [--applied REVISION [--payload FINGERPRINT] [--session NAME_OR_ID] [--cli claude|codex]] -- TAG
+    agent-mail researcher-request -- TAG THREAD   # Message-ID of a routed methods approval request
     agent-mail release INBOUND_ID TARGET [--cli claude|codex] [--host HOST]   # deliver a held mail to a session
     agent-mail rerun INBOUND_ID                # run the orchestrator again on a held or failed mail
+    agent-mail remarkable INBOUND_ID [--dry-run]   # put a held reMarkable mail through its route again (needs Gmail)
     agent-mail receipt REQUEST_ID              # the outcome of a proxied send, without sending again
     agent-mail recover INBOUND_ID [--query TEXT ...] [--refresh]   # read-only search for an unowned reply's session
     agent-mail status
-    agent-mail mailbox list|show|mark|sync|answer|part|summary|backfill ...   # the owner's mailbox, for the Mail tab
+    agent-mail mailbox list|show|mark|sync|answer|fast|researcher|part|summary|backfill ...   # the owner's mailbox, for the Mail tab
+      (sync and backfill need Gmail)
     agent-mail backup                          # copy the message store and the database to config backup.targets
+    agent-mail fast-trial claude|codex [--version V] [--if-untested]
+      try fast mode's effort keys on the installed version (or V) in a throwaway session, with a placeholder key;
+      a pass adds it to fast mode's tested list. --if-untested: nothing to do for a version on that list already.
+      Prints one line; exits 0 on a pass (or nothing to do), 1 on a failure
 
 Mail without --unrouted, to anyone, passes the pre-send review first (config "review"); one it sends back prints
-NOT SENT and exits 3.
-Details: README.md, sections "Sending mail from a session", "The mailroom", "Mac requests and replies" and "The
-Mail tab's mailbox".
+NOT SENT and exits 3. With Gmail off, mail to anyone but the owner, and a command that needs Gmail, exit 5 before
+anything else is done.
+Details: README.md, sections "Sending mail from a session", "The mailroom", "Mac requests and replies", "The
+Mail tab's mailbox", "Researcher mode" and "Fast mode".
 """
 import argparse
 import functools
 import json
 import os
+import signal
 import sys
 import time
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import (backup, cli, config, gmail, groupmail, listing, mailbox, mailroom, outbound,  # noqa: E402
-                       piped, registry, remote, review, routing, rpc, widgets)
+from agentmail import (alerts, backup, cli, config, fasttrial, gmail, groupmail, listing, mailbox,  # noqa: E402
+                       mailroom, outbound, piped, registry, remote, researchermode, review, routing, rpc, widgets)
 from agentmail.outbound import MailError, session_label  # noqa: E402
 from agentmail.config import ConfigError  # noqa: E402
-from agentmail.gmail import NoToken  # noqa: E402
+from agentmail.gmail import GmailOff, NoToken  # noqa: E402
 
 die = functools.partial(cli.die, "agent-mail")
 
@@ -100,7 +114,7 @@ def outgoing(a):
     html_body = Path(a.html).read_text() if a.html else None
     text = read_body(a.body_file, html_body)
     mail = outbound.Mail(text, html_body, outbound.load_images(a.image), outbound.load_files(a.attach))
-    outbound.check_size(mail)
+    outbound.check_mail(mail)
     return widgets.prepare(mail)
 
 
@@ -116,6 +130,13 @@ def check_send_enabled(cfg):
             die(str(e))
 
 
+def needs_gmail(ctx, what):
+    """Stop with exit code outbound.NEEDS_GMAIL when Gmail is off in config: `what` reads or changes Gmail."""
+    if not config.gmail_on(ctx.cfg):
+        die('%s needs Gmail, which is off in config ("gmail": false in %s)' % (what, config.CONFIG_PATH),
+            outbound.NEEDS_GMAIL)
+
+
 def report(outcome):
     """Print what a send or reply did; the exit code is 3 when the pre-send review held the mail."""
     print(outcome.text(), end="")
@@ -127,15 +148,39 @@ def do_send(ctx, a):
     if a.unrouted and os.environ.get("SSH_CONNECTION"):
         die("unrouted SSH sends lose the originating session. Run agent-mail locally on the Mac "
             "with --session so the supported proxy preserves ownership.")
+    if a.alert is not None and not a.unrouted:
+        die("--alert goes with --unrouted: it names the kind of notice a tool sends, not an agent's mail")
+    try:
+        gmail_too = a.alert is not None and outbound.alert_through_gmail(ctx.cfg, a.alert)
+    except ValueError as e:
+        die("--alert: %s" % e)
+    if not config.gmail_on(ctx.cfg):   # mail that cannot go is refused before its files are read
+        outbound.refuse_without_gmail(ctx.cfg, outbound.recipient(ctx.cfg, a.to), outbound.recipient(ctx.cfg, a.cc))
     mail = outgoing(a)
     if a.unrouted:
         to = outbound.recipient(ctx.cfg, a.to)
-        res, _ = outbound.transmit(ctx, None, to, outbound.recipient(ctx.cfg, a.cc), a.subject, mail, None)
-        print("sent to %s | subject %r | thread %s | unrouted (replies go to the orchestrator)"
-              % (to, a.subject, res["threadId"]))
+        res, _ = outbound.transmit(ctx, None, to, outbound.recipient(ctx.cfg, a.cc), a.subject, mail, None,
+                                   through_gmail=gmail_too, kind=a.alert)
+        print("%s | subject %r | thread %s | unrouted (replies go to the orchestrator)"
+              % (outbound.delivered(res, "sent to " + to), a.subject, res["threadId"]))
         return 0
     row = outbound.sender_row(ctx, resolve_session(ctx.cfg, a.session, a.cli))
     return report(outbound.send_mail(ctx, row, a.to, a.cc, a.subject, mail, a.no_review))
+
+
+def caller(cfg, a):
+    """(host, cli, session id) of the session this command runs for, as far as is known without stopping, for fast
+    mode's review skip (fastmode.skips_review): the session whose environment it runs in (Claude's
+    CLAUDE_CODE_SESSION_ID, Codex's CODEX_THREAD_ID), which --session, when given, must name too; outside a session,
+    the one --session names. None when nothing says, or the two disagree."""
+    env = registry.session_from_env(os.getcwd()) or registry.codex_session_from_env()
+    named = None
+    if a.session:
+        named, code, _ = registry.resolve_exact(a.session, a.cli)
+        if code != 0 or (env is not None and (named["cli"], named["id"]) != (env["cli"], env["id"])):
+            return None
+    sess = env or named
+    return (cfg["host_id"], sess["cli"], sess["id"]) if sess else None
 
 
 def do_reply(ctx, a):
@@ -143,7 +188,7 @@ def do_reply(ctx, a):
     inb, row = outbound.reply_target(ctx.st, a.inbound_id)
     if row is None:
         row = outbound.sender_row(ctx, resolve_session(ctx.cfg, a.session, a.cli))
-    return report(outbound.reply_mail(ctx, row, inb, outgoing(a), a.no_review, a.subject))
+    return report(outbound.reply_mail(ctx, row, inb, outgoing(a), a.no_review, a.subject, caller(ctx.cfg, a)))
 
 
 def do_guide(ctx, a):
@@ -219,7 +264,7 @@ def do_release(ctx, a):
         die("delivery failed: the files were not put on %s: %s" % (row["origin_host"], e))
     text = routing.event_text("session", tier, inb["id"], inb["from_name"], inb["from_addr"], collab, inb["subject"],
                               delivered, "", cfg["owner_name"],
-                              reminder=mailroom.owner_reminder(st, cfg, tier, inb["id"], inb["body"] or ""))
+                              reminder=mailroom.owner_reminder(st, cfg, tier, inb["id"], inb["body"] or "", row))
     rc, out = mailroom.deliver_to_session(None, st, cfg, inb["id"], inb["gmail_id"], row, text, "released by hand", False,
                                           matched_tag=row["tag"], match_rule="manual",
                                           released_to=session_label(sess, cfg["host_id"]), released_at=int(time.time()))
@@ -236,7 +281,9 @@ def do_proxy(ctx, a):
     origin = mail = request_id = None
     if a.cmd in ("send", "reply") and getattr(a, "unrouted", False):
         die("proxy mail requires an origin session; --unrouted is not supported")
-    if a.cmd in ("send", "reply", "withdraw"):
+    if a.cmd == "send" and a.alert is not None:
+        die("--alert is not supported through the proxy: it goes with --unrouted, on the desktop")
+    if a.cmd in ("send", "reply", "withdraw") or (a.cmd == "researcher-state" and a.applied is not None):
         origin = resolve_session(ctx.cfg, a.session, a.cli)
     if a.cmd in ("send", "reply"):
         mail = outgoing(a)
@@ -274,6 +321,32 @@ def do_search_local(ctx, a):
     return 0
 
 
+def do_remarkable(ctx, a):
+    """Replay a stored mail through the reMarkable route: same checks, same agent start. It needs Gmail: the route's
+    mail and its PDF are in the agents Gmail account."""
+    from agentmail import remarkable
+    needs_gmail(ctx, "remarkable (the reMarkable route reads the tablet's mail and its PDF from the agents Gmail "
+                     "account)")
+    cfg, st = ctx.cfg, ctx.st
+    inb = st.inbound(a.inbound_id)
+    if not inb:
+        die("no inbound mail with id %s" % a.inbound_id, 4)
+    if routing.is_local(inb["gmail_id"]):
+        die("mail #%d is a reply written in the Mail tab, not a mail from the reMarkable" % inb["id"])
+    if inb["action"] == "delivered" and inb["match_rule"] == "remarkable" and not a.dry_run:
+        die("mail #%d already started a reMarkable agent: %s" % (inb["id"], inb["detail"]), 3)
+    svc = ctx.svc
+    msg = gmail.get_full(svc, inb["gmail_id"])
+    hdrs = gmail.headers(msg)
+    from_name, from_addr = routing.sender(hdrs.get("from", ""))
+    status, detail = remarkable.handle(svc, cfg, inb["id"], msg, from_name, from_addr, hdrs.get("subject", ""),
+                                       gmail.auth_results(hdrs), dry_run=a.dry_run)
+    if not a.dry_run:
+        remarkable.record(svc, st, cfg, inb["id"], inb["gmail_id"], status, detail, from_addr, hdrs.get("subject", ""))
+    print("%s: %s" % (status, detail))
+    return 0 if status in ("started", "dry-run") else 1
+
+
 def do_rerun(ctx, a):
     cfg, st = ctx.cfg, ctx.st
     inb = st.inbound(a.inbound_id)
@@ -302,9 +375,18 @@ def do_rerun(ctx, a):
 
 
 def do_status(ctx, a):
+    """The mailroom's state. With Gmail off it says so first, and shows nothing that only Gmail has (the history
+    cursor, the last poll, DKIM, the mailbox's profile), asking Gmail nothing."""
     import fcntl
     cfg, st = ctx.cfg, ctx.st
-    print("account       %s" % cfg["account"])
+    gmail_on = config.gmail_on(cfg)
+    if gmail_on:
+        print("account       %s" % cfg["account"])
+    else:
+        print('gmail         off (config "gmail": false): nothing is sent through, read from or polled in Gmail')
+        print("account       %s" % ("none: kept mail is from %s" % cfg["account"]
+                                    if cfg["account"] == config.LOCAL_ACCOUNT
+                                    else "%s, as the From of kept mail" % cfg["account"]))
     print("allowlist     %s" % ", ".join(cfg["allowlist"]))
     print("db            %s" % config.DB_PATH)
     running = False
@@ -319,8 +401,11 @@ def do_status(ctx, a):
     except OSError:
         pass
     print("daemon        %s" % ("running (lock held)" if running else "not running"))
-    print("history_id    %s" % st.get_meta("history_id", "-"))
-    print("last_poll     %s" % listing.timestamp(st.get_meta("last_poll")))
+    if gmail_on:
+        print("history_id    %s" % st.get_meta("history_id", "-"))
+        print("last_poll     %s" % listing.timestamp(st.get_meta("last_poll")))
+    else:
+        print("last_pass     %s" % listing.timestamp(st.get_meta("last_pass")))
     print("counts        %s" % json.dumps(st.counts()))
     print("orchestrator  model=%s effort=%s dir=%s" % (cfg.get("orchestrator_model"), cfg.get("orchestrator_effort"),
                                                       cfg.get("orchestrator_dir")))
@@ -329,8 +414,24 @@ def do_status(ctx, a):
     cost = sum(r["cost"] for r in runs if isinstance(r.get("cost"), (int, float)))
     print("orch. runs    %d, $%.2f total, last: %s" % (len(runs), cost, ("ok" if runs[-1]["ok"] else "FAILED") if runs else "-"))
     print("collaborators %s" % (", ".join("%s (%s)" % (k, v.get("name", "?")) for k, v in cfg["collaborators"].items()) or "none"))
+    box = outbound.mailbox_settings(cfg)
+    if not gmail_on:
+        print("owner mail    kept for the Mail tab, every alert too; security alerts (%s) also recorded in %s" % (
+            ", ".join(k for k in outbound.ALERT_KINDS if k in outbound.SECURITY_ALERTS), config.SECURITY_ALERTS_PATH))
+        print("other mail    refused: mail to anyone but %s needs Gmail" % cfg["owner_name"])
+        for line in outbound.gmail_ignored(cfg):
+            print("ignored       %s" % line)
+    else:
+        print("owner mail    %s" % ("through Gmail" if box["owner_delivery"] == "gmail" else
+                                    "kept for the Mail tab; nudge %s, last %s; alerts through Gmail: %s" % (
+                                        "every %d min" % box["nudge_minutes"] if box["nudge_minutes"] else "off",
+                                        listing.timestamp(st.get_meta(alerts.NUDGE)),
+                                        ", ".join(k for k in outbound.ALERT_KINDS
+                                                  if outbound.alert_through_gmail(cfg, k)))))
     for target in cfg["backup"]["targets"]:
         print("backup        %s, last copied %s" % (target, listing.timestamp(st.get_meta(backup.META % target))))
+    if not gmail_on:
+        return 0
     print("require_dkim  %s" % cfg.get("require_dkim"))
     try:
         p = gmail.profile(ctx.svc)
@@ -340,9 +441,10 @@ def do_status(ctx, a):
     return 0
 
 
-def owner_only(ctx, what):
-    """Stop unless the command runs outside an agent session: what acts as the owner (cli.refuse_in_agent)."""
-    cli.refuse_in_agent("agent-mail", what, ctx.cfg["owner_name"])
+def owner_only(ctx, what, tree=False):
+    """Stop unless the command runs outside an agent session (with tree, under no agent's process either): what acts
+    as the owner (cli.refuse_in_agent)."""
+    cli.refuse_in_agent("agent-mail", what, ctx.cfg["owner_name"], tree)
 
 
 def emit(result):
@@ -366,6 +468,7 @@ def do_mailbox_mark(ctx, a):
 
 def do_mailbox_sync(ctx, a):
     owner_only(ctx, "mailbox sync")
+    needs_gmail(ctx, "mailbox sync (the tab and the owner's Gmail brought into step)")
     try:
         text = piped.piped_text()
     except TimeoutError as e:
@@ -394,10 +497,43 @@ def do_mailbox_answer(ctx, a):
     files = []
     if a.json:
         try:
-            text, files = mailbox.answer_input(json.loads(text))
+            text, files = mailbox.answer_input(json.loads(text), "the reply")
         except ValueError as e:
             die("the reply is not JSON: %s" % e)
     return emit(mailbox.answer(ctx.st, ctx.cfg, a.thread, a.key, text, files))
+
+
+def do_mailbox_fast(ctx, a):
+    owner_only(ctx, "mailbox fast", tree=True)   # it lets an agent's replies skip the review: no agent may run it
+    result, lines = mailbox.fast(ctx, a.thread, a.state == "on", time.time())
+    for line in lines:
+        print(line, file=sys.stderr)
+    return emit(result)
+
+
+def do_mailbox_researcher(ctx, a):
+    owner_only(ctx, "mailbox researcher", tree=True)
+    return emit(mailbox.researcher(ctx.st, ctx.cfg, a.thread, a.state == "on", time.time(),
+                                   expected_tag=a.expect_tag))
+
+
+def do_researcher_state(ctx, a):
+    try:
+        if a.applied is None:
+            return emit(researchermode.state(ctx.st, a.tag, None))
+        origin = caller(ctx.cfg, a)
+        if origin is None:
+            raise ValueError("acknowledgement needs the owning conversation; give its --session")
+        return emit(researchermode.acknowledge(ctx.st, ctx.cfg, a.tag, origin, a.applied, a.payload, time.time()))
+    except ValueError as e:
+        raise MailError(str(e), 1) from e
+
+
+def do_researcher_request(ctx, a):
+    try:
+        return emit(researchermode.request_receipt(ctx.st, ctx.cfg, a.tag, a.thread, None))
+    except ValueError as e:
+        raise MailError(str(e), 1) from e
 
 
 def do_mailbox_part(ctx, a):
@@ -409,6 +545,7 @@ def do_mailbox_summary(ctx, a):
 
 
 def do_mailbox_backfill(ctx, a):
+    needs_gmail(ctx, "mailbox backfill (mail fetched from the agents account's Gmail)")
     return 1 if mailbox.backfill(ctx.st, ctx.svc, a.limit, print) else 0
 
 
@@ -421,6 +558,26 @@ def do_backup(ctx, a):
     return 0 if ok else 1
 
 
+def do_fast_trial(ctx, a):
+    """Try fast mode's effort keys on a CLI version (agentmail/fasttrial.py) and print the one line of outcome. A
+    SIGTERM (systemd stopping agent-cli-update, which runs this) ends it through the trial's finally, which ends the
+    trial's tmux session and the CLI in it."""
+    previous = signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+    try:
+        code, line = fasttrial.run(a.cli, a.version, a.if_untested)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    print(line)
+    return code
+
+
+def version_arg(text):
+    """--version's value: a version such as 2.1.330 (fasttrial.VERSION), which goes into paths and a session's name."""
+    if not fasttrial.VERSION.fullmatch(text):
+        raise argparse.ArgumentTypeError("not a version such as 2.1.330: %r" % text)
+    return text
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="agent-mail", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -430,7 +587,8 @@ def main(argv=None):
     mail.add_argument("--body-file")
     mail.add_argument("--html", help="HTML alternative body file (default: rendered from the text body)")
     mail.add_argument("--image", action="append", metavar="NAME=PATH",
-                      help="inline image (PNG/JPEG/GIF/WebP); place it with <img src=\"cid:NAME\">, else it goes at the end")
+                      help="inline image (PNG/JPEG/GIF/WebP); place it with a line of its own ![alt](cid:NAME) in the "
+                           "text or <img src=\"cid:NAME\"> in --html, else it goes at the end")
     mail.add_argument("--attach", action="append", metavar="PATH", help="ordinary attachment (PDF, zip, CSV...)")
     mail.add_argument("--no-review", metavar="WHY",
                       help="skip the pre-send review, recording WHY (urgent, or you disagree with its pushback)")
@@ -445,6 +603,11 @@ def main(argv=None):
     p.add_argument("--subject", required=True)
     p.add_argument("--unrouted", action="store_true",
                    help="no session, no reply tag; replies land at the orchestrator (for reports and alerts)")
+    p.add_argument("--alert", metavar="KIND",
+                   help="with --unrouted: the kind of notice this is (agentmail/outbound.py ALERT_KINDS); while mail "
+                        "to the owner is kept for the Mail tab, a security kind or one config mailbox.gmail_alerts names "
+                        "goes through Gmail; with Gmail off, every kind is kept and a security kind also recorded for "
+                        "the board")
     p.set_defaults(fn=do_send)
 
     p = sub.add_parser("reply", parents=[mail], help="answer an inbound mail, in its thread unless --subject")
@@ -478,6 +641,19 @@ def main(argv=None):
     p.add_argument("inbound_id", type=int)
     p.set_defaults(fn=do_show)
 
+    p = sub.add_parser("researcher-state", help="read the current Researcher preference and revision for a routing tag")
+    p.add_argument("tag")
+    p.add_argument("--applied", type=int, metavar="REVISION", help="acknowledge a revision from its routed conversation")
+    p.add_argument("--payload", metavar="FINGERPRINT", help="verified installed payload to acknowledge when applying On")
+    p.add_argument("--session", help="owning session name or id, for --applied")
+    p.add_argument("--cli", choices=config.CLIS)
+    p.set_defaults(fn=do_researcher_state)
+
+    p = sub.add_parser("researcher-request", help="read the Message-ID of a routed methods approval request")
+    p.add_argument("tag")
+    p.add_argument("thread")
+    p.set_defaults(fn=do_researcher_request)
+
     p = sub.add_parser("release", help="deliver a held mail to a session")
     p.add_argument("inbound_id", type=int)
     p.add_argument("target", help="session name or id, or 'origin': the session the mail was matched to")
@@ -489,6 +665,12 @@ def main(argv=None):
     p = sub.add_parser("rerun", help="run the orchestrator again on a held or failed inbound mail")
     p.add_argument("inbound_id", type=int)
     p.set_defaults(fn=do_rerun)
+
+    p = sub.add_parser("remarkable", help="put a held reMarkable mail through its route again (checks + agent start; "
+                                          "needs Gmail)")
+    p.add_argument("inbound_id", type=int)
+    p.add_argument("--dry-run", action="store_true", help="run the checks only; start nothing, change nothing")
+    p.set_defaults(fn=do_remarkable)
 
     p = sub.add_parser("status", help="mailroom status")
     p.set_defaults(fn=do_status)
@@ -526,29 +708,63 @@ def main(argv=None):
     q.add_argument("--until", type=float, help="snooze: when it comes back, epoch seconds")
     q.set_defaults(fn=do_mailbox_mark)
     q = box.add_parser("sync", help="bring the tab and the owner's Gmail into step, its state piped in as JSON; prints what "
-                                    "Gmail must change (not in an agent)")
+                                    "Gmail must change (not in an agent; Gmail only)")
     q.set_defaults(fn=do_mailbox_sync)
-    q = box.add_parser("answer", help="the owner's reply in a thread, piped in; the mailroom routes it (not in an agent)")
+    q = box.add_parser("answer", help="the owner's reply in a thread, piped in; the mailroom routes it (not in an agent)",
+                       epilog="Exits %d when it refuses the reply for what it holds (empty, too long, too many or "
+                              "too large files, files for a group), having recorded nothing: the draft can be edited "
+                              "and sent again. A thread not in the mailbox exits 4, a usage error or a run inside an "
+                              "agent session 2, any other error 1." % mailbox.ANSWER_REFUSED)
     q.add_argument("thread")
     q.add_argument("--key", required=True, help="the tab's key for this reply: a retry with it answers once")
     q.add_argument("--json", action="store_true",
                    help='the reply piped in is {"text": TEXT, "files": [{"name": NAME, "data": BASE64}, ...]}')
     q.set_defaults(fn=do_mailbox_answer)
+    q = box.add_parser("fast", help="switch fast mode on or off in a thread, for quick back-and-forths with its agent "
+                                    "(not in an agent)",
+                       epilog="A thread not in the mailbox exits 4, a usage error or a run inside an agent session 2, "
+                              "and a thread fast mode is not for (no agent mail, or no single agent gets the replies) "
+                              "1.")
+    q.add_argument("thread")
+    q.add_argument("state", choices=("on", "off"))
+    q.set_defaults(fn=do_mailbox_fast)
+    q = box.add_parser("researcher", help="switch Researcher on or off for the thread's routed agent (owner only)")
+    q.add_argument("--expect-tag", metavar="TAG", required=True,
+                   help="refuse the change if this tag no longer owns the thread")
+    q.add_argument("thread")
+    q.add_argument("state", choices=("on", "off"))
+    q.set_defaults(fn=do_mailbox_researcher)
     q = box.add_parser("part", help="one attachment or inline part of a stored message, base64")
     q.add_argument("key", help="the message's key: agent mail s<sent id>, or a reply with files i<inbound id>")
     q.add_argument("index", type=int)
     q.set_defaults(fn=do_mailbox_part)
     q = box.add_parser("summary", help="the unread and inbox counts, and the agent mail the tab counts as read")
     q.set_defaults(fn=do_mailbox_summary)
-    q = box.add_parser("backfill", help="keep the messages of mail sent before the message store, from Gmail")
+    q = box.add_parser("backfill", help="keep the messages of mail sent before the message store, from Gmail (Gmail "
+                                        "only)")
     q.add_argument("--limit", type=int, help="at most this many, newest first (default: all)")
     q.set_defaults(fn=do_mailbox_backfill)
 
     p = sub.add_parser("backup", help="copy the message store and the database to config backup.targets")
     p.set_defaults(fn=do_backup)
 
+    p = sub.add_parser("fast-trial", help="try fast mode's effort keys on a Claude Code or Codex version, in a "
+                                          "throwaway session with a placeholder key; a pass adds it to fast mode's "
+                                          "tested list",
+                       epilog="Prints one line of outcome. Exits 0 when the version passed (or, with --if-untested, is "
+                              "on the tested list already), 1 when it failed or could not be tried (the screens it "
+                              "read are kept under %s), 2 on a usage error." % (fasttrial.ROOT / "failed"))
+    p.add_argument("cli", choices=config.CLIS)
+    p.add_argument("--version", type=version_arg, help="the version to try (default: the installed one)")
+    p.add_argument("--if-untested", action="store_true",
+                   help="do nothing for a version on fast mode's tested list already (agent-cli-update's use)")
+    p.set_defaults(fn=do_fast_trial)
+
     a = ap.parse_args(argv)
-    ctx = outbound.Context(config.load())
+    try:
+        ctx = outbound.Context(config.load())
+    except ConfigError as e:
+        die(str(e), 2)
     try:
         if ctx.cfg.get("mail_proxy") and a.cmd not in ("rpc", "guide"):
             if a.cmd not in rpc.PROXY_ACTIONS:
@@ -557,6 +773,8 @@ def main(argv=None):
         return a.fn(ctx, a)
     except MailError as e:
         die(str(e), e.exit_code)
+    except GmailOff as e:   # a path that needs Gmail, with Gmail off: what it needed, not a traceback
+        die(str(e), outbound.NEEDS_GMAIL)
     except (NoToken, ConfigError) as e:   # not set up yet: say what to do instead of a traceback
         die(str(e))
 

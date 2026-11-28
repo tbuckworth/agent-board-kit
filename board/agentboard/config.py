@@ -7,9 +7,10 @@ Board-only settings live in ~/.config/agent-board/config.json; every key is opti
 one of the owner's own accounts is off until named:
 
   gmail_credentials   path to an "authorized_user" OAuth file for the owner's own Gmail: the "has the owner read the
-                      agent's mail" check and the Mail tab's Sync with Gmail (agentboard/gmailstate.py; the sync needs
-                      the gmail.modify scope, a read-only login is refused there and the answer says so), and the Time
-                      page's "own email" source. null = off.
+                      agent's mail" check and the Mail tab's Forward, which makes a Gmail draft (agentboard/gmailstate.py;
+                      the read-check needs the gmail.readonly scope, Forward gmail.compose or gmail.modify as well: a
+                      read-only login is refused there and the answer says so), and the Time page's "own email"
+                      source. null = off.
   google_token        path to an "authorized_user" OAuth file for the owner's Google account with Calendar read access
                       (and Drive metadata read, for the Time page's documents): the Time page's meetings and documents
                       sources, and the meeting alerts when meeting_alerts is on. null = off.
@@ -17,15 +18,24 @@ one of the owner's own accounts is off until named:
                       Default false: a google_token for the Time page alone alerts nothing.
   tasks_repo          "OWNER/REPO" of the owner's to-do list, for the Time page's to-do source. Default: the "repo" of
                       the to-do component's config (~/.config/todo-desk/config.json); neither = that source off.
+  keyring_unlock      true turns on the desktop keyring's lock mark and its unlock from the Mac and the phone
+                      (agentboard/keyring.py; README "Unlock the desktop"), for a desktop that logs in by itself and
+                      leaves gnome-keyring locked. Default false: no keyring state is read, and keyring-unlock refuses
+                      before it reads a password.
 
 Per-feature files beside it, each optional: time.json (the Time page), meetings.json (the meeting alerts'
-calendars), allowance.json (the usage breakdown's prices).
+calendars), allowance.json (the usage breakdown's prices and the spend meter's week), colours.json (the groups'
+colours, agentboard/colours.py: it replaces the kit's agentboard/colours.json, which names no group), mailweb.json (the
+phone page and the voice page's devices), voice.json (the voice page), desk.json (the desk), speech.json (the
+desktop's voice), transcripts.json (the transcript archive; it has no default folder), keyring.json (the keyring
+daemon's program).
 
 Environment overrides: AGENT_MAILROOM_DIR (the mailroom checkout, default: the kit's sibling `mailroom/`),
 AGENT_MAIL_CONFIG_DIR / AGENT_MAIL_STATE_DIR (as the mailroom itself honours them), AGENT_BOARD_CONFIG
 (the board's own config file), AGENT_BOARD_REPOS (the worktree scan root), AGENT_BOARD_GMAIL_CREDS,
-AGENT_BOARD_GOOGLE_TOKEN, AGENT_BOARD_MEETING_ALERTS ("yes"/"no"), TODO_DESK_CONFIG_DIR (the to-do component's config
-folder).
+AGENT_BOARD_GOOGLE_TOKEN, AGENT_BOARD_MEETING_ALERTS ("yes"/"no"), AGENT_BOARD_KEYRING_UNLOCK ("yes"/"no"),
+AGENT_BOARD_COLOURS (the groups' colours file), TODO_DESK_CONFIG_DIR (the to-do component's config folder),
+AGENT_BOARD_MAC (the Mac's ssh alias, for the voice desk's `looking` and the transcript archive; mac_host).
 """
 import json
 import os
@@ -45,6 +55,7 @@ BOARD_DEFAULTS = {
     "google_token": None,
     "meeting_alerts": False,
     "tasks_repo": None,
+    "keyring_unlock": False,
 }
 
 
@@ -116,8 +127,8 @@ def _path_setting(key, env, cfg):
 
 
 def gmail_credentials(cfg=None):
-    """The OAuth file of the owner's own Gmail (read-check, Mail tab sync, the Time page's own email), or None when
-    that is off. AGENT_BOARD_GMAIL_CREDS overrides the board config."""
+    """The OAuth file of the owner's own Gmail (read-check, the Mail tab's Forward, the Time page's own email), or None
+    when that is off. AGENT_BOARD_GMAIL_CREDS overrides the board config."""
     return _path_setting("gmail_credentials", "AGENT_BOARD_GMAIL_CREDS", cfg)
 
 
@@ -144,3 +155,25 @@ def tasks_repo(cfg=None, todo_config=None):
     if not (isinstance(repo, str) and repo.strip()):
         repo = _read(todo_config or TODO_CONFIG_DIR / "config.json").get("repo")
     return repo.strip() if isinstance(repo, str) and repo.strip() else None
+
+
+def keyring_unlock(cfg=None):
+    """Whether the owner turned the desktop keyring's lock mark and unlock on: AGENT_BOARD_KEYRING_UNLOCK ("yes",
+    "true", "1" or "on"; anything else is off) when set, else the board config's keyring_unlock (true only)."""
+    env = os.environ.get("AGENT_BOARD_KEYRING_UNLOCK")
+    if env is not None:
+        return env.strip().lower() in ("yes", "true", "1", "on")
+    return (cfg if cfg is not None else board_config()).get("keyring_unlock") is True
+
+
+def mac_host(cfg=None):
+    """The ssh alias this desktop reaches the owner's Mac by, for what reads the Mac (the voice desk's `looking`, the
+    transcript archive's Mac sources): AGENT_BOARD_MAC when set (empty: no Mac), else the mailroom config's
+    remote_hosts["mac"] (the kit installer writes it from MAC_HOST), else None: no Mac is configured, and nothing
+    reaches for one."""
+    env = os.environ.get("AGENT_BOARD_MAC")
+    if env is not None:
+        return env.strip() or None
+    remote = (cfg if cfg is not None else mail_config()).get("remote_hosts") or {}
+    host = remote.get("mac") if isinstance(remote, dict) else None
+    return host.strip() if isinstance(host, str) and host.strip() else None

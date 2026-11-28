@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f8fc">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#131314">
+<meta name="referrer" content="no-referrer">
+<title>Agent Mail</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png" type="image/png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<!-- The app's icons, drawn for it: stroked 24-unit paths, in the colour of the text around them. -->
+<svg class="sprite" aria-hidden="true">
+  <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 5h13L21 13v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-6z"/><path d="M3 13h5l1.5 3h5l1.5-3h5"/></symbol>
+  <symbol id="i-snooze" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M5 3 2.5 5.5M19 3l2.5 2.5"/></symbol>
+  <symbol id="i-unread" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3.5 6.5 8.5 6.5 8.5-6.5"/></symbol>
+  <symbol id="i-reply" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 6 4 11.5l6 5.5"/><path d="M4 11.5h9a7 7 0 0 1 7 7v.5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5.5" r="1.7" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/><circle cx="12" cy="18.5" r="1.7" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5 12.4 19.1a5 5 0 0 1-7.1-7.1l8.1-8.1a3.3 3.3 0 0 1 4.7 4.7l-7.7 7.7a1.6 1.6 0 0 1-2.3-2.3L15.2 7"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 3h4M6 7l1 13h10l1-13M10 11v6M14 11v6"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4.5 21 12 4 19.5 6.5 12z"/><path d="M6.5 12H12"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 2.5 5 13.5h6.5l-1 8 8.5-11h-6.5z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11M12 15v2"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 0 2.5-6"/><path d="M3 3.5V8h4.5M12 7.5V12l3 2"/></symbol>
+  <symbol id="i-extras" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="18" r="1.3" fill="currentColor" stroke="none"/></symbol>
+</svg>
+
+<div id="gate" class="gate" hidden>
+  <img class="gate-icon" src="icons/icon-192.png" alt="" width="72" height="72" loading="lazy">
+  <h1>Agent Mail</h1>
+  <p id="gatetext"></p>
+  <button id="gatebutton" class="filled" hidden></button>
+  <p id="gateerror" class="error" hidden></p>
+</div>
+
+<section id="listview" class="pane">
+  <header class="appbar listbar">
+    <div class="searchbox">
+      <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="query" type="search" placeholder="Search agent mail" autocomplete="off" enterkeyhint="search">
+      <button id="clearquery" class="icon-button" aria-label="Clear the search" hidden><svg class="icon"><use href="#i-close"/></svg></button>
+      <button id="menubutton" class="icon-button" aria-label="More" aria-haspopup="menu"><svg class="icon"><use href="#i-more"/></svg></button>
+    </div>
+    <button id="keyringmark" class="keymark" aria-haspopup="dialog" hidden><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg><span id="keyringtext"></span></button>
+    <nav id="boxes" class="segments" aria-label="Boxes">
+      <button data-box="inbox" class="on">Inbox<span id="unreadcount" class="tabcount" hidden></span></button>
+      <button data-box="snoozed">Snoozed</button>
+      <button data-box="archived">Archived</button>
+      <button data-box="all">All</button>
+    </nav>
+    <p id="searching" class="searching" hidden></p>
+    <p id="summary" class="summary"></p>
+    <p id="colourerror" class="summary" hidden></p>
+  </header>
+  <div id="menu" class="menu" role="menu" hidden>
+    <button id="refresh" role="menuitem">Refresh</button>
+    <button id="signout" role="menuitem">Sign out</button>
+  </div>
+  <div id="listscroll" class="scroller">
+    <div id="ptr" class="ptr" aria-hidden="true"><span class="ptr-spin"></span></div>
+    <p id="listerror" class="error" hidden></p>
+    <ul id="skeleton" class="skeleton" aria-label="Loading">
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+    </ul>
+    <ul id="threads"></ul>
+    <p id="listmore" class="listmore" hidden></p>
+  </div>
+  <button id="orchbutton" class="fab" aria-label="Message the orchestrator"><svg class="icon"><use href="#i-send"/></svg><span>Orchestrator</span></button>
+</section>
+
+<section id="threadview" class="pane thread" hidden>
+  <header class="appbar threadbar">
+    <button id="back" class="icon-button" aria-label="Back to the list"><svg class="icon"><use href="#i-back"/></svg></button>
+    <span class="grow"></span>
+    <div class="threadmodes">
+      <button id="fast" class="modeswitch fastswitch" aria-pressed="false" hidden><svg class="icon" aria-hidden="true"><use href="#i-bolt"/></svg><span id="fastlabel">Fast</span></button>
+      <button id="researcher" class="modeswitch researcherswitch" aria-pressed="false" aria-describedby="researchernote researcherhelp" hidden>Researcher</button>
+      <span id="researcherhelp" hidden></span>
+    </div>
+    <button id="archive" class="icon-button" aria-label="Archive"><svg class="icon"><use id="archiveicon" href="#i-archive"/></svg></button>
+    <button id="snoozebutton" class="icon-button" aria-label="Snooze"><svg class="icon"><use href="#i-snooze"/></svg></button>
+    <button id="unread" class="icon-button" aria-label="Mark unread"><svg class="icon"><use href="#i-unread"/></svg></button>
+  </header>
+  <p id="fastnote" class="modenote fastnote" hidden></p>
+  <p id="researchernote" class="modenote" role="status" hidden></p>
+  <div id="progress" class="progress" hidden></div>
+  <p id="threaderror" class="error" hidden></p>
+  <div class="docwrap">
+    <iframe id="doc" title="The thread" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>
+    <div id="docload" class="docload" hidden>
+      <h1 id="docsubject"></h1>
+      <div class="bar"></div><div class="bar"></div><div class="bar short"></div>
+    </div>
+  </div>
+  <button id="extrasbutton" class="extrasbutton" hidden><svg class="icon"><use href="#i-extras"/></svg><span id="extraslabel"></span></button>
+  <button id="replybutton" class="fab"><svg class="icon"><use href="#i-reply"/></svg><span id="replylabel">Reply</span></button>
+</section>
+
+<div id="scrim" class="scrim" hidden></div>
+
+<section id="extrasheet" class="sheet" hidden aria-label="Options, plots, code and files">
+  <div class="grab"></div>
+  <div class="sheethead"><h2>In this thread</h2><button class="icon-button sheetclose" aria-label="Close"><svg class="icon"><use href="#i-close"/></svg></button></div>
+  <div class="sheetbody">
+    <p id="widgetnotice" class="notice" hidden></p>
+    <div id="extras" class="extras" hidden></div>
+    <ul id="attachments" class="attachments" hidden></ul>
+  </div>
+</section>
+
+<section id="snoozesheet" class="sheet" hidden aria-label="Snooze until">
+  <div class="grab"></div>
+  <div class="sheethead"><h2>Snooze until</h2><button class="icon-button sheetclose" aria-label="Close"><svg class="icon"><use href="#i-close"/></svg></button></div>
+  <div class="sheetbody">
+    <div id="snoozechoices" class="choices"></div>
+    <label class="pick">Pick a date and time<input id="snoozeat" type="datetime-local"></label>
+    <button id="snoozepicked" class="filled" disabled>Snooze</button>
+  </div>
+</section>
+
+<section id="reply" class="sheet composer" hidden aria-label="Reply">
+  <div class="grab"></div>
+  <div class="sheethead"><h2 id="replyto">Reply</h2><button class="icon-button sheetclose" aria-label="Close, keeping the draft"><svg class="icon"><use href="#i-close"/></svg></button></div>
+  <div id="answers" class="answers" hidden></div>
+  <p id="answersmore" class="more" hidden>More below: scroll to the end to send.</p>
+  <textarea id="text" rows="4" placeholder="Reply to the agent" autocomplete="off"></textarea>
+  <ul id="files"></ul>
+  <p id="held" class="status" hidden></p>
+  <p id="draftnote" class="draftnote" hidden></p>
+  <ul id="versions" class="versions" aria-label="Versions the desktop keeps" hidden></ul>
+  <div class="composebar">
+    <label class="icon-button filebutton" aria-label="Attach files"><svg class="icon"><use href="#i-clip"/></svg><input id="attach" type="file" multiple hidden></label>
+    <button id="versionsbutton" class="icon-button" aria-label="Versions" aria-controls="versions" hidden><svg class="icon"><use href="#i-history"/></svg></button>
+    <button id="discard" class="icon-button" aria-label="Discard the draft"><svg class="icon"><use href="#i-trash"/></svg></button>
+    <span class="grow"></span>
+    <button id="send" class="filled"><svg class="icon"><use href="#i-send"/></svg>Send</button>
+  </div>
+  <p id="sendstatus" class="status"></p>
+</section>
+
+<section id="orchsheet" class="sheet composer" hidden aria-label="Message the orchestrator">
+  <div class="grab"></div>
+  <div class="sheethead"><h2>Message the orchestrator</h2><button class="icon-button sheetclose" aria-label="Close, keeping the message"><svg class="icon"><use href="#i-close"/></svg></button></div>
+  <p class="notice">Like an email to it: ask it to start an agent, pass something on to one, or answer a question. It runs once and answers you by email.</p>
+  <textarea id="orchtext" rows="4" placeholder="Write to the orchestrator" autocomplete="off"></textarea>
+  <div class="composebar">
+    <span class="grow"></span>
+    <button id="orchsend" class="filled" disabled><svg class="icon"><use href="#i-send"/></svg>Send</button>
+  </div>
+  <p id="orchstatus" class="status"></p>
+</section>
+
+<!-- The desktop keyrings' password goes in this field alone: autocomplete="one-time-code" is what keeps Chrome from
+     offering to save it (README, "Mail on the phone"), and the page empties it as it is sent, on closing, on signing out
+     and whenever the page is hidden. -->
+<section id="keyringsheet" class="sheet" hidden aria-label="Unlock the desktop">
+  <div class="grab"></div>
+  <div class="sheethead"><h2>Unlock the desktop</h2><button class="icon-button sheetclose" aria-label="Close"><svg class="icon"><use href="#i-close"/></svg></button></div>
+  <div class="sheetbody">
+    <p class="notice">The desktop logs in by itself, so its keyrings stay locked after a restart and Chrome there waits at its password dialog. Type the keyring's password: it is tried on each one that is locked, Chrome's first. Once your fingerprint approves it, it goes to the desktop over your tailnet and is kept nowhere.</p>
+    <input id="keyringpassword" class="keyfield" type="password" autocomplete="one-time-code" placeholder="Keyring password" aria-label="Keyring password" enterkeyhint="go">
+    <p id="keyringsaid" class="status"></p>
+    <button id="keyringunlock" class="filled" disabled>Unlock</button>
+  </div>
+</section>
+
+<div id="snackbar" class="snackbar" role="status" hidden><span id="snacktext"></span><button id="snackaction" hidden></button></div>
+<script src="passkeys.js"></script>
+<script src="snooze.js"></script>
+<script src="widgets.js"></script>
+<script src="replytext.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -27,16 +27,18 @@ once if it falls short.
    headline goes below a clear break that says it needs no action, in an attachment or behind a link.
    Length is fine when it is structured and {owner_name} asked for the long thing (a table of every
    run, a full list).
-5. **The ask.** If {owner_name} must decide or do something: one clear question, with the options, your
-   recommendation and the default if there is no answer ("Yes or no: ...", "Reply 1, 2 or 3; I
-   recommend 2"). It must make sense where it stands. Ask it at the top only as a summary that stands
-   on its own (what exactly would be done, with what tool or model, how, at what cost). Otherwise ask
-   it right after your recommendation, and let the first lines say a decision follows ("Decision
-   needed: whether to ...; my recommendation and the question are below"). A bare yes/no before the
-   reader knows what it is about means scrolling down and back up. Never hand {owner_name} a task you could
-   do yourself; unavoidable manual steps come as exact commands, each in its own fenced block (below), with
-   where to run them. When you ask them to approve wording (a prompt, a message, a rule) or a design, show the
-   text itself or an example of it.
+5. **The ask.** If {owner_name} must decide or do something: one clear question, with the options,
+   your recommendation and the default if there is no answer ("Yes or no: ...", "Reply 1, 2 or 3; I
+   recommend 2"). When {owner_name} picks an option or approves something, give the options as a
+   `choices` block (below), which they answer with one click; so a mail that asks them to decide never
+   goes with `--html`, which takes no blocks. It must make sense where it stands. Ask it at the top
+   only as a summary that stands on its own (what exactly would be done, with what tool or model, how,
+   at what cost). Otherwise ask it right after your recommendation, and let the first lines say a
+   decision follows ("Decision needed: whether to ...; my recommendation and the question are below").
+   A bare yes/no before the reader knows what it is about means scrolling down and back up. Never hand
+   {owner_name} a task you could do yourself; unavoidable manual steps come as exact commands, each in
+   its own fenced block (below), with where to run them. When you ask them to approve wording (a
+   prompt, a message, a rule) or a design, show the text itself or an example of it.
 6. **Nothing {owner_name} cannot open.** No desktop file paths, "open ~/...", local commands or private repo
    paths as the way to see a result (a command {owner_name} is asked to run, rule 5, is another matter). Embed
    plots and images; link anything else to a page that opens on a phone.
@@ -106,11 +108,14 @@ them about it.
 ## How, with agent-mail
 
 - Plots, screenshots and GIFs inline: `--image NAME=PATH` (PNG, JPEG, GIF or WebP; repeatable), placed
-  in your `--html` with `<img src="cid:NAME" alt="what it shows" style="max-width:100%">`. An image the
-  HTML does not place goes at the end. Never data: URIs (Gmail strips them) or local paths.
+  where a line of its own in the plain-text body says `![what it shows](cid:NAME)`, or in your `--html`
+  with `<img src="cid:NAME" alt="what it shows" style="max-width:100%">`. An image not placed goes at the
+  end. Never data: URIs (Gmail strips them) or local paths. Make each at least 1200 px wide (matplotlib:
+  `savefig(..., dpi=200)` or more; a screenshot at 2x): a narrower one looks grainy, and agent-mail holds it.
 - Plain text is turned into HTML from its markdown alone, so most mail needs no `--html`: mark it up (`- ` or
   `1. ` items, `**bold**` and `*italic*`, `# ` headings, `[text](https://...)` links), and never hard-wrap a line
-  (every line break shows, and a flush-left line ends a list item).
+  (every line break shows, and a flush-left line ends a list item). A bare https:// address is a link too;
+  `[text](https://...)` gives the link words that say where it goes.
 - Every command {owner_name} should run, and every text to paste, goes in a fenced block of its own, which the
   Mail tab gives a Copy button: one command per block when they run separately, no `$` or `>` prompt and
   nothing else in the block, and where to run it in the line before:
@@ -119,7 +124,10 @@ them about it.
   agent-mail status
   ```
 - Tables: a GitHub-style pipe table in plain text renders as a real table: a header row, a `|---|---|` row,
-  then one line per row (`:--:` centres a column, `--:` right-aligns it). Or write `--html FILE` with a `<table>`.
+  then one line per row (`:--:` centres a column, `--:` right-aligns it). Keep it narrow enough for a phone:
+  at most about five columns of short cells. Split a wider one into two tables, or turn it round (a row per
+  measure). A wider table scrolls sideways, but {owner_name} reads one best whole. Never send a table with
+  `--html`: see 5.
 - Files {owner_name} asked for (PDF, zip, CSV): `--attach PATH`.
 - Write the body to a file with a quoted heredoc (`cat > body.txt <<'EOF'`): an unquoted heredoc or
   double quotes let the shell eat `$6,037` and backticks.
@@ -140,6 +148,19 @@ them about it.
   ```plot
   {{"title": "Accuracy by step", "kind": "line", "x": {{"label": "step"}}, "y": {{"label": "accuracy"}},
    "image": "acc", "series": [{{"name": "Muon", "x": [0, 1000, 2000], "y": [0.1, 0.52, 0.7]}}]}}
+  ```
+
+  Bars split two ways (say models, each under two prompts on two task lists): make the models the
+  categories, and give a series per prompt and list, named by the prompt, with the list as its
+  `"texture"`: one colour per prompt, solid or hatched per list. Do not write both groupings into long
+  category names instead.
+  Shares of parts of fixed size (how much of each of two ticket sets each model fixed): `"kind": "filled"`, a
+  bar per row cut into segments by size, each filled to a percentage, with a tick for a baseline:
+
+  ```plot
+  {{"title": "The long prompt moves the fixes to bug tickets", "kind": "filled", "image": "fill",
+   "segments": [{{"name": "bugs", "size": 39}}, {{"name": "features", "size": 39}}], "tick": "baseline",
+   "rows": [{{"group": "Model A", "label": "long prompt", "fill": [34, 0], "tick": [16, 16]}}]}}
   ```
 
   Rules and limits: the kit's `mailroom/README.md`, "Widgets in agent mail"; agent-mail names any

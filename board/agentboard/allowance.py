@@ -1,36 +1,47 @@
 """Where a plan window's allowance has gone since it last reset: each agent's share, by board group and sub-group,
-and Other. The README's section "Plan usage: where it went" says how it is worked out; each function says how it
-does its part.
+and Other; and what a per-token login (a model on OpenRouter) has spent this week, against its weekly budget. The
+README's sections "Plan usage: where it went" and "Spend of a per-token login" say how they are worked out; each
+function says how it does its part.
 
-compute() answers the usage_split action. ~/.config/agent-board/allowance.json overrides DEFAULTS. The parsed
-transcripts are cached in CACHE (private), and each answer adds a line to LOG. The fit reads the usage readings
-sample() records in SAMPLES: the board's usage refresh (bin/agent-board's annotate_usage) calls it with each new
-reading, and it keeps at most one line per SAMPLE_EVERY seconds.
+compute() answers the usage_split action, and weekly_spend() the board's spend meters. ~/.config/agent-board/
+allowance.json overrides DEFAULTS. The parsed transcripts are cached (private): CACHE for the split, SPEND_CACHE for
+the spend, as one reads 21 days and the other a week, and a cache shared between them would be read afresh each time.
+Each split adds a line to LOG. The fit reads the usage readings sample() records in SAMPLES: the board's usage refresh
+(bin/agent-board's annotate_usage) calls it with each new reading, and it keeps at most one line per SAMPLE_EVERY
+seconds.
 """
 import bisect
 import collections
+import datetime
 import glob
 import json
 import math
 import os
 import re
 import time
+import zoneinfo
 from pathlib import Path
 
-from . import collect, groups, sources, timesources, timeuse
+from . import collect, colours, groups, sources, timesources, timeuse
 
 CONFIG = Path(os.environ.get("AGENT_BOARD_ALLOWANCE_CONFIG") or sources.HOME / ".config/agent-board/allowance.json")
 CACHE = sources.BOARD_STATE / "allowance-cache.json"
 LOCK = sources.BOARD_STATE / "allowance.lock"
 LOG = sources.BOARD_STATE / "allowance.log"
+SPEND_CACHE = sources.BOARD_STATE / "spend-cache.json"
+SPEND_LOCK = sources.BOARD_STATE / "spend.lock"
 SAMPLES = sources.BOARD_STATE / "usage-samples.jsonl"
 SAMPLE_EVERY = 30 * 60      # seconds between two usage readings kept for the fit
 SAMPLES_MAX, SAMPLES_TRIM = 1000, 700     # past SAMPLES_MAX lines (~20 days), keep the newest SAMPLES_TRIM
 DEFAULTS = {
-    # dollars per million tokens at API rates: [input, output, cache read]; a cache write costs 1.25 times the input
-    # price (5-minute) or 2 times (1-hour). Codex's models have no published prices: theirs are weights between
-    # token kinds, since the fitted factor sets the scale.
+    # dollars per million tokens at API rates: [input, output, cache read], or [input, output, cache read, cache write]
+    # for a model whose cache writes have a price of their own; without one, a cache write costs 1.25 times the input
+    # price (5-minute) or 2 times (1-hour), as Anthropic charges. Codex's models have no published prices: theirs are
+    # weights between token kinds, since the fitted factor sets the scale. A per-token login's model (OpenRouter's
+    # maker/model name) needs its price here, at what OpenRouter charges, for its spend meter: add yours in
+    # allowance.json (README, "Spend of a per-token login"). Gemini's cache writes cost nothing on OpenRouter.
     "prices": {
+        "google/gemini-4-neon": [3, 15, 0.15, 0], "google/gemini-4-hydrogen": [1.5, 7.5, 0.075, 0],
         "claude-fable-5-2": [8, 40, 0.2], "claude-fable-5-1": [10, 50, 0.25], "claude-fable-5": [10, 50, 1],
         "claude-opus-5-5": [4, 20, 0.2], "claude-opus-5": [5, 25, 0.5], "claude-opus-4-8": [5, 25, 0.5],
         "claude-opus-4-7": [5, 25, 0.5], "claude-opus-4-6": [5, 25, 0.5],
@@ -41,6 +52,7 @@ DEFAULTS = {
     "fit_hours": 6,          # each point of the fit: the window's rise over this many hours of readings
     "fit_days": 21,          # how far back the fit reads (sample() keeps about 20 days of readings)
     "min_fit_points": 8,     # with fewer stretches of agent use than this there is no factor, so no percentages
+    "week_zone": None,       # a weekly budget's week starts on Monday at midnight in this time zone (None: local time)
 }
 WINDOW_SECONDS = {"session": 5 * 3600, "weekly": 7 * 86400}     # a model's own window ("model:<name>") is weekly
 CHART_STEPS = 168                                               # the chart's points across a window (hourly in a week)
@@ -50,13 +62,19 @@ ORCHESTRATOR = "orchestrator"                                   # one row for al
 
 def config():
     """DEFAULTS with the config file's overrides. Raises ValueError for prices that are not
-    {model: [input, output, cache read]} in dollars per million tokens."""
+    {model: [input, output, cache read] or [input, output, cache read, cache write]} in dollars per million tokens,
+    and for a week_zone that names no time zone."""
     cfg = sources.load_config(DEFAULTS, CONFIG)
     p = cfg["prices"]
-    if not (isinstance(p, dict) and all(isinstance(v, list) and len(v) == 3 and
+    if not (isinstance(p, dict) and all(isinstance(v, list) and len(v) in (3, 4) and
                                         all(isinstance(x, (int, float)) for x in v) for v in p.values())):
-        raise ValueError("%s: prices must map each model to [input, output, cache read] dollars per million tokens"
-                         % CONFIG)
+        raise ValueError("%s: prices must map each model to [input, output, cache read] or [input, output, cache read, "
+                         "cache write] dollars per million tokens" % CONFIG)
+    if cfg["week_zone"] is not None:
+        try:
+            zoneinfo.ZoneInfo(cfg["week_zone"])
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, TypeError):
+            raise ValueError("%s: no time zone %r (week_zone)" % (CONFIG, cfg["week_zone"])) from None
     return cfg
 
 
@@ -137,9 +155,9 @@ def parse_codex(lines, out, path):
     """A Codex rollout's turns, as parse_claude's replies: each token_count event's growth of the thread's totals,
     uncached input as input and cached input as cache reads, on the model of the turn it is in. A thread spawned or
     forked from another first replays that one's events, so those before the thread started only set where its own
-    totals start. "parent": the thread that spawned it. Totals that fall start again from there. "unread": the lines
-    that might have held a turn but are not JSON; a first line that is not JSON, or names no thread, leaves the thread
-    without an id ("sid" empty), so the ledger leaves it out and says so."""
+    totals start. "parent": the thread that spawned it, or asked for it (a review thread). Totals that fall start
+    again from there. "unread": the lines that might have held a turn but are not JSON; a first line that is not
+    JSON, or names no thread, leaves the thread without an id ("sid" empty), so the ledger leaves it out and says so."""
     if out is None:
         first = next(lines, None)
         if first is None:
@@ -148,10 +166,8 @@ def parse_codex(lines, out, path):
             meta = json.loads(first).get("payload") or {}
         except ValueError:
             meta = {}
-        src = meta.get("source") if isinstance(meta.get("source"), dict) else {}
-        spawned = (src.get("subagent") or {}).get("thread_spawn") or {}
         out = {"sid": meta.get("id") or "", "cwd": meta.get("cwd") or "", "replies": {},
-               "parent": meta.get("parent_thread_id") or spawned.get("parent_thread_id"),
+               "parent": meta.get("parent_thread_id") or sources.subagent_parent(json.dumps(meta.get("source")), ""),
                "start": sources.iso_ts(meta["timestamp"]) if meta.get("timestamp") else 0, "model": "",
                "total": [0, 0, 0], "unread": 0}
     for line in lines:
@@ -225,29 +241,32 @@ def login_at(ms, ts, folder):
 
 
 def price(row, prices):
-    """A reply's dollars at API rates, None when its model has no price."""
+    """A reply's dollars at API rates, None when its model has no price. Cache writes cost the model's own price for
+    them when it has one, else CACHE_WRITE's multiples of the input price."""
     p = prices.get(row[1])
     if p is None:
         return None
-    inp, out, read = p
-    return (row[2] * inp + row[3] * inp * CACHE_WRITE["5m"] + row[4] * inp * CACHE_WRITE["1h"] + row[5] * read
-            + row[6] * out) / 1e6
+    inp, out, read = p[:3]
+    five, hour = (p[3], p[3]) if len(p) > 3 else (inp * CACHE_WRITE["5m"], inp * CACHE_WRITE["1h"])
+    return (row[2] * inp + row[3] * five + row[4] * hour + row[5] * read + row[6] * out) / 1e6
 
 
 def ledger(cfg, since, logins, codex_home, status_log, cache_path):
     """Every reply since `since`, once: ([(target, session id, ts, model, dollars)], {session id: cwd}, notes).
-    logins: [(login name, its config folder)] (sources.claude_logins); a Codex sub-thread's replies count on the thread
-    that spawned it. A reply whose model has no price is left out and named in the notes, with its tokens. A reply
-    in several Claude transcripts counts on the first of them by their first reply (then session id): the copies
-    failover makes are of one session, and a fork's copied history counts on one of the two."""
+    logins: [(login name, its config folder)] (sources.claude_logins); codex_home None reads no Codex threads; a Codex
+    sub-thread's replies count on the thread that spawned it. A reply whose model has no price is left out and named
+    in the notes, with its tokens. A reply in several Claude transcripts counts on the first of them by their first
+    reply (then session id): the copies failover makes are of one session, and a fork's copied history counts on one
+    of the two."""
     paths, folder = [], {}
     for name, home in logins:
         for pat in (("projects", "*", "*.jsonl"), ("projects", "*", "*", "subagents", "*.jsonl")):
             for p in sorted(glob.glob(os.path.join(str(home), *pat))):
                 paths.append((p, parse_claude))
                 folder[p] = name
-    paths += [(p, parse_codex) for p in sorted(glob.glob(os.path.join(str(codex_home), "sessions", "*", "*", "*",
-                                                                     "rollout-*.jsonl")))]
+    if codex_home is not None:
+        paths += [(p, parse_codex) for p in sorted(glob.glob(os.path.join(str(codex_home), "sessions", "*", "*", "*",
+                                                                         "rollout-*.jsonl")))]
     parsed = sources.read_appended(paths, since, cache_path, log)
     moved, unread = moves(status_log)
     rows, cwd, unpriced, notes = [], {}, collections.Counter(), []
@@ -383,10 +402,10 @@ def timeline(rows, since, until, group_of, k, readings):
     return {"start": since, "step": step, "unit": "$" if k is None else "%", "groups": groups_out, "other": other}
 
 
-def split(target, key, accounts, rows, cwd, samples, cfg, now, history, layout, names, orch_dir):
+def split(target, key, accounts, rows, cwd, samples, cfg, now, history, layout, names, orch_dir, palette):
     """Where window `key` of pool `target` has gone since it last reset: {"target", "window", "since", "resets_at",
-    "used", "dollars", "scale" (fit's, or None), "agents_pct", "other_pct", "groups", "chart" (timeline's), "layout"
-    (the board's, groups.layout's form, so the Mac colours each group as the Time page does)}. groups:
+    "used", "dollars", "scale" (fit's, or None), "agents_pct", "other_pct", "groups", "chart" (timeline's), "colours"
+    (the layout's, colours.for_layout's of `palette`, so the Mac colours each group as the Time page does)}. groups:
     [{"name", "dollars", "pct", "agents", "subgroups": [{"name", "dollars", "pct", "agents"}]}], biggest first, and
     each agent {"id", "name", "dollars", "pct", "inferred"} (inferred: grouped by its repo, not placed by the owner).
     The percentages are None without a factor. rows, cwd: ledger's; samples: sample()'s lines; history, layout:
@@ -435,23 +454,25 @@ def split(target, key, accounts, rows, cwd, samples, cfg, now, history, layout, 
     return {"target": target, "window": key, "since": since, "resets_at": float(w["resets_at"]), "used": used,
             "dollars": round(total, 2), "scale": scale, "agents_pct": pct(total),
             "other_pct": None if k is None else round(used - total * k, 2), "groups": out_groups,
-            "chart": timeline(mine, since, min(now, float(w["resets_at"])), group_of, k, readings), "layout": layout}
+            "chart": timeline(mine, since, min(now, float(w["resets_at"])), group_of, k, readings),
+            "colours": colours.for_layout(layout, palette)}
 
 
 def compute(target, key, now=None):
     """split() for window `key` of pool `target` from this machine's sources: the usage reading (agent-usage), the
     agents' transcripts (through CACHE, under LOCK), the status log, the usage readings (SAMPLES), the board's groups
     and the mailroom's session names; with "notes" on what was left out. Raises ValueError for a pool or window the
-    reading lacks or a damaged config, and RuntimeError when agent-usage fails."""
+    reading lacks or a damaged config or colours.json, and RuntimeError when agent-usage fails."""
     now = now or time.time()
     cfg = config()
+    palette = colours.load()
     accounts = sources.read_usage()
     window_of(accounts, target, key)                 # an unknown pool or window fails before any transcript is read
     with sources.file_lock(LOCK):
         rows, cwd, notes = ledger(cfg, now - cfg["fit_days"] * 86400, sources.claude_logins(), sources.CODEX_HOME,
                                   sources.STATUS_LOG, CACHE)
     out = split(target, key, accounts, rows, cwd, sources.read_jsonl(SAMPLES), cfg, now, groups.history(),
-                groups.layout(), timesources.session_names(sources.MAIL_DB), collect.orchestrator_dir())
+                groups.layout(), timesources.session_names(sources.MAIL_DB), collect.orchestrator_dir(), palette)
     if out["scale"] is None:
         notes.append("too few usage readings with agent use to turn dollars into percent of the window (needs %d "
                      "stretches of %d hours in the last %d days)" % (cfg["min_fit_points"], cfg["fit_hours"],
@@ -462,3 +483,102 @@ def compute(target, key, now=None):
         "$100 from %d stretches, rms %.1f)" % (out["agents_pct"], out["other_pct"], 100 * out["scale"]["pct_per_dollar"],
                                                out["scale"]["points"], out["scale"]["rms"])))
     return out
+
+
+# ------------------------------------------------------------------ a per-token login's weekly spend
+
+def week_start(now, zone):
+    """The start of the week holding `now` (epoch seconds): Monday 00:00 in time zone `zone` (None: this machine's local
+    time), as epoch seconds. Across a clock change the week is an hour longer or shorter, as the clocks there say."""
+    if zone is None:
+        day = datetime.date.fromtimestamp(now)
+        monday = day - datetime.timedelta(days=day.weekday())
+        return time.mktime(datetime.datetime.combine(monday, datetime.time(0)).timetuple())
+    tz = zoneinfo.ZoneInfo(zone)
+    day = datetime.datetime.fromtimestamp(now, tz).date()
+    monday = day - datetime.timedelta(days=day.weekday())
+    return datetime.datetime.combine(monday, datetime.time(0), tzinfo=tz).timestamp()
+
+
+def budgets(accounts=None):
+    """[(login name, config folder, weekly budget in dollars, model)] for each Claude login of the mailroom's
+    usage.claude_accounts (`accounts`, read from its config when None) with a weekly_budget_usd: a per-token login
+    (a model through OpenRouter), its model the one it runs (its "model", or None: any), its folder sources.login_home's.
+    Raises ValueError for a weekly_budget_usd that is not a positive number of dollars (a login with no budget leaves
+    the key out), or a "model" that is not a model's name."""
+    accounts = sources.claude_accounts() if accounts is None else accounts
+    out = []
+    for name, a in accounts.items():
+        if not isinstance(a, dict) or "weekly_budget_usd" not in a:
+            continue
+        budget, model = a["weekly_budget_usd"], a.get("model")
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+            raise ValueError("usage.claude_accounts.%s.weekly_budget_usd is %r, not a positive number of dollars"
+                             % (name, budget))
+        if model is not None and not (isinstance(model, str) and model):
+            raise ValueError("usage.claude_accounts.%s.model is %r, not a model's name" % (name, model))
+        out.append((name, sources.login_home(a), float(budget), model))
+    return out
+
+
+def own_model(model, login_model):
+    """Whether a reply's model is one the login runs: one from the provider of its model, the part before "/"
+    ("google/" for a google/... model), so its sub-agents' other models from that provider count; any model when the
+    login names none."""
+    if not login_model:
+        return True
+    return model.startswith(login_model.split("/", 1)[0] + "/") if "/" in login_model else model == login_model
+
+
+def spend_of(rows, target, since, login_model):
+    """(dollars, notes): what pool `target` (claude:<login>) spent since `since`, from ledger's rows. A reply on a
+    model the login does not run (own_model) is left out and named in the notes with what it would cost: such a model
+    cannot run there (a Claude model id fails on OpenRouter's endpoint), so its replies are ones credited to the login
+    by mistake, as when a move between logins is missing from the status log."""
+    dollars, other = 0.0, collections.defaultdict(lambda: [0, 0.0])
+    for t, _, ts, model, d in rows:
+        if t != target or ts < since:
+            continue
+        if own_model(model, login_model):
+            dollars += d
+        else:
+            other[model or "(no model)"][0] += 1
+            other[model or "(no model)"][1] += d
+    notes = ["left out, not a model this login runs: %s" % ", ".join(
+        "%s (%d repl%s, $%.2f at its price)" % (m, n, "y" if n == 1 else "ies", d)
+        for m, (n, d) in sorted(other.items(), key=lambda x: -x[1][1]))] if other else []
+    return dollars, notes
+
+
+def weekly_spend(now=None, accounts=None, status_log=None, cache_path=None):
+    """{login name: {"dollars", "budget", "since", "notes"}} for each per-token login (budgets(accounts)): the dollars
+    its agents spent since Monday 00:00 in the config's week_zone (week_start, "since"), at its prices (OpenRouter's,
+    from allowance.json) from their transcripts, through the split's own ledger (each reply once, credited to the login it ran on
+    by the status log's moves); "notes" say what was left out. Reads only those logins' folders (a session's replies
+    on a login are in its copy there), through `cache_path` (SPEND_CACHE) under SPEND_LOCK. {} with no such login.
+    Raises ValueError for a damaged config (the mailroom's, budgets', or allowance.json)."""
+    now = now or time.time()
+    found = budgets(accounts)
+    if not found:
+        return {}
+    cfg = config()
+    since = week_start(now, cfg["week_zone"])
+    with sources.file_lock(SPEND_LOCK if cache_path is None else Path(str(cache_path) + ".lock")):
+        rows, _, notes = ledger(cfg, since, [(name, home) for name, home, _, _ in found], None,
+                                sources.STATUS_LOG if status_log is None else status_log,
+                                SPEND_CACHE if cache_path is None else cache_path)
+    out = {}
+    for name, _, budget, model in found:
+        dollars, own = spend_of(rows, sources.usage_target({"cli": "claude", "account": name}), since, model)
+        out[name] = {"dollars": dollars, "budget": budget, "since": since, "notes": notes + own}
+    return out
+
+
+def annotate(accounts, spend=None):
+    """Put "spend" (weekly_spend's, or `spend`) on the account of each per-token login in a usage reading's accounts
+    (in place), for the Mac's spend meter. Raises as weekly_spend does."""
+    spend = weekly_spend() if spend is None else spend
+    for a in accounts:
+        target = a.get("target") or ""
+        if target.startswith("claude:") and target[7:] in spend:
+            a["spend"] = spend[target[7:]]

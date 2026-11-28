@@ -1,4 +1,4 @@
-"""A git worktree for a new agent, for agent-spawn: fetch origin (retrying, never prompting
+"""A git worktree for a new agent, for agent-spawn and the reMarkable route: fetch origin (retrying, never prompting
 for credentials), pick the base for the agent's branch, check the branch out in a new worktree, and remove one
 again."""
 import os

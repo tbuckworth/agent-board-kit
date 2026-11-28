@@ -1,13 +1,17 @@
 """What the mailroom does with one inbound mail, shared by the daemon (bin/agent-mailroom) and agent-mail (release,
-rerun, recover, mailbox answer): which senders are held (sender_hold, collaborator_hold), the session a
+rerun, recover, remarkable, mailbox answer): which senders are held (sender_hold, collaborator_hold), the session a
 mail goes to (claim), the routing context the orchestrator is given (orchestrator_context) and the thread it reads
 (thread_messages), the reminder the owner's mail to a session carries (owner_reminder), the text a session or the
 orchestrator is handed, with the files of a Mail-tab reply put where it can open them (delivered_body), delivering to
 a session (deliver_to_session), settling a mail after an orchestrator run (settle_run), and setting a mail's state together
-with its Gmail labels (set_state). sender_hold, collaborator_hold and orchestrator_context decide only and do no IO."""
+with its Gmail labels (set_state). sender_hold, collaborator_hold and orchestrator_context decide only and do no IO.
+With Gmail off in config ("gmail": false) the svc these take is gmail.OFF: a thread is read from the store alone and
+no labels are set."""
+import time
 from email.utils import formataddr
 
-from . import deliver, gmail, recovery, remote, replyfiles, routing
+from . import (config, deliver, fastmode, gmail, mailview, messages, recovery, remote, replyfiles, researchermode,
+               routing)
 
 # The mailroom label (a key of config "labels") each state puts on the mail in Gmail, and whether it marks the mail
 # read. Putting one on takes the other mailroom labels off, so a mail never shows two outcomes.
@@ -57,14 +61,22 @@ def claim(st, hdrs, thread_id, account):
 
 
 def thread_messages(svc, st, inb):
-    """Inbound mail inb's thread as gmail.thread_messages gives it, (headers, text, time, Gmail id) oldest first, with
-    the replies written in the Mail tab that the store holds in it (Store.local_replies; Gmail has no copy), and inb
-    moved last: routing.thread_context and orchestrator_context take the last message for the mail being handled.
-    Calls the Gmail API."""
-    local = [({"from": formataddr((r["from_name"] or "", r["from_addr"])), "subject": r["subject"] or "",
-               "message-id": r["message_id"]}, r["body"] or "", r["received_at"], r["gmail_id"])
-             for r in st.local_replies(inb["thread_id"])]
-    msgs = sorted(gmail.thread_messages(svc, inb["thread_id"]) + local, key=lambda m: m[2])
+    """Inbound mail inb's thread as gmail.thread_messages gives it, (headers, text, time, Gmail id) oldest first, and
+    inb moved last: routing.thread_context and orchestrator_context take the last message for the mail being handled.
+    The mail of the thread that only the store holds joins Gmail's: replies written in the Mail tab
+    (Store.local_replies), and agent mail kept for the tab alone (Store.kept_sent), with its headers and text read from
+    the message store and Gmail id None, as its sent row has. Gmail is asked only for a thread it holds mail of
+    (Store.thread_in_gmail), and never with Gmail off (svc gmail.OFF): the thread is then what the store holds of it.
+    Calls the Gmail API; reads the message store."""
+    tid = inb["thread_id"]
+    here = [({"from": formataddr((r["from_name"] or "", r["from_addr"])), "subject": r["subject"] or "",
+              "message-id": r["message_id"]}, r["body"] or "", r["received_at"], r["gmail_id"])
+            for r in st.local_replies(tid)]
+    for r in st.kept_sent(tid):
+        parsed = mailview.parse(messages.load(r["eml"]))
+        here.append(({k.lower(): str(v) for k, v in parsed.headers.items()}, parsed.text, r["sent_at"], None))
+    in_gmail = svc is not gmail.OFF and st.thread_in_gmail(tid)
+    msgs = sorted((gmail.thread_messages(svc, tid) if in_gmail else []) + here, key=lambda m: m[2])
     return [m for m in msgs if m[3] != inb["gmail_id"]] + [m for m in msgs if m[3] == inb["gmail_id"]]
 
 
@@ -107,13 +119,14 @@ def orchestrator_context(rule, tier, inbound_id, thread_msgs, sent_rows, cfg):
     return rule, unowned_reply, context
 
 
-def owner_reminder(st, cfg, tier, inbound_id, body):
-    """The reminder lines for routing.event_text when inbound mail #inbound_id, of text body, goes to a session:
-    routing.reply_reminder for the owner's mail (tier "owner"), which counts their mails in the thread in the store;
-    "" for anyone else's."""
+def owner_reminder(st, cfg, tier, inbound_id, body, session):
+    """Instructions for owner mail: the Researcher preference and ordinary Fast or reply guidance."""
     if tier != "owner":
         return ""
-    return routing.reply_reminder(cfg["owner_name"], body, st.nth_in_thread(inbound_id))
+    mode = st.researcher_mode(session["tag"]) if researchermode.supported(session) else None
+    researcher = researchermode.instruction(cfg, session, mode, control=False) + "\n" if mode else ""
+    fast = fastmode.reminder(st, cfg, st.inbound(inbound_id), time.time())
+    return researcher + (fast or routing.reply_reminder(cfg["owner_name"], body, st.nth_in_thread(inbound_id)))
 
 
 FILES_NOT_PLACED = (OSError, ValueError, remote.RemoteError)   # what delivered_body raises when files stay put
@@ -129,18 +142,23 @@ def delivered_body(cfg, row, host):
         return body, []
     paths = deliver.place_files(cfg, host, "i%d" % row["id"], [(p.name, p.data) for p in parts])
     said = replyfiles.lines(cfg["owner_name"], [(path, p.type, len(p.data)) for path, p in zip(paths, parts)])
-    return ("%s\n\n%s" % (body, said) if body else said), paths
+    return replyfiles.with_lines(body, said), paths
 
 
 def deliver_to_session(svc, st, cfg, inbound_id, gid, session, text, note, relabel, **fields):
     """Hand text to session (a sessions row) through agent-send, or through its own machine's agent-mail for a
     session elsewhere (deliver.deliver_session: a subprocess, or SSH). Accepted: the mail is saved as queued (another
-    machine) or delivered, with detail "<note>: <agent-send's output>" and fields, and labelled when relabel
-    (set_state). Returns (rc, out); a failed delivery (rc != 0) saves nothing."""
-    rc, out = deliver.deliver_session(session, text, cfg)
+    machine, or a Codex agent that holds it in its queue: deliver.HELD, which counts as accepted and returns 0, as
+    the mail must not go again) or delivered, with detail "<note>: <agent-send's output>" and fields, and labelled
+    when relabel (set_state). Returns (rc, out); a failed delivery (rc != 0) saves nothing."""
+    rc, out = deliver.deliver_session(session, text, cfg, cfg["resume_offline"])
+    if rc == deliver.HELD:
+        rc = 0
+        state = "queued"
+    else:
+        state = "queued" if session["origin_host"] != cfg["host_id"] else "delivered"
     if rc == 0:
-        set_state(svc, st, cfg, inbound_id, gid, "queued" if session["origin_host"] != cfg["host_id"] else "delivered",
-                  relabel, detail="%s: %s" % (note, out), **fields)
+        set_state(svc, st, cfg, inbound_id, gid, state, relabel, detail="%s: %s" % (note, out), **fields)
     return rc, out
 
 
@@ -179,10 +197,10 @@ def settle_run(svc, st, cfg, inbound_id, gid, info, run_name, unowned_reply, rel
 def label(svc, cfg, gid, action):
     """Make Gmail message gid's labels show action (STATE_LABELS). Calls the Gmail API; raises if that fails, and
     for an action that has no labels. A reply written in the Mail tab (routing.is_local) has no Gmail copy, so it
-    gets no labels and Gmail is not called."""
+    gets no labels and Gmail is not called; nor is it with Gmail off in config (config.gmail_on)."""
     if action not in STATE_LABELS:
         raise ValueError("no mailroom label for action %r" % action)
-    if routing.is_local(gid):
+    if routing.is_local(gid) or not config.gmail_on(cfg):
         return
     name, read = STATE_LABELS[action]
     add = [gmail.ensure_label(svc, cfg["labels"][name])] if name else []

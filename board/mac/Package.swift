@@ -8,7 +8,9 @@ let package = Package(
         .executableTarget(
             name: "AgentBoard",
             path: "Sources/AgentBoard",
-            resources: [.copy("widgets.js")],          // the Mail tab's widget renderer (MailWidgets.script)
+            // the Mail tab's widget renderer (MailWidgets.script), and the cases --selftest-mail checks the reply's
+            // text on, which the phone's copy of it is checked on too (MailTest.sharedCases)
+            resources: [.copy("widgets.js"), .copy("reply-text-cases.json")],
             linkerSettings: [.linkedFramework("Carbon")]
         ),
     ]

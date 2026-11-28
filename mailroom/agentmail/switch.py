@@ -17,6 +17,7 @@ model or effort but not CLI (agentmail/failover.py moves it with the daemon's ow
 keep running and are listed in the note it resumes with (a background session's are stopped with it, and the note
 says so).
 """
+import contextlib
 import json
 import os
 import re
@@ -47,24 +48,6 @@ def effort_in_codex_argv(argv):
     return None
 
 
-def codex_pane(sess):
-    """(pane, codex pid) for a Codex agent: its tmux session is named after it (agent-spawn), and the pane's shell
-    is the parent of a codex process. (None, None) if not found."""
-    name = sess.get("name") or ""
-    if not name:
-        return None, None
-    r = commands.tmux("list-panes", "-t", "=" + name, "-F", "#{pane_id} #{pane_pid}", check=False)
-    for line in (r.stdout or "").split("\n"):
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        for kid in procs.children(int(parts[1])):
-            argv = procs.cmdline(kid)
-            if argv and "codex" in os.path.basename(argv[0]):
-                return parts[0], kid
-    return None, None
-
-
 def pane_busy(pane):
     text = commands.tmux("capture-pane", "-p", "-t", pane, check=False).stdout or ""
     return BUSY_MARK in text.lower()
@@ -90,8 +73,7 @@ def state(sess):
             bool(pane and pane != claude_session.BG and pane_busy(pane))
         out["background_jobs"] = len(claude_session.background_jobs(pid)) if pid else 0
     else:
-        pane, pid = codex_pane(sess)
-        why = "" if pane else "no tmux pane named %s running codex (not agent-spawn's layout)" % (sess.get("name") or "?")
+        pane, pid, why = registry.codex_pane(sess["id"])
         argv = procs.cmdline(pid) if pid else []
         out.update(model=commands.flag_value(argv, "-m", "--model"), effort=effort_in_codex_argv(argv))
         busy = bool(pane and pane_busy(pane))
@@ -111,17 +93,20 @@ def find(name, cfg):
 
 # ------------------------------------------------------------------ models
 def claude_models(account, cfg, run=subprocess.run):
-    """The model catalog Claude Code offers this login: [{"value", "label", "efforts"}]. From its own initialize
-    answer (runs the claude CLI; no model call), cached for a day per login in STATE_DIR/models-cache.json.
-    Raises SwitchError with the probe's error when claude cannot be run or names no model. A cache file that is
-    not JSON raises (jsonfile.read); it is only a cache, so the operator deletes it."""
+    """The model catalog Claude Code offers this login: [{"value", "label", "efforts"}]. A login with a model of its
+    own offers that one, at every effort. Otherwise from Claude Code's own initialize answer (runs the claude CLI; no
+    model call), cached for a day per login in STATE_DIR/models-cache.json. Raises SwitchError with the probe's error
+    when claude cannot be run or names no model. A cache file that is not JSON raises (jsonfile.read); it is only a
+    cache, so the operator deletes it."""
+    acct = accounts.account(usage.settings(cfg), account) if account else {}
+    if accounts.fixed_model(acct):
+        return [{"value": acct["model"], "label": acct["model"], "efforts": list(launch.EFFORTS)}]
     cache_file = config.STATE_DIR / "models-cache.json"
     cache = jsonfile.read(cache_file)
     key = usage.claude_target(account or "default")
     hit = cache.get(key)
     if hit and time.time() - hit.get("at", 0) < MODEL_CACHE_SECONDS:
         return hit["models"]
-    acct = accounts.account(usage.settings(cfg), account) if account else {}
     what = "the model catalog of Claude login %s" % (account or "default")
     try:
         resp = claude_session.claude_control(registry.claude_bin() or "claude", acct, {"subtype": "initialize"}, 60,
@@ -157,29 +142,53 @@ def target_of(st):
     return "codex" if st["cli"] == "codex" else usage.claude_target(st.get("account") or "default")
 
 
+def fixed_model_of(s, cli, account):
+    """The one model Claude login `account` runs (accounts.fixed_model), or None: any model, or Codex."""
+    return accounts.fixed_model(accounts.account(s, account)) if cli == "claude" and account else None
+
+
+def target_model(st, cli, account, asked, s, cfg):
+    """The model the agent in state st runs on (cli, Claude login account) when `asked` is asked for (None: none).
+    Without one, it keeps its own on its own CLI, and runs what a new agent gets (config spawn_<cli>_model) on the
+    other; on a Claude login, accounts.move_model decides. Raises SwitchError for a model move_model refuses."""
+    fresh = cfg[config.SPAWN_KEYS[cli]["model"]]
+    current = st.get("model") if cli == st["cli"] else fresh
+    if cli != "claude":
+        return asked or current
+    try:
+        return accounts.move_model(s, st.get("account") if st["cli"] == "claude" else None, account, asked, current,
+                                   fresh)
+    except ValueError as e:
+        raise SwitchError(str(e)) from e
+
+
 def options(name, cfg, snaps=None, models=None):
-    """Everything the board's menu needs, for one agent."""
+    """Everything the board's menu needs, for one agent. Each target has the models it offers ("models"): a Claude
+    login with a model of its own that one, the other Claude logins Claude Code's catalog (models["claude"]: the
+    agent's own login's, or the default login's when the agent runs Codex or on a login with a model of its own), and
+    Codex its own (models["codex"])."""
     sess = find(name, cfg)
     st = state(sess)
     s = usage.settings(cfg)
     snaps = usage.snapshots(cfg) if snaps is None else snaps
     current = target_of(st)
+    if models is None:
+        own = st["cli"] == "claude" and not fixed_model_of(s, "claude", st.get("account"))
+        models = {"claude": claude_models(st.get("account") if own else None, cfg), "codex": codex_models()}
     targets = []
     for t in usage.targets(s):
         cli = "codex" if t == "codex" else "claude"
         acct = usage.account_of(t)
         # Headroom for the model the agent would run there: its own on the same CLI (a Fable agent needs Fable).
-        model = st.get("model") if cli == st["cli"] else cfg[config.SPAWN_KEYS[cli]["model"]]
+        model = target_model(st, cli, acct, None, s, cfg)
         a = usage.assess(snaps.get(t) or {"windows": [], "error": "not read"}, s, model)
         ready = True if cli == "codex" else accounts.account_ready(accounts.account(s, acct))[0]
         label = ("Codex" if cli == "codex" else "Claude Code %s" % acct)
         kind = "current" if t == current else ("handoff" if cli != st["cli"] else "resume")
         targets.append({"target": t, "label": label, "cli": cli, "account": acct, "current": t == current,
                         "kind": kind, "status": a["status"] if ready else "unavailable",
-                        "usage": usage.summary(snaps.get(t) or {}, model), "available": ready})
-    if models is None:
-        models = {"claude": claude_models(st.get("account") if st["cli"] == "claude" else None, cfg),
-                  "codex": codex_models()}
+                        "usage": usage.summary(snaps.get(t) or {}, model), "available": ready,
+                        "models": claude_models(acct, cfg) if fixed_model_of(s, cli, acct) else models[cli]})
     return {"agent": {k: st[k] for k in ("name", "id", "cli", "account", "model", "effort", "status", "busy",
                                          "movable", "why_not", "background_jobs", "cwd")},
             "will_interrupt": st["busy"],
@@ -370,29 +379,35 @@ def relaunch_codex(st, model, effort, prompt, codex):
         (["-m", model] if model else []) + (launch.codex_effort(effort) if effort else [])
     if prompt:
         cmd.append(prompt)
-    if not stop(st["pid"]):
-        return False, "codex pid %d did not exit after SIGKILL; nothing relaunched" % st["pid"]
-    try:
-        launch.type_line(st["pane"], launch.shell_line(None, cmd, None), None)
-    except commands.CommandError as e:
-        return False, "stopped codex pid %d, but relaunching it in pane %s failed: %s" % (st["pid"], st["pane"], e)
-    # a lock file can outlive a killed codex, so wait for a new codex process in the pane, not for the lock
+    with contextlib.ExitStack() as keys:   # from the kill to the resume line's Enter: no other keys reach the shell
+        try:
+            keys.enter_context(commands.keys_lock(True))
+        except commands.LockBusy as e:
+            return False, "codex pid %d not stopped, nothing relaunched: %s" % (st["pid"], e)
+        if not stop(st["pid"]):
+            return False, "codex pid %d did not exit after SIGKILL; nothing relaunched" % st["pid"]
+        try:
+            launch.type_line(st["pane"], launch.shell_line(None, cmd, None), None)
+        except commands.CommandError as e:
+            return False, "stopped codex pid %d, but relaunching it in pane %s failed: %s" % (st["pid"], st["pane"], e)
+    # a lock file can outlive a killed codex, so wait for a new codex process holding it, not for the file
 
     def relaunched():
-        pane, pid = codex_pane({"name": st["name"]})
+        pane, pid, _ = registry.codex_pane(st["id"])
         return pid if pid and pid != st["pid"] else None
     ok = launch.wait_for(relaunched, 60)
     return bool(ok), "resumed Codex thread %s with %s, effort %s" % (st["id"][:8], model, effort) if ok else \
         "relaunched codex but thread %s not live after 60 s" % st["id"][:8]
 
 
-def start_claude(st, dst_dir, model, effort, brief, claude):
+def start_claude(st, dst_dir, model, effort, brief, claude, s):
     """A new Claude session in the agent's pane (handoff), on the login whose config dir is dst_dir (None: the
     default), with brief as its first prompt: the brief is written to an owner-only file under launch.BRIEF_DIR
-    (launch.write_brief), which launch.start_claude types into the pane. Returns its session id, or None if none
-    showed up within 60 s. Raises commands.CommandError if tmux fails."""
+    (launch.write_brief), which launch.start_claude types into the pane, with that login's options (s:
+    usage.settings). Returns its session id, or None if none showed up within 60 s. Raises commands.CommandError if
+    tmux fails."""
     brief_path = launch.write_brief("%s-switch" % (st["name"] or "agent"), brief)
-    launch.start_claude(st["pane"], claude, st["name"], dst_dir, model, effort, brief_path)
+    launch.start_claude(st["pane"], claude, st["name"], dst_dir, model, effort, brief_path, s)
 
     def new_session():
         return next((s["id"] for s in registry.live_on(dst_dir) if s["id"] != st["id"] and s.get("name") == st["name"]),
@@ -438,7 +453,7 @@ def switch(name, cfg, to=None, model=None, effort=None, force=False, dry_run=Fal
     if gap:
         raise SwitchError("cannot hand %s over to Codex in %s: %s. Bring the main checkout up to date, or leave the "
                           "agent on Claude" % (name, st["cwd"], gap))
-    model = model or (st["model"] if same_cli else cfg[config.SPAWN_KEYS[dst_cli]["model"]])
+    model = target_model(st, dst_cli, dst_acct, model, s, cfg)
     effort = effort or (st["effort"] if same_cli else cfg[config.SPAWN_KEYS[dst_cli]["effort"]])
     catalog = claude_models(dst_acct, cfg) if dst_cli == "claude" else codex_models()
     known = {m["value"]: m for m in catalog}
@@ -506,21 +521,29 @@ def switch(name, cfg, to=None, model=None, effort=None, force=False, dry_run=Fal
                 raise SwitchError("cannot trust %s for %s: %s" % (st["cwd"], dst, e)) from e
         hpath = write_handoff(st["name"], doc)
         text = handoff_brief(st, hpath, src, dst, owner, preamble(st, dst_cli) if preamble else "")
-        if not stop(st["pid"]):
-            result.update(detail="pid %d did not exit after SIGKILL; nothing started (handoff record %s)" % (
-                st["pid"], hpath))
-            return result
-        if cur_cli == "claude":
-            registry.remove_dead_entry(sess)   # claude removes its own on exit; a killed one leaves it behind
-        try:
-            if dst_cli == "claude":
-                new_id, not_briefed, notes = start_claude(st, dst_dir, model, effort, text, claude), "", []
-            else:
-                new_id, not_briefed, notes = start_codex(st, model, effort, text, codex)
-        except commands.CommandError as e:
-            result.update(detail="stopped %s, but starting %s in pane %s failed: %s; handoff record %s" % (
-                name, dst, st["pane"], e, hpath))
-            return result
+        # The keys lock from the kill until the new agent has started (its waits too, which fast mode's keys do not
+        # wait for: paneeffort.set_level), so that no other keys reach the pane's shell before its line's Enter.
+        with contextlib.ExitStack() as keys:
+            try:
+                keys.enter_context(commands.keys_lock(True))
+            except commands.LockBusy as e:
+                result.update(detail="nothing stopped: %s (handoff record %s)" % (e, hpath))
+                return result
+            if not stop(st["pid"]):
+                result.update(detail="pid %d did not exit after SIGKILL; nothing started (handoff record %s)" % (
+                    st["pid"], hpath))
+                return result
+            if cur_cli == "claude":
+                registry.remove_dead_entry(sess)   # claude removes its own on exit; a killed one leaves it behind
+            try:
+                if dst_cli == "claude":
+                    new_id, not_briefed, notes = start_claude(st, dst_dir, model, effort, text, claude, s), "", []
+                else:
+                    new_id, not_briefed, notes = start_codex(st, model, effort, text, codex)
+            except commands.CommandError as e:
+                result.update(detail="stopped %s, but starting %s in pane %s failed: %s; handoff record %s" % (
+                    name, dst, st["pane"], e, hpath))
+                return result
         said = "".join("; " + n for n in notes)
         if not new_id:
             result.update(detail="handed over to %s, but the new session did not show up within 60 s; handoff record "

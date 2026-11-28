@@ -22,12 +22,13 @@ struct SentMessage: Decodable, Identifiable {
     var to: String?
     var ok: Bool?
     var text: String
+    var files: [String]?         // the names of the files that went with it (Dialogs' MessageFiles)
     var error: String?
     var state: String            // waiting, done, checked, failed
     var done: SentDone?
     var id: String { ref }
 
-    enum CodingKeys: String, CodingKey { case ref, ts, kind, to, ok, text, error, state, done }
+    enum CodingKeys: String, CodingKey { case ref, ts, kind, to, ok, text, files, error, state, done }
 }
 
 struct SentList: Decodable {
@@ -141,6 +142,10 @@ struct SentSheet: View {
                     .lineLimit(open ? nil : 3)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if let names = m.files, !names.isEmpty {
+                    Label(names.joined(separator: ", "), systemImage: "paperclip")
+                        .font(.system(size: 11 * z)).foregroundStyle(.secondary).lineLimit(2)
+                }
                 if long {
                     Button(open ? "Less" : "More") {
                         if open { expanded.remove(m.ref) } else { expanded.insert(m.ref) }

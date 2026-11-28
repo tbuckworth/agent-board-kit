@@ -1,8 +1,8 @@
 """Temporary homes for the files agentmail reads and writes: config.json, the status log, and the session registries
 of Claude Code and Codex (agentmail/registry.py); and a repo whose worktree has a review gate its main checkout
-lacks. A test writes and reads real files there instead of stubbing the code that does, and nothing touches the live
-config, status log, ~/.claude or ~/.codex. It imports isolate_state, then agentmail: a test module puts the repo on
-sys.path before importing it."""
+lacks; and agent-group's commands run with their arguments filled in (run_group). A test writes and reads real files
+there instead of stubbing the code that does, and nothing touches the live config, status log, ~/.claude or ~/.codex.
+It imports isolate_state, then agentmail: a test module puts the repo on sys.path before importing it."""
 import json
 import os
 import shutil
@@ -12,8 +12,8 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-import isolate_state  # temporary state dirs and the test identity; before agentmail
-from agentmail import config, registry, statuslog
+import isolate_state  # noqa: F401  (temporary state dirs and the test identity; before agentmail)
+from agentmail import config, groupcmd, groups, registry, statuslog
 
 
 def temp_dir(test):
@@ -51,6 +51,47 @@ def config_file(test, data):
     path.write_text(json.dumps(dict(isolate_state.IDENTITY, **data)))
     patch(test, config, "CONFIG_PATH", path)
     return path
+
+
+EXAMPLE_SETTINGS = Path(__file__).resolve().parent.parent / "config" / "claude-openrouter-settings.example.json"
+NEON = "google/gemini-4-neon"   # the model of the example's login
+
+
+def per_token_login(test, folder=None):
+    """A Claude login billed per token, as config usage.claude_accounts names one ("manual", a settings file and a
+    model of its own): its config dir, with no /login in it, and a copy of EXAMPLE_SETTINGS, in folder (default: a
+    temporary one, removed when the test ends). Returns its account entry."""
+    folder = Path(folder) if folder else temp_dir(test)
+    (folder / ".claude-gemini").mkdir()
+    settings = folder / "gemini-claude-settings.json"
+    shutil.copy(str(EXAMPLE_SETTINGS), str(settings))
+    return {"config_dir": str(folder / ".claude-gemini"), "label": "Gemini Neon (OpenRouter)",
+            "settings": str(settings), "model": NEON, "manual": True, "weekly_budget_usd": 500}
+
+
+def researcher_install(home, cli, version):
+    """Install a minimal test plugin in the real CLI cache format without running its workflow."""
+    marketplace = config.DEFAULTS["researcher_marketplaces"][cli]
+    root = home / "plugins" / "cache" / marketplace / "researcher" / version
+    files = {
+        ".%s-plugin/plugin.json" % cli: json.dumps({"name": "researcher", "version": version}),
+        "commands/researcher.md": "Read docs/WORKFLOW.md.",
+        "docs/WORKFLOW.md": "Verified Researcher fixture.",
+        "scripts/methods_review.py": ("import argparse\nparser = argparse.ArgumentParser()\n"
+                                      "parser.add_argument('action', choices=('approve-human', 'verify'))\n"
+                                      "parser.parse_args()\n"),
+    }
+    if cli == "codex":
+        files.update({"skills/researcher/SKILL.md": "Read the command.", "templates/codex-adapter.md": "Codex adapter."})
+    for name, text in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    if cli == "claude":
+        record = {"scope": "user", "installPath": str(root), "version": version}
+        (home / "plugins" / "installed_plugins.json").write_text(
+            json.dumps({"plugins": {"researcher@" + marketplace: [record]}}))
+    return root
 
 
 def status_log(test):
@@ -129,3 +170,15 @@ class Homes:
                 holder = subprocess.Popen(["codex", "3600"], executable=shutil.which("sleep"), stdin=fh)
             self.test.addCleanup(holder.wait)
             self.test.addCleanup(holder.kill)
+
+
+def run_group(cfg, who, action, **args):
+    """agent-group's command action for who (groupcmd.run), every argument groupcmd.ACTIONS lists for it None but
+    those given, and a new id for a post or a group when none is."""
+    full = {k: None for k in groupcmd.ACTIONS[action]}
+    full.update(args)
+    if action == "post" and full["post_id"] is None:
+        full["post_id"] = groups.new_id()
+    if action == "new" and full["group_id"] is None:
+        full["group_id"] = groups.new_id()
+    return groupcmd.run(cfg, who, action, full)

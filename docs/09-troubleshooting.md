@@ -2,7 +2,28 @@
 
 Start with `kit doctor --online`: it checks most of what follows and prints the fix.
 
-## Mail
+## Without Gmail (the default)
+
+**A reply in the Mail tab or the phone app never reached the agent.** `agent-mail status` on the Linux machine says
+whether the mailroom is running and what is waiting. The agent's session must have started after the install (it
+reads hooks and instructions at launch): restart it. If the agent has closed, the reply went to the orchestrator.
+
+**An agent says `agent-mail` refused a mail (exit 5).** With Gmail off, agent mail goes only to you. The agent
+should tell you what it would have sent; turn Gmail on ([02-agent-gmail.md](02-agent-gmail.md)) if you want agents
+to mail other people.
+
+**`agent-mail status` lists settings under `ignored`.** They only work with Gmail on (`nudge_minutes`,
+`gmail_alerts`, `collaborators`, ...): remove them from `~/.config/agent-mail/config.json`, or turn Gmail on.
+
+**The phone app does not load.** `kit doctor` names the step that is missing: the phone not listed in
+`~/.config/agent-board/mailweb.json`, the service not running (`journalctl --user -u agent-board-mail-web -n 30`),
+or `tailscale serve` not publishing its socket ([07-mac.md](07-mac.md), "The phone app"). It refuses to answer
+while Tailscale Funnel exposes its port (`tailscale funnel status`).
+
+**No Mac notification for a security alert.** System Settings → Notifications → AgentBoard: allow. The alert is in
+the Mail tab either way.
+
+## Mail (with Gmail on)
 
 **My reply never reached the agent.**
 1. `agent-mail inbox --held`: is it held? `agent-mail show N` says why (unknown sender, DKIM fail,
@@ -108,7 +129,7 @@ your key, and that `~/.local/bin/agent-board` exists on the Linux machine.
 **The to-do web app says "Bad credentials" or 404.** The fine-grained token must have access to the
 tasks repo with Issues read/write and Contents read/write. Re-create it and paste it in Settings.
 
-**No Chats button, the Mail tab says there is no mailbox, Sync with Gmail fails, no meeting alerts, a
+**No Chats button, the Mail tab says there is no mailbox, Forward fails, no meeting alerts, a
 Time source is marked failed, or usage shows in dollars.** Each has an entry in the board's own
 [Troubleshooting](../board/README.md#troubleshooting). Usage shows in dollars until the board has a few
 days of its own usage readings.

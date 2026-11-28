@@ -14,6 +14,9 @@ in tokens, so a local count cannot be turned into a percentage honestly. Reading
 `cache_seconds` in STATE_DIR/usage-cache.json (percentages, reset times, plan names; no identities, no tokens).
 When a read fails, the last good reading is used, marked stale with its age.
 
+A login marked "manual" (accounts.manual) has no plan to read: it is billed per token (per_token), and routing never
+picks it.
+
 Routing: places are tried in `places` order, each Claude login in `order` on each model of
 config.claude_model_order in turn; the first whose counted windows all keep at least `min_remaining` percent wins (recommend says what comes
 next). Counted windows are the 5-hour/session and weekly ones, plus a per-model weekly window only when it is for
@@ -35,9 +38,15 @@ DEFAULTS = {
     # Claude accounts, one config dir each. config_dir None is the default login (~/.claude, CLAUDE_CONFIG_DIR
     # unset). exclude_owners / only_owners: GitHub owners (from the repo's origin) this account must not / may
     # only be used for, e.g. keep employer repos off a personal plan. min_remaining overrides per account.
+    # settings: a Claude Code settings file every claude on the login gets (--settings); the login is then ready
+    # without a /login of its own. model: the only model the login runs (--model). manual: true for a login used
+    # only when a person names it, never by routing, failover or a resume; it has no usage read and is billed per
+    # token (per_token), with weekly_budget_usd only reported. README.md, "Usage-aware routing and a second Claude
+    # login", says more.
     "claude_accounts": {"default": {"config_dir": None, "label": "Claude (default login)"}},
     "codex_label": "Codex",   # how the report names Codex
-    # Preference order: the first target with headroom wins. None means every Claude account, then codex.
+    # Preference order: the first target with headroom wins. None means every Claude account, then codex. A manual
+    # account in it is ignored (ranked).
     "order": None,
     # Percent that must REMAIN in each counted window; below it the account is "low" and skipped.
     "min_remaining": {"session": 10, "weekly": 5},
@@ -48,6 +57,7 @@ DEFAULTS = {
 CODEX = "codex"   # Codex's target; a Claude login's is CLAUDE_PREFIX and the login's name (claude_target)
 CLAUDE_PREFIX = "claude:"
 CACHE_NAME = "usage-cache.json"
+PER_TOKEN = "per_token"   # a snapshot's "billing" for a login with no plan (per_token)
 
 
 class UsageError(Exception):
@@ -55,10 +65,18 @@ class UsageError(Exception):
 
 
 def settings(cfg):
+    """Config key "usage" over DEFAULTS. Raises ValueError for a Claude account that sets a settings file or a model
+    of its own with no config dir of its own: the default login's claude runs with neither."""
     s = dict(DEFAULTS, **(cfg.get("usage") or {}))
     s["min_remaining"] = dict(DEFAULTS["min_remaining"], **(s.get("min_remaining") or {}))
     if not s.get("claude_accounts"):
         s["claude_accounts"] = dict(DEFAULTS["claude_accounts"])
+    for n, a in s["claude_accounts"].items():
+        own = [k for k in ("settings", "model") if (a or {}).get(k)]
+        if own and not (a or {}).get("config_dir"):
+            raise ValueError("config usage.claude_accounts.%s sets %s but no config_dir: a login with its own "
+                             "settings file or model needs a config dir of its own (agent-usage init-account)"
+                             % (n, " and ".join(own)))
     if not s.get("order"):
         s["order"] = [claude_target(n) for n in s["claude_accounts"]] + [CODEX]
     return s
@@ -76,8 +94,9 @@ def account_of(target):
 
 
 def ranked(s):
-    """The targets routing may pick, in preference order (unknown names in `order` are ignored)."""
-    return [t for t in s["order"] if t == CODEX or account_of(t) in s["claude_accounts"]]
+    """The targets routing may pick, in preference order (unknown names and manual logins in `order` are ignored)."""
+    return [t for t in s["order"] if t == CODEX or (account_of(t) in s["claude_accounts"]
+                                                    and not accounts.manual(s["claude_accounts"][account_of(t)]))]
 
 
 def places(s, claude_models, codex_model):
@@ -94,7 +113,8 @@ def places(s, claude_models, codex_model):
 
 
 def targets(s):
-    """Every target agent-usage reads and shows: the ranked ones, then any account left out of `order`."""
+    """Every target agent-usage reads and shows: the ranked ones, then any account left out of `order` (the manual
+    ones among them)."""
     out = ranked(s)
     out += [claude_target(n) for n in s["claude_accounts"] if claude_target(n) not in out]
     return out + ([CODEX] if CODEX not in out else [])
@@ -368,10 +388,16 @@ def read_one(target, s):
     return data
 
 
+def per_token(acct):
+    """The snapshot of a manual login, which is read from nowhere: billed per token, no windows, and the weekly budget
+    config gives it ("weekly_budget_usd", None: none), which agent-usage only reports."""
+    return {"billing": PER_TOKEN, "windows": [], "weekly_budget_usd": acct.get("weekly_budget_usd")}
+
+
 def snapshots(cfg, refresh=False, reader=None, cache_file=None, now=None):
-    """{target: snapshot}. Fresh cache entries are reused; the rest are read in parallel and written to the cache
-    file. A cache file that is not JSON raises (jsonfile.read); it is only a cache, so the operator deletes it. One
-    that cannot be written raises OSError."""
+    """{target: snapshot}. A manual login's is per_token. Fresh cache entries are reused; the rest are read in
+    parallel and written to the cache file. A cache file that is not JSON raises (jsonfile.read); it is only a cache,
+    so the operator deletes it. One that cannot be written raises OSError."""
     s = settings(cfg)
     reader = reader or read_one
     now = time.time() if now is None else now
@@ -379,6 +405,10 @@ def snapshots(cfg, refresh=False, reader=None, cache_file=None, now=None):
     cache = jsonfile.read(cache_file)
     out, todo = {}, []
     for t in targets(s):
+        acct = accounts.account(s, account_of(t)) if t != CODEX else {}
+        if accounts.manual(acct):
+            out[t] = per_token(acct)
+            continue
         c = cache.get(t)
         if c and not refresh and now - c.get("observed_at", 0) < s["cache_seconds"]:
             out[t] = dict(c, cached=True)
@@ -438,8 +468,11 @@ def used_up(snap, model):
 
 
 def assess(snap, s, model=None, now=None):
-    """-> {"status": ok|low|out|unknown, "headroom": %, "why": [...]}; why says what keeps it from ok."""
+    """-> {"status": ok|low|out|unknown, "headroom": %, "why": [...]}; why says what keeps it from ok. A login billed
+    per token (per_token) has no windows to run out: ok."""
     now = time.time() if now is None else now
+    if snap.get("billing") == PER_TOKEN:
+        return {"status": "ok", "headroom": None, "why": []}
     if not snap.get("windows"):
         return {"status": "unknown", "headroom": None, "why": ["usage unknown: %s" % (snap.get("error") or "no data")]}
     acct = accounts.account(s, snap.get("account")) if snap.get("cli") == "claude" else {}
@@ -470,7 +503,15 @@ def assess(snap, s, model=None, now=None):
     return {"status": status, "headroom": min(rems) if rems else None, "why": why}
 
 
+def billed_per_token(snap):
+    """A per_token snapshot in words: "billed per token, weekly budget $500.00"."""
+    budget = snap.get("weekly_budget_usd")
+    return "billed per token" + (", weekly budget %s" % money(budget, "USD") if budget else "")
+
+
 def summary(snap, model=None):
+    if snap.get("billing") == PER_TOKEN:
+        return billed_per_token(snap)
     parts = ["%s %d%% left" % (w["name"], w["remaining_pct"]) for w in snap.get("windows", []) if counted(w, model)]
     return ", ".join(parts) or "no counted windows"
 
@@ -576,6 +617,10 @@ def render_text(snaps, rec, cfg, now=None):
         if not snap:
             continue
         src = snap.get("source") or "-"
+        if snap.get("billing") == PER_TOKEN:
+            lines += ["%-18s %s  [not read: used only when asked for by name]" % (t, snap.get("label") or ""),
+                      "    %s; no plan usage windows" % billed_per_token(snap), ""]
+            continue
         if snap.get("stale"):
             src = "STALE %s from %s" % (src, time.strftime("%H:%M", time.localtime(snap.get("observed_at", now))))
         elif src == "session-log":

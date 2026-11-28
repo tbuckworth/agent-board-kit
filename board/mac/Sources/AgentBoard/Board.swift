@@ -150,7 +150,7 @@ struct SwitchSession: Identifiable {
 
 /// The sheet open over the board; there is at most one.
 enum BoardSheet: Identifiable {
-    case restart, sent, time
+    case restart, sent, time, phone, keyring
     case switching(SwitchSession)
     case chats(String?)          // the chat to open first
     case newChat(String?)        // an agent to put in it
@@ -161,6 +161,8 @@ enum BoardSheet: Identifiable {
         case .restart: return "restart"
         case .sent: return "sent"
         case .time: return "time"
+        case .phone: return "phone"
+        case .keyring: return "keyring"
         case .switching(let s): return "switch " + s.id.uuidString
         case .chats: return "chats"
         case .newChat: return "new chat"
@@ -234,12 +236,13 @@ final class BoardModel: ObservableObject {
     /// false for offscreen renders, which must never overwrite the saved layout
     let persist: Bool
 
-    /// `mail`: the Mail tab's model; nil makes the app's, which asks the desktop and keeps drafts on this Mac when
-    /// `persist`, else in a folder of this run's own.
+    /// `mail`: the Mail tab's model; nil makes the app's, which asks the desktop and, when `persist`, keeps drafts on
+    /// the desktop with this Mac's copy, else in a folder of this run's own and nowhere else.
     init(layout: Layout, persist: Bool, mail: MailModel? = nil) {
         self.layout = layout
         self.persist = persist
-        self.mail = mail ?? MailModel(draftsFolder: persist ? MailDrafts.appFolder : MailDrafts.scratchFolder())
+        self.mail = mail ?? MailModel(draftsFolder: persist ? MailDrafts.appFolder : MailDrafts.scratchFolder(),
+                                      syncDrafts: persist)
     }
 
     /// The app's board, on the layout saved on this Mac (Layout.load of Layout.url).
@@ -324,6 +327,7 @@ final class BoardModel: ObservableObject {
 
     func apply(_ snap: Snapshot) {
         snapshot = snap
+        mail.account = snap.owner
         if let m = snap.metrics { meters.metrics = m }
         if let u = snap.usage { setUsage(u) }
         var l = layout
@@ -340,6 +344,11 @@ final class BoardModel: ObservableObject {
     // MARK: derived
 
     var agents: [Agent] { snapshot?.agents ?? [] }
+    /// The agents at work now, each with its tile's state (AgentState.foremost, of its tiles if it has several): the
+    /// Mail tab dots their threads in that tile's colour (MailRules.working).
+    var workingAgents: [AgentKey: AgentState] {
+        Dictionary(grouping: agents, by: \.key).compactMapValues { AgentState.foremost($0.map(\.agentState)) }
+    }
     var selected: Agent? { agents.first { $0.id == selectedID } }
     var freeWorktrees: [FreeWorktree] { snapshot?.worktrees ?? [] }
     var selectedWorktree: FreeWorktree? { freeWorktrees.first { $0.id == selectedID } }
@@ -610,16 +619,21 @@ final class BoardModel: ObservableObject {
     // MARK: actions
 
     /// ⌘R: reconnect if the link is down, otherwise ask the desktop to read everything again (Collector.refresh), and on
-    /// the Mail tab the mail list too.
+    /// the Mail tab, or with a thread popped out into its own window, the mail list too.
     func refreshAll() {
         if case .live = link {
             stream.send(["cmd": "refresh"])
-            if tab == .mail { mail.refresh() }
+            if tab == .mail || !mail.popouts.isEmpty { mail.refresh() }
             show("Refreshing…")
         } else {
             reconnect()
             show("Reconnecting…")
         }
+    }
+
+    /// Ask the desktop to read the keyring's state again (after an unlock), so the top bar's mark follows in seconds.
+    func refreshKeyring() {
+        if case .live = link { stream.send(["cmd": "refresh_keyring"]) }
     }
 
     func refreshUsage() {
@@ -654,26 +668,39 @@ final class BoardModel: ObservableObject {
     }
 
     /// The agent's latest mail to the owner, in the owner's Gmail: the thread itself when the read-check has found it,
-    /// else a search for that exact message. Gmail does the rest (images, replying, unread).
+    /// else a search for that exact message. Gmail does the rest (images, replying, unread). nil without one in the
+    /// last week, and for one the mailroom kept for the Mail tab alone, which Gmail has no copy of.
     func latestMailURL(for a: Agent) -> URL? {
-        // ?authuser=EMAIL picks the account (Gmail redirects to its /u/N/); a literal /u/EMAIL/ path gives
-        // "Temporary Error (404): your account is temporarily unavailable"
-        let owner = (snapshot?.owner).flatMap { $0.isEmpty ? nil : $0 }
-        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "@.-_"))   // `+` would read as a space
-        let base = "https://mail.google.com/mail/" + (owner.flatMap {
-            $0.addingPercentEncoding(withAllowedCharacters: safe).map { "?authuser=" + $0 } } ?? "u/0/")
-        if let t = a.mail.gmailThread, !t.isEmpty { return URL(string: base + "#all/" + t) }
+        if a.mail.lastOutKept == true { return nil }
+        if let t = a.mail.gmailThread, !t.isEmpty { return Browser.gmail("all/" + t, account: snapshot?.owner) }
         guard let mid = a.mail.lastOutId, !mid.isEmpty else { return nil }
         let q = ("rfc822msgid:" + mid.trimmingCharacters(in: CharacterSet(charactersIn: "<> ")))
             .addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
-        return URL(string: base + "#search/" + q)
+        return Browser.gmail("search/" + q, account: snapshot?.owner)
     }
 
-    /// The agent's latest mail to the owner in the Mail tab, in whichever box it is.
+    /// A double-click on a tile: select it and open its latest mail in the Mail tab. The tile is in the board's window,
+    /// so the window is in front already.
+    func openFromTile(_ a: Agent) {
+        selectedID = a.id
+        openInMail(a)
+    }
+
+    /// The agent's latest mail to the owner in the Mail tab, in whichever box it is, opened at that mail
+    /// (MailModel.reveal). Without one (none in the last week, the board's mail window) or without a mailbox on the
+    /// desktop, a toast says so and the tab stays as it is.
     func openInMail(_ a: Agent) {
-        guard let thread = a.mail.lastOutThread, !thread.isEmpty else { show("\(a.display) has no mail in the Mail tab."); return }
+        guard snapshot?.mailbox != nil else {
+            show("The desktop has no mailbox yet, so the Mail tab can't show \(a.display)'s mail.")
+            return
+        }
+        guard let thread = a.mail.lastOutThread, !thread.isEmpty else {
+            show(a.mail.lastOut == nil ? "\(a.display) hasn't mailed you in the last week."
+                 : "\(a.display)'s latest mail isn't in the Mail tab; right-click the tile to open it in Gmail.")
+            return
+        }
         tab = .mail
-        mail.reveal(thread)
+        mail.reveal(thread, at: a.mail.lastOut)
     }
 
     func openLatestMail(_ a: Agent) {
@@ -681,6 +708,13 @@ final class BoardModel: ObservableObject {
         if let why = Browser.open(url, signedInAs: snapshot?.owner) {
             show("Opened in the default browser, which may be the wrong Google account: \(why)")
         }
+    }
+
+    /// A click on a security alert's notification (SecurityAlerts): its thread in the Mail tab, or the tab alone when
+    /// the alert names no thread.
+    func openSecurityAlert(_ thread: String) {
+        tab = .mail
+        if !thread.isEmpty { mail.reveal(thread) }
     }
 
     /// A meeting's join link or calendar page (from its overlay or its notification), in the Chrome profile signed in
@@ -701,5 +735,46 @@ final class BoardModel: ObservableObject {
             return "ssh -t \(host) " + shellQuote(remote)
         }
         return nil
+    }
+}
+
+extension MailTest {
+    /// A tile's Gmail link (BoardModel.latestMailURL): the thread the read check found, else a search for that one
+    /// message; none for mail the mailroom kept for the Mail tab alone (last_out_kept), which Gmail has no copy of,
+    /// and which the tile still opens in the Mail tab.
+    static func gmailLink(_ check: (Bool, String) -> Void) {
+        var asked: [String] = []
+        let folder = MailDrafts.scratchFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }          // this test's own folder
+        let board = BoardModel(layout: Layout(), persist: false,
+                               mail: MailModel(call: { request, _ in asked.append(request["action"] as? String ?? "?") },
+                                               upload: { _, _ in }, ahead: 0, cacheBytes: 0, draftsFolder: folder))
+        func mailed(_ name: String, thread: String, _ more: [String: Any]) -> [String: Any] {
+            var a = agent(name, name, state: "idle", thread: thread, lastOut: 300)
+            a["mail"] = (a["mail"] as? [String: Any] ?? [:]).merging(more) { $1 }
+            return a
+        }
+        guard let snap = snapshot([mailed("found", thread: "18c0ffee", ["last_out_id": "<a@mail.gmail.com>",
+                                                                        "gmail_thread": "18c0ffee"]),
+                                   mailed("sought", thread: "18c0ffef", ["last_out_id": "<b@mail.gmail.com>"]),
+                                   mailed("kept", thread: "L0123456789abcdef",
+                                          ["last_out_id": "<177.1.2@agent-mailroom.local>", "last_out_kept": true])],
+                                  check) else { return }
+        board.apply(snap)
+        let tile = Dictionary(uniqueKeysWithValues: board.agents.map { ($0.name, $0) })
+        guard let found = tile["found"], let sought = tile["sought"], let kept = tile["kept"] else {
+            check(false, "the board has the stand-in agents: \(tile.keys.sorted())")
+            return
+        }
+        let link = board.latestMailURL(for: found)?.absoluteString
+        check(link == "https://mail.google.com/mail/u/0/#all/18c0ffee", "a found thread: its Gmail page: \(link ?? "none")")
+        let search = board.latestMailURL(for: sought)?.absoluteString
+        check(search == "https://mail.google.com/mail/u/0/#search/rfc822msgid%3Ab%40mail%2Egmail%2Ecom",
+              "not found yet: a search for the one message: \(search ?? "none")")
+        check(kept.mail.lastOutKept == true && found.mail.lastOutKept == nil, "last_out_kept decodes, absent as nil")
+        check(board.latestMailURL(for: kept) == nil, "kept for the tab alone: no Gmail link")
+        board.openInMail(kept)
+        check(board.tab == .mail && board.mail.selected == "L0123456789abcdef" && asked == ["mail_show"],
+              "and the tile opens it in the Mail tab: \(board.tab) \(asked)")
     }
 }

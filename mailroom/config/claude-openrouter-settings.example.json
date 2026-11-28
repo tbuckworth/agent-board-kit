@@ -1,0 +1,20 @@
+{
+  "apiKeyHelper": "tr -d '[:space:]' < \"$HOME/.config/agent-mail/openrouter-api-key\"",
+  "model": "google/gemini-4-neon",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
+    "ANTHROPIC_MODEL": "google/gemini-4-neon",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "google/gemini-4-neon",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "google/gemini-4-neon",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "google/gemini-4-hydrogen",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "google/gemini-4-neon",
+    "ANTHROPIC_SMALL_FAST_MODEL": "google/gemini-4-hydrogen",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "google/gemini-4-neon",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "3600000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES": "thinking,interleaved_thinking,adaptive_thinking,effort,temperature",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES": "thinking,interleaved_thinking,adaptive_thinking,effort,temperature",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES": "thinking,interleaved_thinking,adaptive_thinking,effort,temperature",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES": "thinking,interleaved_thinking,adaptive_thinking,effort,temperature"
+  }
+}

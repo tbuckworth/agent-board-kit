@@ -1,7 +1,8 @@
 """Group chats on the board (agentboard/chats.py and its actions): python3 -m unittest discover -s tests
 
 agent-group is the mailroom's command, another component with its own tests, and here it would read and deliver to
-the owner's real groups and agents, so each test answers for it with a stand-in that records the argv and stdin it was given.
+the owner's real groups and agents, so each test answers for it with a stand-in that records the argv and stdin it was
+given.
 """
 import contextlib
 import importlib.machinery
@@ -23,9 +24,38 @@ from agentboard import actions, chats, groups, sent, sources, subchats, timesour
 GROUP = "q8F3Ab_-q8F3Ab_-q8F3Ab"
 SUB, SOLO = "6F1C2E9A-0B7D-4C1E-9F3A-2D5B8C7E4A10", "0A9B8C7D-6E5F-4A3B-8C1D-0E9F8A7B6C5D"   # the Mac's sub-group ids
 POST = "Zt0pZt0pZt0pZt0pZt0pZt"
+REPLY = "X5O_N7WdXobdN9KHoDyKHw"
+TOPIC = "8fLuiBEUyaigdFaTgeVN9A"
+DASHED = "-FyE0Oabv7Ha4jfVa-xxGw"                    # a chat's id may start with "-" (16 bytes in base64url)
 NOW = 1_800_000_000.0
+ALICE, BOB = {"device": "desktop", "agent": "alice"}, {"device": "desktop", "agent": "bob"}
+RELEASE = {"id": TOPIC, "title": "Release"}
+
+
+def chat(**fields):
+    """A chat as agent-group's list --json gives it: no posts, no topics, but for `fields`."""
+    return dict({"id": GROUP, "title": "Garden", "members": [], "maker": None, "task": None, "hidden": False,
+                 "created": 1, "updated": 2, "posts": 0, "last_post": None, "topics": []}, **fields)
+
+
+def details(**fields):
+    """A chat as agent-group's show, new and set --json give it to the owner: chat()'s fields and each member's alert
+    settings, the default (named) for the chat and its own for each topic (none), but for `fields`."""
+    c = chat(**fields)
+    c.setdefault("member_alerts", [dict(m, alerts="named", topic_alerts={}) for m in c["members"]])
+    return c
+
+
+def post(post_id, created, text, owner=False, **fields):
+    """A post as agent-group's posts --json gives it, in no topic: from the desktop, alpha's, or the owner's when
+    `owner`; `fields` over all of that."""
+    return dict({"id": post_id, "created": created, "from": "desktop", "from_agent": None if owner else "alpha",
+                 "from_owner": owner, "sender_label": "Alex" if owner else "alpha@desktop", "reply_to": None,
+                 "topic": None, "text": text}, **fields)
+
+
 ROWS = [{"id": "11111111-2222-3333-4444-555555555555", "cli": "claude", "live": True, "display": "alpha", "name": "alpha"},
-        {"id": "0190aaaa-0000-7000-8000-00000000a001", "cli": "codex", "live": True, "display": "(untitled)", "name": ""},
+        {"id": "0190dddd-0000-7000-8000-00000000d001", "cli": "codex", "live": True, "display": "(untitled)", "name": ""},
         {"id": "22222222-2222-3333-4444-555555555555", "cli": "claude", "live": False, "display": "beta", "name": "beta"},
         {"id": "33333333-2222-3333-4444-555555555555", "cli": "claude", "live": True, "display": "gamma", "name": "gamma"}]
 
@@ -62,7 +92,7 @@ class ChatTest(unittest.TestCase):
 
     def test_bad_requests_never_reach_agent_group(self):
         for req in ({"action": "chat_post", "group": "short", "post": POST, "title": "t", "text": "hi"},
-                    {"action": "chat_post", "group": "-" + GROUP[1:], "post": POST, "title": "t", "text": "hi"},
+                    {"action": "chat_post", "group": GROUP, "post": "-" + POST[1:], "title": "t", "text": "hi"},
                     {"action": "chat_post", "group": GROUP, "post": None, "title": "t", "text": "hi"},
                     {"action": "chat_post", "group": GROUP, "post": POST, "title": "t", "text": "   "},
                     {"action": "chat_post", "group": GROUP, "post": POST, "title": "two\nlines", "text": "hi"},
@@ -72,17 +102,25 @@ class ChatTest(unittest.TestCase):
                     {"action": "chat_new", "title": "t", "members": [ROWS[0]["id"]] * 17},
                     {"action": "chat_new", "title": "", "members": [ROWS[0]["id"]]},
                     {"action": "chat_members", "group": GROUP, "op": "delete", "members": [ROWS[0]["id"]]},
-                    {"action": "chat_hide", "group": GROUP, "hidden": "yes"}):
+                    {"action": "chat_hide", "group": GROUP, "hidden": "yes"},
+                    {"action": "chat_new", "title": "tab\there", "members": [ROWS[0]["id"]]},
+                    {"action": "chat_share", "group": GROUP},                  # no such action in the kit
+                    {"action": "chat_accept", "group": GROUP, "agents": [ALICE]}):
             run = AgentGroup()
             res = self.act(req, run)
             self.assertFalse(res["ok"], req)
             self.assertEqual(run.calls, [], req)
 
     def test_new_and_members_name_board_agents_by_session_name(self):
-        made = {"id": GROUP, "title": "-Garden", "members": [{"device": "desktop", "agent": "alpha"}], "maker": None}
+        alpha = {"device": "desktop", "agent": "alpha"}
+        beta = {"device": "desktop", "agent": "beta"}
+        made = details(title="-Garden", members=[alpha, beta])
         run = AgentGroup((0, json.dumps(made), ""))
         res = self.act({"action": "chat_new", "title": "  -Garden  ", "members": [ROWS[0]["id"], ROWS[2]["id"]]}, run)
-        self.assertEqual(res, {"ok": True, "chat": made})                  # the Mac opens it by its id
+        # the chat as chat_show gives it, which the Mac reads as a Chat and opens by its id: each member's per-topic
+        # settings a list, as chats.show makes them, not agent-group's dict
+        self.assertEqual(res, {"ok": True, "chat": dict(made, member_alerts=[
+            dict(alpha, alerts="named", topic_alerts=[]), dict(beta, alerts="named", topic_alerts=[])])})
         self.assertEqual(run.calls[0][0], ["/bin/agent-group", "new", "--json", "--as", "owner", "--with", "alpha,beta",
                                            "--", "-Garden"])
         run = AgentGroup()
@@ -93,10 +131,35 @@ class ChatTest(unittest.TestCase):
         self.assertTrue(self.act({"action": "chat_hide", "group": GROUP, "hidden": False}, run)["ok"])
         self.assertEqual(run.calls[0][0], ["/bin/agent-group", "unhide", "--as", "owner", "--", GROUP])
 
+    def test_new_and_set_give_the_chat_as_show_does_and_a_chat_made_is_never_said_to_be_unmade(self):
+        alerts = dict(ALICE, alerts="named", topic_alerts={TOPIC: "all", "a_b": "never"})
+        shown = details(members=[ALICE], member_alerts=[alerts])
+        for what, got in (("new", chats.new("Garden", ["alice"], AgentGroup((0, json.dumps(shown), "")))),
+                          ("set", chats.set_chat(GROUP, "Garden", ["alice"], AgentGroup((0, json.dumps(shown), "")))),
+                          ("show", chats.show(GROUP, AgentGroup((0, json.dumps(shown), ""))))):
+            self.assertEqual(got["member_alerts"][0]["topic_alerts"],
+                             [{"topic": TOPIC, "alerts": "all"}, {"topic": "a_b", "alerts": "never"}], what)
+        # agent-group made the chat but its answer does not check out: the error says it was made, and which, so
+        # the owner does not make it again
+        bare = {k: v for k, v in shown.items() if k != "members"}
+        run = AgentGroup((0, json.dumps(bare), ""))
+        res = self.act({"action": "chat_new", "title": "Garden", "members": [ROWS[0]["id"]]}, run)
+        self.assertFalse(res["ok"])
+        self.assertIn("agent-group made chat %s, but its answer is not understood" % GROUP, res["error"])
+        self.assertIn("not a chat with members", res["error"])
+        self.assertEqual(res["made"], GROUP)                    # the Mac says it was made, not "Not made"
+        res = self.act({"action": "chat_new", "title": "Garden", "members": [ROWS[0]["id"]]},
+                       AgentGroup((0, json.dumps([]), "")))
+        self.assertIn("agent-group made the chat, but its answer is not understood", res["error"])
+        self.assertIn("made", res)
+        self.assertIsNone(res["made"])                          # made, but which is not known
+        audit = [json.loads(line) for line in actions.AUDIT.read_text().splitlines()]
+        self.assertEqual([(a["action"], a["group"], a["members"]) for a in audit],
+                         [("chat_new", GROUP, ["alpha"]), ("chat_new", None, ["alpha"])])   # each on the record
+
     def test_the_chat_list_has_the_snapshot_s_rows(self):
         # the Mac reads both as ChatSummary, whose members is a count
-        raw = [{"id": GROUP, "title": "Garden", "members": [{"device": "desktop", "agent": "alpha"}], "maker": None,
-                "task": None, "hidden": False, "created": 1, "updated": 2, "posts": 3, "last_post": 9}]
+        raw = [chat(members=[{"device": "desktop", "agent": "alpha"}], posts=3, last_post=9)]
         listed = self.act({"action": "chat_list"}, AgentGroup((0, json.dumps(raw), "")))
         snap = subchats.summary(AgentGroup((0, json.dumps(raw), "")))
         self.assertEqual(listed["chats"], snap["chats"])
@@ -105,23 +168,85 @@ class ChatTest(unittest.TestCase):
     def test_posts_show_the_owner_s_text_without_the_footer(self):
         mine = "Put the parser fixes live." + chats.footer("k3f9")
         theirs = "quoting it:" + chats.footer("k3f9")                      # an agent's post is shown as it is
-        run = AgentGroup((0, json.dumps([
-            {"id": POST, "created": 1, "from": "desktop", "from_agent": None, "reply_to": None, "text": mine},
-            {"id": GROUP, "created": 2, "from": "desktop", "from_agent": "alpha", "reply_to": POST, "text": theirs}]), ""))
+        run = AgentGroup((0, json.dumps([post(POST, 1, mine, owner=True), post(GROUP, 2, theirs, reply_to=POST)]), ""))
         res = self.act({"action": "chat_posts", "group": GROUP, "since": POST}, run)
-        self.assertEqual(run.calls[0][0], ["/bin/agent-group", "posts", "--json", "--as", "owner", "--since", POST,
+        self.assertEqual(run.calls[0][0], ["/bin/agent-group", "posts", "--json", "--as", "owner", "--since=" + POST,
                                            "--", GROUP])
         self.assertEqual([(p["text"], p.get("ref")) for p in res["posts"]],
                          [("Put the parser fixes live.", "k3f9"), (theirs, None)])
         self.assertEqual(chats.split_footer("no footer"), ("no footer", None))
-        self.assertTrue(chats.footer("k3f9").startswith("\n\n(Alex posted this from the agent board as message k3f9."))
-        self.assertEqual(chats.as_owner(), "owner")                # the mailroom's alias, whatever the owner's name
+
+    def test_posts_carry_their_topic_and_sender_and_the_owner_s_are_known_without_from_owner(self):
+        mine = "Plan for the release." + chats.footer("k3f9")
+        raw = [post(POST, 1, mine, owner=True, topic=RELEASE),
+               post(REPLY, 2, "on it", reply_to=POST, topic=RELEASE,
+                    **{"from": "mac", "from_agent": "mac-agent", "sender_label": "mac-agent@mac"})]
+        res = self.act({"action": "chat_posts", "group": GROUP}, AgentGroup((0, json.dumps(raw), "")))
+        self.assertEqual([(p["from_owner"], p["sender_label"], p["topic"], p["text"], p.get("ref"))
+                          for p in res["posts"]],
+                         [(True, "Alex", RELEASE, "Plan for the release.", "k3f9"),
+                          (False, "mac-agent@mac", RELEASE, "on it", None)])
+        # an agent-group that does not mark the owner's posts: a post with no agent is the owner's
+        bare = [{k: v for k, v in p.items() if k != "from_owner"} for p in raw]
+        res = self.act({"action": "chat_posts", "group": GROUP}, AgentGroup((0, json.dumps(bare), "")))
+        self.assertEqual([p.get("ref") for p in res["posts"]], ["k3f9", None])
+        res = self.act({"action": "chat_posts", "group": GROUP}, AgentGroup((0, json.dumps({"id": POST}), "")))
+        self.assertIn("not a list of posts", res["error"])
+
+    def test_a_chat_is_listed_with_its_topics(self):
+        raw = [chat(members=[ALICE, BOB], posts=5, last_post=5, topics=[dict(RELEASE, posts=2, last_post=2)]),
+               {k: v for k, v in chat(id=DASHED).items() if k != "topics"}]          # an agent-group that lists none
+        res = self.act({"action": "chat_list"}, AgentGroup((0, json.dumps(raw), "")))
+        self.assertEqual([(c["id"], c["members"], c["topics"]) for c in res["chats"]],
+                         [(GROUP, 2, [{"id": TOPIC, "title": "Release", "posts": 2, "last_post": 2}]), (DASHED, 0, [])])
+        res = self.act({"action": "chat_list"}, AgentGroup((0, json.dumps([chat(topics=["Release"])]), "")))
+        self.assertIn("does not list its topics as topics", res["error"])
+
+    def test_an_id_starting_with_a_dash_is_never_read_as_an_option(self):
+        dashed = "-" + REPLY[1:]
+        run = AgentGroup((0, "[]", ""))
+        self.assertTrue(self.act({"action": "chat_posts", "group": DASHED, "since": dashed}, run)["ok"])
+        self.assertEqual(run.calls[0][0], ["/bin/agent-group", "posts", "--json", "--as", "owner", "--since=" + dashed,
+                                           "--", DASHED])
+        run = AgentGroup((0, "posted", ""))
+        res = self.act({"action": "chat_post", "group": DASHED, "post": POST, "title": "Garden", "text": "hi",
+                        "topic": "-" + TOPIC[1:], "reply_to": dashed}, run)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(run.calls[0][0], ["/bin/agent-group", "post", "--as", "owner", "--id", POST,
+                                           "--topic=-" + TOPIC[1:], "--reply-to=" + dashed, "--", DASHED])
+
+    def test_a_post_goes_in_a_topic_opens_one_or_answers_a_post(self):
+        base = {"action": "chat_post", "group": GROUP, "post": POST, "title": "Shared", "text": "hi"}
+        for place, flags in (({"topic": TOPIC}, ["--topic=" + TOPIC]),
+                             ({"new_topic": "  -Release plan  "}, ["--new-topic=-Release plan"]),
+                             ({"reply_to": REPLY}, ["--reply-to=" + REPLY]),
+                             ({"topic": TOPIC, "reply_to": REPLY}, ["--topic=" + TOPIC, "--reply-to=" + REPLY]),
+                             ({"new_topic": "Aside", "reply_to": REPLY}, ["--new-topic=Aside", "--reply-to=" + REPLY]),
+                             ({"topic": None, "new_topic": None}, [])):
+            run = AgentGroup((0, "posted %s" % POST, ""))
+            res = self.act(dict(base, **place), run)
+            self.assertTrue(res["ok"], (place, res))
+            (argv, stdin), = run.calls
+            self.assertEqual(argv, ["/bin/agent-group", "post", "--as", "owner", "--id", POST] + flags + ["--", GROUP])
+            self.assertTrue(stdin.startswith("hi\n\n(Alex posted this"))
+        audit = [json.loads(line) for line in actions.AUDIT.read_text().splitlines()]
+        self.assertEqual([(a["topic"], a["new_topic"], a["reply_to"]) for a in audit],
+                         [(TOPIC, None, None), (None, "-Release plan", None), (None, None, REPLY),
+                          (TOPIC, None, REPLY), (None, "Aside", REPLY), (None, None, None)])
+        for place in ({"topic": "Release"}, {"reply_to": REPLY + "x"}, {"new_topic": "   "},
+                      {"new_topic": "a\tb"}, {"new_topic": "line separator"}, {"new_topic": "nel\x85"},
+                      {"new_topic": "é" * 101}, {"new_topic": 7}, {"new_topic": "Release", "topic": TOPIC}):
+            run = AgentGroup()
+            res = self.act(dict(base, **place), run)
+            self.assertFalse(res["ok"], place)
+            self.assertEqual(run.calls, [], place)
+        self.assertIsNone(chats.title_error("é" * 100, "topic"))         # 200 bytes: agent-group takes it
 
     def layout(self, *subs):
         return [{"name": "Work", "members": [], "subgroups": list(subs)}]
 
     def test_a_sub_group_s_chat_follows_it_from_two_named_agents_until_it_is_deleted(self):
-        made = {"id": GROUP, "title": "Web", "members": [], "maker": None}
+        made = details(title="Web")              # new and set --json answer as show --json does
         em = {"name": "Web", "members": [ROWS[0]["id"], ROWS[1]["id"], ROWS[3]["id"]], "id": SUB}
         solo = {"name": "Solo", "members": [ROWS[0]["id"], "99999999-2222-3333-4444-555555555555"], "id": SOLO}
         run = AgentGroup((0, json.dumps(made), ""))
@@ -165,14 +290,33 @@ class ChatTest(unittest.TestCase):
         # agent-group adds only a session that exists: an exited one (its tile still in the sub-group, shown offline)
         # would make it refuse the whole chat
         em = {"name": "Web", "members": [ROWS[0]["id"], ROWS[2]["id"], ROWS[3]["id"]], "id": SUB}
-        run = AgentGroup((0, json.dumps({"id": GROUP}), ""))
+        run = AgentGroup((0, json.dumps(details()), ""))
         self.assertEqual(subchats.sync(self.layout(em), ROWS, run), [])    # an exited agent is no problem
         self.assertEqual([argv for argv, _ in run.calls],
                          [["/bin/agent-group", "new", "--json", "--as", "owner", "--with", "alpha,gamma", "--", "Web"]])
 
+    def test_a_sub_group_s_chat_made_but_not_understood_is_kept_and_never_made_again(self):
+        # agent-group made the chat, but its answer does not check out (here, one that lists no members): the sync
+        # keeps the chat's id, so the next one changes it, not makes another
+        em = {"name": "Web", "members": [ROWS[0]["id"], ROWS[3]["id"]], "id": SUB}
+        older = {"id": GROUP, "title": "Web", "maker": None}
+        problems = subchats.sync(self.layout(em), ROWS, AgentGroup((0, json.dumps(older), "")))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('sub-group "Work / Web": agent-group made chat %s, but its answer is not understood' % GROUP,
+                      problems[0])
+        self.assertEqual(subchats.state()["chats"][SUB], {"chat": GROUP, "title": "Web", "members": ["alpha", "gamma"],
+                                                          "unnamed": []})
+        run = AgentGroup((0, json.dumps(details()), ""))
+        self.assertEqual(subchats.sync(self.layout(dict(em, name="Web 2")), ROWS, run), [])
+        self.assertEqual([argv[1] for argv, _ in run.calls], ["set"])          # the same chat, not a second one
+        # an answer with no id it can keep: the problem says the chat was made, though not which
+        problems = subchats.sync(self.layout(dict(em, id=SOLO)), ROWS, AgentGroup((0, json.dumps([]), "")))
+        self.assertIn("agent-group made the chat, but its answer is not understood", problems[0])
+        self.assertNotIn(SOLO, subchats.state()["chats"])
+
     def test_a_sub_group_sent_without_its_id_hides_no_chat(self):
         em = {"name": "Web", "members": [ROWS[0]["id"], ROWS[3]["id"]], "id": SUB}
-        self.act({"action": "groups", "groups": self.layout(em)}, AgentGroup((0, json.dumps({"id": GROUP}), "")))
+        self.act({"action": "groups", "groups": self.layout(em)}, AgentGroup((0, json.dumps(details()), "")))
         run = AgentGroup()                                     # an app older than sub-group chats sends no ids
         res = self.act({"action": "groups", "groups": self.layout({"name": "Web", "members": em["members"]})}, run)
         self.assertEqual(res["chat_problems"], ['sub-group "Work / Web" came without its id: relaunch the board app'])
@@ -181,13 +325,13 @@ class ChatTest(unittest.TestCase):
 
     def test_a_failed_sync_is_a_snapshot_problem_and_keeps_the_chat(self):
         em = {"name": "Web", "members": [ROWS[0]["id"], ROWS[3]["id"]], "id": SUB}
-        self.act({"action": "groups", "groups": self.layout(em)}, AgentGroup((0, json.dumps({"id": GROUP}), "")))
+        self.act({"action": "groups", "groups": self.layout(em)}, AgentGroup((0, json.dumps(details()), "")))
         run = AgentGroup((4, "", "agent-group: no group " + GROUP))
         res = self.act({"action": "groups", "groups": self.layout(dict(em, name="Web 2"))}, run)
         self.assertTrue(res["ok"])                             # the groups are stored all the same
         self.assertEqual(res["chat_problems"], ['sub-group "Work / Web 2": agent-group: no group ' + GROUP])
         self.assertEqual(subchats.state()["chats"][SUB]["title"], "Web")
-        listed = [{"id": GROUP, "title": "Web", "members": [], "hidden": False, "posts": 0, "last_post": None}]
+        listed = [chat(title="Web")]
         with tempfile.TemporaryDirectory() as d:
             col = fixtures.collector(d, chats=sources.Periodic(lambda: subchats.summary(AgentGroup((0, json.dumps(
                 listed), ""))), chats.REFRESH, None, True))
@@ -200,7 +344,7 @@ class ChatTest(unittest.TestCase):
         self.act({"action": "groups", "groups": self.layout()}, AgentGroup())     # makes the state file and lock
         folder = groups.GROUPS.parent
         folder.chmod(0o500)                                                      # the file can no longer be replaced
-        run = AgentGroup((0, json.dumps({"id": GROUP}), ""))
+        run = AgentGroup((0, json.dumps(details()), ""))
         try:
             with self.assertRaises(PermissionError):
                 subchats.sync(self.layout(em), ROWS, run)
@@ -212,9 +356,9 @@ class ChatTest(unittest.TestCase):
         em = {"name": "Web", "members": [ROWS[0]["id"], ROWS[3]["id"]], "id": SUB}
         groups.beside("subgroup-chats.log").mkdir(parents=True)   # the log cannot be written
         with self.assertRaises(IsADirectoryError):             # loud: the groups action answers with the error
-            subchats.sync(self.layout(em), ROWS, AgentGroup((0, json.dumps({"id": GROUP}), "")))
+            subchats.sync(self.layout(em), ROWS, AgentGroup((0, json.dumps(details()), "")))
         self.assertEqual(subchats.state()["chats"][SUB]["chat"], GROUP)
-        run = AgentGroup((0, json.dumps({"id": GROUP}), ""))
+        run = AgentGroup((0, json.dumps(details()), ""))
         with self.assertRaises(IsADirectoryError):
             subchats.sync(self.layout(dict(em, name="Web 2")), ROWS, run)
         self.assertEqual([argv[1] for argv, _ in run.calls], ["set"])   # the same chat, not a second one
@@ -243,7 +387,7 @@ class ChatTest(unittest.TestCase):
                  "live": True}
                 for i in range(chats.MAX_MEMBERS + 1)]
         big = {"name": "Big", "members": [r["id"] for r in rows], "id": SUB}
-        run = AgentGroup((0, json.dumps({"id": GROUP}), ""))
+        run = AgentGroup((0, json.dumps(details()), ""))
         problems = subchats.sync(self.layout(big), rows, run)
         self.assertEqual(problems, ['sub-group "Work / Big" has 17 named agents; its chat holds the first 16'])
         self.assertEqual(run.calls[0][0][6], ",".join(r["name"] for r in rows[:chats.MAX_MEMBERS]))
@@ -255,7 +399,7 @@ class ChatTest(unittest.TestCase):
 
     def test_a_hide_that_fails_is_a_problem_and_is_tried_again(self):
         em = {"name": "Web", "members": [ROWS[0]["id"], ROWS[3]["id"]], "id": SUB}
-        self.act({"action": "groups", "groups": self.layout(em)}, AgentGroup((0, json.dumps({"id": GROUP}), "")))
+        self.act({"action": "groups", "groups": self.layout(em)}, AgentGroup((0, json.dumps(details()), "")))
         res = self.act({"action": "groups", "groups": self.layout()}, AgentGroup((1, "", "agent-group: store locked")))
         self.assertEqual(res["chat_problems"], ['hiding the chat of sub-group "Web", which left the layout: '
                                                 'agent-group: store locked'])
@@ -266,8 +410,8 @@ class ChatTest(unittest.TestCase):
         self.assertTrue(subchats.state()["chats"][SUB]["gone"])
 
     def test_agent_group_s_failure_or_absence_is_the_error(self):
-        res = self.act({"action": "chat_list"}, AgentGroup((2, "", "agent-group: only members and alex read a group\n")))
-        self.assertEqual(res, {"ok": False, "error": "agent-group: only members and alex read a group"})
+        res = self.act({"action": "chat_list"}, AgentGroup((2, "", "agent-group: only members and Alex read a group\n")))
+        self.assertEqual(res, {"ok": False, "error": "agent-group: only members and Alex read a group"})
         res = self.act({"action": "chat_show", "group": GROUP}, AgentGroup((0, "not json", "")))
         self.assertIn("not JSON", res["error"])
         sources.find_bin = lambda name: None
@@ -285,16 +429,15 @@ class SnapshotTest(unittest.TestCase):
         sources.find_bin, groups.GROUPS = self.real
 
     def test_the_snapshot_carries_the_chats_and_says_when_they_fail(self):
-        listed = [{"id": GROUP, "title": "Garden", "members": [{"device": "desktop", "agent": "alpha"}],
-                   "maker": None, "task": None, "hidden": False, "created": 1, "updated": 2, "posts": 3, "last_post": 9}]
+        listed = [chat(members=[{"device": "desktop", "agent": "alpha"}], posts=3, last_post=9)]
         run = AgentGroup((0, json.dumps(listed), ""), (1, "", "agent-group: groups store unreadable"))
         with tempfile.TemporaryDirectory() as d:
             col = fixtures.collector(d, chats=sources.Periodic(lambda: subchats.summary(run), chats.REFRESH, None,
                                                                True))
             snap = col.snapshot(NOW)
             self.assertEqual(snap["chats"], {"chats": [{"id": GROUP, "title": "Garden", "hidden": False,
-                                                        "members": 1, "posts": 3, "last_post": 9, "subgroup": None,
-                                                        "unnamed": []}]})
+                                                        "members": 1, "posts": 3, "last_post": 9, "topics": [],
+                                                        "subgroup": None, "unnamed": []}]})
             self.assertEqual(snap["problems"], [])
             snap = col.snapshot(NOW + chats.REFRESH + 1)                    # the next read fails: the last value stays
             self.assertEqual(snap["chats"]["chats"][0]["posts"], 3)
@@ -328,10 +471,10 @@ class DoneByTest(unittest.TestCase):
         loader.exec_module(cli)
         sent.record("chat", "group chat Garden", "ship it", True, ref="k3f9", group=GROUP, post=POST)
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
-        os.environ["CODEX_THREAD_ID"] = "0190aaaa-0000-7000-8000-00000000a001"
+        os.environ["CODEX_THREAD_ID"] = "0190dddd-0000-7000-8000-00000000d001"
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["done", "k3f9", "-m", "shipped"]), 0)
-        self.assertEqual(sent.messages()[0]["done"]["by"], "0190aaaa-0000-7000-8000-00000000a001")
+        self.assertEqual(sent.messages()[0]["done"]["by"], "0190dddd-0000-7000-8000-00000000d001")
 
 
 class TimeTest(unittest.TestCase):

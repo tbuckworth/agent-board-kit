@@ -1,0 +1,16 @@
+[Unit]
+Description=agent-board: the desktop's voice, Kokoro text-to-speech on a Unix socket (agent-speech serve)
+
+[Service]
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin
+# Kokoro's model and voice come from Hugging Face's cache (agent-speech fetch, once): the daemon never goes online
+Environment=HF_HUB_OFFLINE=1
+# The speech venv (board/requirements-speech.txt, with PyTorch), not the kit's: README, "The ask box on the Mac"
+ExecStart=%h/.local/share/agent-kit/speech-venv/bin/python {{KIT_DIR}}/board/bin/agent-speech serve
+Restart=on-failure
+RestartSec=10
+# 2: the speech venv cannot import Kokoro or PyTorch; it stays stopped until it is set up (its journal says how)
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=default.target

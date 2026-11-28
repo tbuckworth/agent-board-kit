@@ -3,6 +3,7 @@
 
     agent-send [--from WHO] [--cli claude|codex] [--offline fail|resume] [--dangerous|--no-dangerous]
                [--raw] [--exact-id] [--dry-run] TARGET MESSAGE...    # or the message on stdin
+    agent-send [OPTIONS] --input-json TARGET < message.json     # {"text": ..., "files": [{"name", "data"}]}
     agent-send --list [--json] [--cli claude|codex]
 
 Details: README.md, section "agent-send".
@@ -17,15 +18,20 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agentmail import config, orchestrate, piped, registry  # noqa: E402
+from agentmail import codexqueue, config, orchestrate, piped, registry, replyfiles  # noqa: E402
 from agentmail.commands import CommandError  # noqa: E402
-from agentmail.deliver import write_receipt  # noqa: E402
+from agentmail.deliver import HELD, write_receipt  # noqa: E402
 from agentmail.registry import all_sessions, resolve, short  # noqa: E402
 from agentmail.send import (folder_gone, queue_codex, resume_claude, resume_codex, resume_place,  # noqa: E402
                             send_claude_socket, wrap)
 
 # What a failed delivery raises: reported as "delivery to X failed" with exit 1, the path the mailroom holds mail on.
 DELIVERY_ERRORS = (OSError, RuntimeError, ValueError, CommandError, subprocess.SubprocessError)
+# What agent-send says of a message `codex queue` took, by what became of it (codexqueue.follow).
+FOLLOWED = {codexqueue.DELIVERED: "delivered to", codexqueue.QUEUED: "queued for", codexqueue.UNCHECKED: "queued for",
+            codexqueue.HELD: "held in Codex's queue for"}
+# What it says of one typed at a Codex agent's idle prompt, by what became of it (codexqueue.paste).
+TYPED = {codexqueue.DELIVERED: "delivered to", codexqueue.UNCHECKED: "typed for"}
 
 
 # ---------------------------------------------------------------- sender identity
@@ -76,6 +82,10 @@ def main(argv=None):
     ap.add_argument("--list", action="store_true", help="print the address book")
     ap.add_argument("--json", action="store_true", help="with --list: JSON output")
     ap.add_argument("--dry-run", action="store_true", help="resolve and report, send nothing")
+    ap.add_argument("--input-json", action="store_true",
+                    help='read the message and its files from stdin, {"text": TEXT, "files": [{"name": NAME, "data": '
+                         'BASE64}, ...]} as a Mail-tab reply gives them; the files are saved for the session, and the '
+                         'message ends with their paths')
     a = ap.parse_args(argv)
 
     if a.list:
@@ -84,12 +94,35 @@ def main(argv=None):
         ap.print_usage()
         return 1
 
-    body = " ".join(a.message).strip()
-    if not body:
-        body = (piped.piped_text() or "").strip()       # only what was piped in: never the tool's open socket
-    if not body:
+    files = []
+    if a.input_json:
+        from agentmail import mailbox       # here, not above: its imports would slow every other send
+        if a.message:
+            print("agent-send: with --input-json the message is in the JSON on stdin, not on the command line",
+                  file=sys.stderr)
+            return 1
+        try:
+            body, files = mailbox.piped_input("the message")
+        except mailbox.MailError as e:
+            print("agent-send: --input-json: %s" % e, file=sys.stderr)
+            return 1
+        body = body.strip()
+    else:
+        body = " ".join(a.message).strip()
+        if not body:
+            body = (piped.piped_text() or "").strip()       # only what was piped in: never the tool's open socket
+    if not body and not files:
         print("agent-send: empty message", file=sys.stderr)
         return 1
+
+    def message():
+        """body, then the lines that tell its reader where its files are, saved for it under replyfiles.FILES_DIR
+        (replyfiles.attach); for a dry run, their names, saved nowhere."""
+        if not files:
+            return body
+        if a.dry_run:
+            return replyfiles.with_lines(body, "[files, not saved in a dry run: %s]" % ", ".join(n for n, _ in files))
+        return replyfiles.with_lines(body, replyfiles.attach(replyfiles.FILES_DIR, files, a.sender or default_from()))
 
     if a.exact_id:
         sess, code, cands = registry.by_id(all_sessions(a.cli), a.target)
@@ -102,11 +135,12 @@ def main(argv=None):
     if code == 4 or (code == 0 and not sess["live"]):
         # the orchestrator has no long-lived session: a message to it runs one event
         if a.target.lower() == registry.orchestrator_name().lower():
-            text = body if a.raw else wrap(body, a.sender or default_from())
+            said = message()
+            text = said if a.raw else wrap(said, a.sender or default_from())
             if a.dry_run:
                 print("would run the orchestrator once with:\n---\n" + text)
                 return 0
-            info = orchestrate.run_event("[message from %s via agent-send]\n%s" % (a.sender or default_from(), body)
+            info = orchestrate.run_event("[message from %s via agent-send]\n%s" % (a.sender or default_from(), said)
                                          if a.raw else text, "peer", config.load())
             if info["ok"]:
                 print("orchestrator ran: $%s, %s turns, %ss\n%s" % (info["cost"], info["turns"], info["duration_s"], info["result"][:600]))
@@ -122,7 +156,8 @@ def main(argv=None):
         print("agent-send: no session matches '%s' (try --list)" % a.target, file=sys.stderr)
         return 4
 
-    text = body if a.raw else wrap(body, a.sender or default_from())
+    said = message()
+    text = said if a.raw else wrap(said, a.sender or default_from())
     label = "%s %s [%s] %s" % (sess["cli"], sess["name"] or "(unnamed)", short(sess["id"]), "live" if sess["live"] else "offline")
 
     def accepted():
@@ -137,7 +172,8 @@ def main(argv=None):
     if a.dry_run:
         print("would send to", label)
         route = ("socket " + str(sess.get("socket"))) if sess["cli"] == "claude" and sess["live"] \
-            else "codex queue" if sess["live"] else ("resume" if a.offline == "resume" else "fail (offline)")
+            else "typed at its idle prompt, else codex queue" if sess["live"] \
+            else ("resume" if a.offline == "resume" else "fail (offline)")
         if route == "resume" and sess["cli"] == "claude":
             try:
                 route += " " + (resume_place(sess, dry_run=True)[1] or "on the login it ran with")
@@ -155,11 +191,24 @@ def main(argv=None):
             print("sent to %s via inbox socket%s" % (label, (" (" + ack + ")") if ack else ""))
             return 0
         if sess["cli"] == "codex" and sess["live"]:
+            mark = codexqueue.before(sess["id"])
+            # typed at its idle prompt when nothing is in the way, which Codex takes at once; else its queue
+            got, not_typed = codexqueue.paste(sess, mark, text)
+            if got:
+                accepted()
+                print("%s %s\n%s" % (TYPED[got.state], label, got.why))
+                return 0
             ok, out = queue_codex(sess, text)
             if ok:
                 accepted()
-                print("queued for %s: %s" % (label, out))
-                return 0
+                # whether Codex took it, or holds it, said on the last line: what the mailroom and the board show
+                try:
+                    got = codexqueue.follow(sess, mark, out)
+                except DELIVERY_ERRORS as e:   # it is in the queue: an error now must not read as a failed send
+                    got = codexqueue.Outcome(codexqueue.UNCHECKED, "whether it arrived could not be checked: %s" % e)
+                print("%s %s (%s; not typed at its prompt: %s)\n%s" % (FOLLOWED[got.state], label, out, not_typed,
+                                                                         got.why))
+                return HELD if got.state == codexqueue.HELD else 0
             if "No active session" in out:
                 sess["live"] = False
                 label = label.replace("live", "offline")

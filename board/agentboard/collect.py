@@ -169,16 +169,14 @@ class RetryMemo:
         self.memo = {k: v for k, v in self.memo.items() if k in keys}
 
 
-def tmux_name(reg_tmux):
-    """Claude registers tmux as "session:@window.%pane"; the session name is what attach needs."""
-    return (reg_tmux or "").split(":", 1)[0]
-
-
 class Collector:
     """Reads the agents (agents()) and assembles the board's snapshot (snapshot()). usage, gmail, worktrees,
-    desktop, meetings and mailbox are the caches whose sections the snapshot carries (Usage, GmailState, worktree_scan,
-    desktop_info, meetings.Meetings, a Periodic of mailbox.summary); prs (PullRequests) feeds the agents' git chips and
-    the worktree rows; sent and restart are the agentboard modules whose counts and status it carries.
+    desktop, keyring, meetings and mailbox are the caches whose sections the snapshot carries (Usage, GmailState,
+    worktree_scan, desktop_info, keyring.watch, meetings.Meetings, a Periodic of mailbox.summary); security_alerts
+    reads the mailroom's recent security alerts (sources.security_alerts) with each snapshot, for the Mac's
+    notifications; prs (PullRequests) feeds the agents' git chips and the worktree rows; sent and restart are the
+    agentboard modules whose counts and status it carries; logins gives the logins a new agent can be started on by
+    name (sources.manual_logins), read with each snapshot.
     Whether the owner has read an agent's mail (is_read) comes from gmail and mailbox together.
     None leaves a section out. The other arguments replace the readers their defaults name."""
 
@@ -186,7 +184,8 @@ class Collector:
                  claude=sources.claude_sessions_all, panes=sources.tmux_list_panes, prs=None, gmail=None,
                  worktrees=None, desktop=None, restored=None, waits=sources.stuck_waits, routing=sources.claude_routing,
                  stops=sources.last_turn_failed, stuck_mail=sources.stuck_mail, sent=None, restart=None,
-                 chats=None, meetings=None, mailbox=None):
+                 chats=None, meetings=None, mailbox=None, security_alerts=sources.security_alerts, keyring=None,
+                 logins=None):
         self.events = events or sources.EventLog()
         self.codex = codex or sources.CodexReader()
         self.mail = mail or sources.MailStore()
@@ -198,10 +197,13 @@ class Collector:
         self.gmail = gmail
         self.worktrees = worktrees
         self.desktop = desktop
+        self.keyring = keyring                 # the browser's keyring on the desktop, with login beside it (None: off)
         self.sent, self.restart = sent, restart
         self.chats = chats                     # a sources.Periodic of subchats.summary, for the Mac's Chats button
         self.meetings = meetings               # for the Mac's meeting alerts (None: off, no meetings section)
         self.mailbox = mailbox                 # the Mail tab's unread count, and what the owner has read there
+        self.security_alerts = security_alerts  # the mailroom's recent security alerts, for the Mac's notifications
+        self.logins = logins                   # the start dialog's logins besides Automatic
         self.restored_fn = restored            # {id: (restored_at, activity before)}: keep quiet agents' colours
         self.panes_fn = panes
         self.panes, self.tmux_names = {}, {}   # pane pid -> session; session -> its panes' directories
@@ -216,8 +218,8 @@ class Collector:
         self.stops = RetryMemo(300)            # (session id, limit/error ts) -> transcript ends on a failed request?
         # what a manual refresh reads again, and whose errors the snapshot lists, by the name it lists them under
         self.caches = {name: c for name, c in (
-            ("usage", usage), ("Gmail", gmail), ("worktrees", worktrees), ("Desktop", desktop), ("pull requests", prs),
-            ("meetings", meetings), ("mailbox", mailbox), ("tmux", self.tmux),
+            ("usage", usage), ("Gmail", gmail), ("worktrees", worktrees), ("Desktop", desktop), ("keyring", keyring),
+            ("pull requests", prs), ("meetings", meetings), ("mailbox", mailbox), ("tmux", self.tmux),
             ("background waits", self.waits),
             ("stuck mail", self.stuck)) if c is not None}
         self.problems = []                     # {source, error}: what failed in the last agents() and snapshot()
@@ -362,7 +364,7 @@ class Collector:
                 ms["gmail_thread"] = self.gmail.thread_of(ms["last_out_id"])
             if not s["live"] and not classify.keep_offline(ev, ms, last_activity, now):
                 continue
-            tm = tmux_name(s.get("tmux"))
+            tm = sources.tmux_name(s.get("tmux"))
             if not tm and s["live"] and s.get("pid"):
                 tm = sources.tmux_session_for(int(s["pid"]), panes)
             a = {
@@ -386,7 +388,7 @@ class Collector:
                 a["events"] = a["events"][-10:]
                 # what "offline" leaves behind: the directory/worktree, and possibly an empty tmux session
                 a["left_behind"] = {"cwd_exists": bool(a["cwd"]) and os.path.isdir(a["cwd"]),
-                                    "tmux": self._own_tmux(a["cwd"], a["name"], tmux_name(s.get("tmux")))}
+                                    "tmux": self._own_tmux(a["cwd"], a["name"], sources.tmux_name(s.get("tmux")))}
             rows.append(a)
 
         if with_git:
@@ -423,9 +425,10 @@ class Collector:
 
     def snapshot(self, now=None):
         """The board's JSON snapshot: agents, timeline, summary, mail, and the section of each cache and module the
-        collector was given. It ticks no message off (tick_seen() does that); the one file it can write is the Codex
-        credits state, through the usage cache's annotate step. A source that fails is left out or kept at its last
-        reading, and listed in "problems" ({source, error})."""
+        collector was given, and "spawn_logins" (its `logins`'). It ticks no message off (tick_seen() does that); the
+        files it can write are the Codex credits state, the usage readings for the usage breakdown and the spend
+        meters' transcript cache, through the usage cache's annotate step. A source that fails is left out or kept at
+        its last reading, and listed in "problems" ({source, error})."""
         now = now or time.time()
         rows, mail, evs = self.agents(now)
         names = {a["id"]: a["display"] for a in rows}
@@ -454,6 +457,11 @@ class Collector:
             "problems": self.problems,
         }
         problems = snap["problems"]
+        if self.logins is not None:
+            try:
+                snap["spawn_logins"] = self.logins()           # the start dialog's logins besides Automatic
+            except (OSError, ValueError, RuntimeError, ImportError) as e:
+                problems.append({"source": "the mailroom's logins", "error": sources.error_text(e)})
         if self.usage is not None:
             snap["usage"] = self.usage.maybe_refresh(now)
             self.mark_logins(rows, snap["usage"].get("accounts") or [], now)
@@ -478,10 +486,26 @@ class Collector:
             if value is not None:             # until the first read ends, the Mac keeps the meetings it has
                 snap["meetings"] = {k: value[k] for k in ("notify_minutes", "fullscreen_minutes", "events")}
                 problems += [{"source": "meetings: %s calendar" % f["calendar"], "error": f["error"]} for f in value["failed"]]
+        if self.security_alerts is not None:
+            try:
+                alerts, bad = self.security_alerts(now)
+            except OSError as e:              # left out: the Mac keeps what it has notified
+                problems.append({"source": "security alerts", "error": sources.error_text(e)})
+            else:
+                snap["security_alerts"] = alerts
+                if bad:
+                    problems.append({"source": "security alerts", "error": "%d line(s) of %s are not alerts"
+                                     % (bad, sources.SECURITY_ALERTS.name)})
         if self.worktrees is not None:
             snap["worktrees"] = self.worktree_section(rows, now)
         if self.desktop is not None:
             snap["desktop"] = dict(self.desktop.maybe_refresh(now))
+        if self.keyring is not None:
+            value = self.keyring.maybe_refresh(now)
+            if value is not None:             # None until the first read ends
+                snap["keyring"] = value
+                problems += [{"source": "keyring (%s)" % name, "error": c["error"]}
+                             for name, c in value["collections"].items() if c["error"]]
         if self.restart is not None:
             try:
                 st = self.restart.status()
@@ -504,11 +528,15 @@ class Collector:
 
     def is_read(self, message_id):
         """Whether the owner has read the agent mail with this Message-ID: True when the Mail tab counts it read (the
-        mailbox's last summary) or Gmail does, else Gmail's answer (False, or None when Gmail cannot tell or is not
-        asked). Needs gmail or mailbox."""
+        mailbox's last summary). Otherwise, for mail in the tab alone (sources.tab_only), the tab's answer: False once
+        there is a summary, which lists every agent mail the tab counts read from the last 8 days (the mailroom's
+        SUMMARY_READ_DAYS), more than the week of mail the collector reads (MailStore.read), and None before. For other
+        mail, Gmail's answer (True, False, or None when Gmail cannot tell or is not asked). Needs gmail or mailbox."""
         tab = self.mailbox.value if self.mailbox is not None else None
         if tab and sources.norm_id(message_id) in tab["read"]:
             return True
+        if sources.tab_only(message_id):
+            return None if tab is None else False
         return self.gmail.is_read(message_id) if self.gmail is not None else None
 
     def mark_logins(self, rows, accounts, now):

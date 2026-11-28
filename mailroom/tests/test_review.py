@@ -1,4 +1,3 @@
-import base64
 import contextlib
 import email
 import email.policy
@@ -21,13 +20,14 @@ TMP = tempfile.mkdtemp()
 import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail)
 import fakes  # noqa: E402
 import homes  # noqa: E402
+import pictures  # noqa: E402
 from scripts import load_script  # noqa: E402
-from agentmail import config, headless, outbound, registry, review  # noqa: E402
+from agentmail import compose, config, headless, outbound, registry, review  # noqa: E402
 from agentmail.store import Store  # noqa: E402
 
 OWNER = "owner@example.com"
 OWNER_NAME = config.load()["owner_name"]
-PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+PNG = pictures.png(1600, 900)        # wide enough to look sharp (review.MIN_IMAGE_WIDTH)
 LONG = "**Results of the run.**\n\n" + " ".join("word%d" % i for i in range(200)) + "\n"
 PROSE = ("The second run finished overnight and the scores moved the way we expected, although the gap between "
          "the two models is smaller than the first run suggested. I checked the logs for every attempt and found "
@@ -65,6 +65,16 @@ class Render(unittest.TestCase):
         self.assertIn("| a | 1", shown)
         self.assertIn("[IMAGE embedded: accuracy]", shown)
         self.assertIn("doc <https://d.example/doc>", shown)
+
+    def test_a_link_whose_words_are_its_address_is_read_once(self):
+        """agent-mail links a bare address in plain text; the reviewer reads (and the word count counts) it once, as
+        typed, while a link with words of its own is still followed by where it goes."""
+        text = "The page is at https://claude.ai/artifact/abc-123, the PR at [#12](https://github.com/x/y/pull/12)."
+        self.assertIn("https://claude.ai/artifact/abc-123</a>", compose.text_to_html(text))
+        self.assertEqual(review.render(text),
+                         "The page is at https://claude.ai/artifact/abc-123, the PR at #12 "
+                         "<https://github.com/x/y/pull/12>.")
+        self.assertEqual(review.render("", '<a href="https://x.y/z">https://x.y/z</a>'), "https://x.y/z")
 
     def test_text_is_rendered_the_way_agent_mail_renders_it(self):
         shown = review.render("**Bottom line:** works\n\n- one\n- two\n")
@@ -115,6 +125,15 @@ class Checks(unittest.TestCase):
                           owner_name=OWNER_NAME)
         self.assertEqual(len(out), 3)
         self.assertEqual(review.lint("t", '<img src="cid:fig">', [("fig", PNG)], owner_name=OWNER_NAME), [])
+
+    def test_lint_an_image_too_narrow_to_look_sharp(self):
+        narrow = [("grainy", pictures.png(760, 489)), ("fine", pictures.png(1200, 700)),
+                  ("demo", pictures.gif(640, 400)), ("photo", pictures.jpeg(1000, 800))]
+        out = review.lint("t", None, narrow, owner_name=OWNER_NAME)
+        self.assertEqual(len(out), 2, out)
+        self.assertIn("Image grainy is 760 px wide, so it looks grainy on %s's screens" % OWNER_NAME, out[0])
+        self.assertIn("at least 1200 px wide", out[0])
+        self.assertIn("Image photo is 1000 px wide", out[1])       # a GIF, a screen recording mostly, is let off
 
     def test_hints(self):
         h = review.hints("The plot is at /home/alex/tmp/p.png.\n\n| a | b |\n| 1 | 2 |\n", owner_name=OWNER_NAME)
@@ -352,6 +371,15 @@ class Gate(unittest.TestCase):
         self.assertIsNone(self.gate(text="key: " + key, no_review="a dummy key in a test fixture")[1])
         self.assertEqual(review.secrets("tokens look like sk-ant-..., ghp_..."), [])
 
+    def test_a_fast_mode_reply_skips_the_checks_and_the_model_but_not_the_credential_check(self):
+        review.ask_model = FakeModel()   # any call to it fails the test
+        rid, stop, tips = self.gate(text=CUT + LONG, fast=True)   # hard-wrapped, long: the checks would hold it
+        self.assertEqual((stop, tips), (None, None))
+        self.assertEqual([(r["id"], r["verdict"], r["kind"]) for r in self.rows()], [(rid, "skipped", "fast")])
+        key = "sk-ant-api03-" + "x" * 40
+        stop = self.gate(text="key: " + key, fast=True)[1]
+        self.assertIn("an Anthropic or OpenAI API key ('sk-ant...')", stop)
+
     def test_short_mail_skips_the_model(self):
         review.ask_model = FakeModel()
         rid, stop, tips = self.gate(text="Done: merged PR 12. Nothing needed from you.")
@@ -470,7 +498,7 @@ class Gate(unittest.TestCase):
 class Args:
     def __init__(self, **kw):
         self.__dict__.update(dict(body_file=None, html=None, session=None, cli=None, cc=None, unrouted=False,
-                                  image=None, attach=None, no_review=None, subject=None))
+                                  alert=None, image=None, attach=None, no_review=None, subject=None))
         self.__dict__.update(kw)
 
 
@@ -653,6 +681,9 @@ class AgentMail(unittest.TestCase):
         bad = Path(TMP) / "x.png"
         bad.write_text("not an image")
         with self.assertRaisesRegex(outbound.MailError, "not a PNG"):
+            outbound.load_images(["fig=%s" % bad])
+        bad.write_bytes(pictures.png(1600, 900)[:20])                  # a PNG cut short before its size
+        with self.assertRaisesRegex(outbound.MailError, "image fig is a PNG file whose header gives no size"):
             outbound.load_images(["fig=%s" % bad])
         with self.assertRaisesRegex(outbound.MailError, "NAME=PATH"):
             outbound.load_images(["no-equals-sign"])

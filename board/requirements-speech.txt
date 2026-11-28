@@ -1,0 +1,104 @@
+# The desktop's voice (bin/agent-speech, agentboard/speech.py): Kokoro and everything it needs, pinned, for a venv of
+# its own; optional, and only for the Mac's ask box to speak (README, "The ask box on the Mac"). PyTorch is not here:
+# install it into the venv first, as its CUDA libraries depend on the machine.
+#   python3 -m venv ~/.local/share/agent-kit/speech-venv
+#   ~/.local/share/agent-kit/speech-venv/bin/pip install torch
+#       (the default Linux wheel has CUDA; for the CPU alone: --index-url https://download.pytorch.org/whl/cpu)
+#   ~/.local/share/agent-kit/speech-venv/bin/pip install --no-deps -r board/requirements-speech.txt
+#   agent-speech fetch          # Kokoro's model and voice, ~330 MB, once
+# --no-deps keeps pip from fetching another torch; these pins (pip's resolution for kokoro 0.9.4 with misaki[en] 0.9.4,
+# against torch 2.11.0) hold torch's own pure-Python needs too. A venv made with --system-site-packages reuses a torch
+# installed already instead; add --ignore-installed to the last pip so each pin still lands in the venv.
+# espeakng-loader carries espeak-ng's library and data, for words misaki's lexicon lacks: nothing is installed outside
+# the venv.
+addict==2.4.0
+annotated-doc==0.0.7
+annotated-types==0.8.0
+anyio==4.16.0
+attrs==26.1.0
+babel==2.18.0
+blis==1.3.4
+catalogue==2.0.10
+certifi==2026.11.20
+charset-normalizer==3.5.3
+click==8.5.1
+cloudpathlib==0.26.0
+cloudpickle==3.1.3
+confection==1.3.4
+csvw==4.2.0
+curated-tokenizers==0.0.10
+curated-transformers==0.1.1
+cymem==2.0.16
+dlinfo==2.0.0
+docopt==0.6.2
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+espeakng-loader==0.2.4
+filelock==4.3.1
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.8.0
+httpcore2==2.16.2
+httpcore==1.0.9
+httpx2==2.16.2
+httpx==0.28.1
+huggingface_hub==2.4.0
+idna==3.20
+isodate==0.7.2
+Jinja2==3.1.6
+joblib==1.6.0
+jsonschema-specifications==2025.9.1
+jsonschema==4.26.0
+kokoro==0.9.4
+language-tags==1.3.2
+loguru==0.8.0
+markdown-it-py==4.3.0
+MarkupSafe==3.0.4
+mdurl==0.1.2
+misaki==0.9.4
+mpmath==1.3.0
+murmurhash==1.0.16
+networkx==3.7
+num2words==0.5.14
+numpy==2.5.5
+packaging==26.4
+phonemizer-fork==3.3.2
+preshed==3.0.15
+pydantic==2.14.4
+pydantic_core==2.50.5
+Pygments==2.21.0
+pyparsing==3.3.3
+python-dateutil==4.0.0
+PyYAML==6.0.4
+rdflib==7.6.0
+referencing==0.37.0
+regex==2026.11.23
+requests==2.34.2
+rfc3986==1.5.0
+rich==15.0.0
+rpds-py==2026.9.1
+safetensors==0.8.0
+segments==2.4.0
+setuptools==81.0.0
+shellingham==1.5.4
+smart_open==10.0.0
+spacy-curated-transformers==0.3.1
+spacy-legacy==3.0.12
+spacy-loggers==1.0.5
+spacy==3.8.18
+srsly==2.5.6
+sympy==1.14.0
+termcolor==3.3.0
+thinc==8.3.14
+tokenizers==0.23.3
+tqdm==4.70.1
+transformers==5.24.0
+truststore==0.10.5
+typer==0.29.2
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+tzdata==2026.6
+uritemplate==4.2.0
+urllib3==2.8.0
+wasabi==1.1.3
+weasel==1.0.1
+wrapt==2.5.2

@@ -14,6 +14,10 @@ AGENT_SEND = Path(__file__).resolve().parent.parent / "bin" / "agent-send"
 # agent-send's exit codes for a session that cannot take a message until someone starts it again: not live and not
 # resumed (2), no such session (4), its folder removed (5). A Mac answers a delivery with the same codes.
 SESSION_GONE = (2, 4, 5)
+# agent-send's exit code for a message a live Codex agent took into its queue and holds there (agentmail/codexqueue.py
+# says when): accepted, its receipt written, so never to be sent again, but not delivered; the output's last line says
+# why. 7, not 6, which agent-mail exits with for a Mail-tab reply it refuses (mailbox.ANSWER_REFUSED).
+HELD = 7
 
 
 def agent_send_bin():
@@ -47,6 +51,7 @@ def _send(cmd, target, text, timeout):
 
     agent-send writes acceptance before memory capping or printing. A restart can
     otherwise lose its stdout even after the session has received the message.
+    A HELD exit is agent-send's own answer, its receipt written too, and is kept.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
@@ -60,7 +65,7 @@ def _send(cmd, target, text, timeout):
             rc, out = r.returncode, (r.stdout + r.stderr).strip()
         except (OSError, subprocess.SubprocessError) as e:
             failure = e
-        if (failure is not None or rc != 0) and receipt_written(path, target, text):
+        if (failure is not None or rc not in (0, HELD)) and receipt_written(path, target, text):
             return 0, "session accepted the message; transport receipt verified after sender interruption"
         if failure is not None:
             raise failure
@@ -70,19 +75,19 @@ def _send(cmd, target, text, timeout):
 def deliver(cli, session_id, text, resume, dangerous, timeout=240):
     """Hand text to session_id through agent-send (a subprocess); an offline session is resumed only when resume,
     and then with permissions bypassed only when dangerous. Returns (exit_code, output): 0 sent/queued/resumed,
-    a SESSION_GONE code when the session cannot take it, else error."""
+    HELD when a Codex agent holds it in its queue, a SESSION_GONE code when the session cannot take it, else error."""
     cmd = [agent_send_bin(), "--raw", "--exact-id", "--cli", cli, "--offline", "resume" if resume else "fail"]
     cmd.append("--dangerous" if dangerous else "--no-dangerous")
     return _send(cmd, session_id, text, timeout)
 
 
-def deliver_session(session, text, cfg):
-    """Known origin only. Remote sessions are never resumed, even if local resume is enabled."""
+def deliver_session(session, text, cfg, resume):
+    """Hand text to the session of sessions row session, on its own machine. Here an offline session is resumed only
+    when resume (config resume_offline for mail; never for a notice); a remote session is never resumed."""
     host = session["origin_host"]
     if host == cfg["host_id"]:
         try:
-            return deliver(session["cli"], session["session_id"], text,
-                           cfg["resume_offline"], cfg["resume_dangerous"])
+            return deliver(session["cli"], session["session_id"], text, resume, cfg["resume_dangerous"])
         except (OSError, subprocess.SubprocessError) as e:
             return 1, str(e)
     # The receiving Codex can answer without guessing its identity.
@@ -94,7 +99,8 @@ def deliver_session(session, text, cfg):
 
 def deliver_named(agent, text, timeout):
     """Hand text to this machine's session named agent (registry.by_name) through agent-send, never resuming it.
-    Returns (exit code, output): 0 sent or queued, 2 not live, 3 several live sessions have that name, 4 none has."""
+    Returns (exit code, output): 0 sent or queued, HELD held in a Codex agent's queue, 2 not live, 3 several live
+    sessions have that name, 4 none has."""
     sess, code, cands = registry.by_name(registry.all_sessions(), agent)
     if code == 4:
         return 4, "no session is named %s" % agent

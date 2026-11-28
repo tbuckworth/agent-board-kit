@@ -18,7 +18,7 @@ import isolate_state  # noqa: E402,F401  (temporary state dirs; before agentmail
 import fakes  # noqa: E402
 import homes  # noqa: E402
 from scripts import load_script  # noqa: E402
-from agentmail import config, failover, switch  # noqa: E402
+from agentmail import config, failover, launch, switch, usage  # noqa: E402
 
 HOST = config.DEFAULTS["host_id"]
 WORK = tempfile.mkdtemp()
@@ -125,35 +125,45 @@ class Switching(unittest.TestCase):
         sess = kw.pop("sess", None) or {"id": st["id"], "name": st["name"], "cli": st["cli"], "account": st["account"],
                                         "live": True}
         lookup = (lambda found: {"side_effect": found} if isinstance(found, Exception) else {"return_value": found})
+
+        def locked():   # calls["locked"]: whether the keys lock was taken at each stop and start
+            calls.setdefault("locked", []).append(fakes.keys_taken())
         stopped = kw.pop("stopped", True)   # whether the SIGKILLed agent exits
+        real_models = switch.claude_models
+
+        def claude_models(account, cfg):   # a one-model login's catalog starts no claude: that one is the real one
+            one = switch.fixed_model_of(usage.settings(cfg), "claude", account)
+            return real_models(account, cfg) if one else CLAUDE_MODELS
         # switch() is the decision under test: each step that would reach the agent or a CLI is a stand-in (its
         # lookup, the CLIs' model catalogs, stopping it, the move and relaunches in its pane, its files), each
         # driven for real elsewhere (test_resolve, ClaudeModels, StartCodex, test_failover's Move)
         patches = [mock.patch.object(switch, "find", return_value=sess),
                    mock.patch.object(switch, "state", return_value=st),
-                   mock.patch.object(switch, "claude_models", return_value=CLAUDE_MODELS),
+                   mock.patch.object(switch, "claude_models", side_effect=claude_models),
                    mock.patch.object(switch, "codex_models", return_value=CODEX_MODELS),
                    mock.patch.object(switch.failover, "migrate",
                                      side_effect=lambda *a, **k: calls.setdefault("migrate", (a, k)) and (True, "moved")),
                    mock.patch.object(switch, "relaunch_codex",
                                      side_effect=lambda *a: calls.setdefault("codex", a) and (True, "resumed")),
-                   mock.patch.object(switch, "stop", side_effect=lambda pid: bool(calls.setdefault("stop", pid)) and stopped),
+                   mock.patch.object(switch, "stop", side_effect=lambda pid: locked() or (
+                       bool(calls.setdefault("stop", pid)) and stopped)),
                    mock.patch.object(switch.claude_session, "transcript", **lookup(transcript)),
                    mock.patch.object(switch.registry, "codex_rollout", **lookup(rollout)),
                    mock.patch.object(switch.claude_session, "background_jobs", return_value=[]),
                    mock.patch.object(switch, "write_handoff", return_value=Path("/h/agent-x-handoff.md")),
                    mock.patch.object(switch, "start_codex", side_effect=kw.pop("start_error", None) or (
-                       lambda st_, m, e, brief, codex: calls.setdefault("start_codex", (m, e, brief))
-                       and (kw.pop("new_id", "thread-2"), kw.pop("queue_error", ""), kw.pop("notes", [])))),
+                       lambda st_, m, e, brief, codex: locked() or (calls.setdefault("start_codex", (m, e, brief))
+                       and (kw.pop("new_id", "thread-2"), kw.pop("queue_error", ""), kw.pop("notes", []))))),
                    mock.patch.object(switch, "start_claude",
-                                     side_effect=lambda st_, dst_dir, m, e, brief, claude:
-                                     calls.setdefault("start_claude", (dst_dir, m, e, brief)) and kw.pop("new_id", "sess-2"))]
+                                     side_effect=lambda st_, dst_dir, m, e, brief, claude, s: locked() or (
+                                         calls.setdefault("start_claude", (dst_dir, m, e, brief))
+                                         and kw.pop("new_id", "sess-2")))]
         rehome = mock.Mock(return_value=1)
         trust = kw.pop("trust", lambda cwd, config_dir: calls.setdefault("trust", (cwd, config_dir)))
         with contextlib.ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            res = switch.switch("agent-x", CFG, rehome=rehome, preamble=lambda st_, cli: "PREAMBLE ",
+            res = switch.switch("agent-x", kw.pop("cfg", CFG), rehome=rehome, preamble=lambda st_, cli: "PREAMBLE ",
                                 claude="/bin/claude", codex="/bin/codex", trust=trust,
                                 **{k: v for k, v in kw.items() if k not in ("new_id", "queue_error", "notes")})
         return res, calls, rehome
@@ -236,6 +246,23 @@ class Switching(unittest.TestCase):
         rehome.assert_called_once_with("claude", "11111111-1111-1111-1111-111111111111", "codex", "thread-2",
                                        "agent-x", "/w")
         self.assertIn("mail routing moved", res["detail"])
+
+    def test_a_handoff_holds_the_keys_lock_from_the_kill_until_the_new_agent_has_started(self):
+        for to, cli in (("codex", "claude"), ("claude:work", "codex")):
+            with self.subTest(to=to):
+                res, calls, _ = self.run_switch(agent(cli, None, "gpt-6.1-sol", "xhigh") if cli == "codex" else agent(),
+                                                to=to)
+                self.assertTrue(res["ok"], res)
+                self.assertEqual(calls["locked"], [True, True])
+                self.assertFalse(fakes.keys_taken())
+
+    def test_a_handoff_whose_keys_lock_is_not_had_in_time_stops_nothing(self):
+        with fakes.keys_held_elsewhere(), mock.patch.object(switch.commands, "LOCK_WAIT_SECONDS", 0.2):
+            res, calls, rehome = self.run_switch(agent(), to="codex")
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["detail"].startswith("nothing stopped: "), res["detail"])
+        self.assertNotIn("stop", calls)
+        rehome.assert_not_called()
 
     def test_a_handoff_removes_the_killed_claudes_registry_entry(self):
         home = Path(tempfile.mkdtemp())
@@ -383,6 +410,79 @@ class Chained(unittest.TestCase):
         self.assertEqual(switch.carry_forward("an ordinary brief", ["x"]), ("an ordinary brief", ["x"]))
 
 
+class PerTokenLogin(unittest.TestCase):
+    """gemini, a login with a model of its own (and billed per token): switching onto it runs that model, switching
+    off it runs the other login's, and it offers that one model alone."""
+
+    run_switch = Switching.run_switch   # switch() with the agent and the CLIs stood in for
+
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(CFG))
+        self.cfg["usage"]["claude_accounts"]["gemini"] = homes.per_token_login(self)
+        self.gem = dict(agent(account="gemini", model=homes.NEON, effort="high"))
+
+    def test_onto_it_its_model_and_only_its_model(self):
+        res, calls, _ = self.run_switch(agent(), to="claude:gemini", cfg=self.cfg)
+        self.assertTrue(res["ok"], res)
+        args, kw = calls["migrate"]
+        self.assertEqual((args[1], kw["overrides"]), ("gemini", {"--model": homes.NEON, "--effort": "xhigh"}))
+        self.assertEqual(res["to"], "Claude Code (gemini login), %s at effort xhigh" % homes.NEON)
+        res, calls, _ = self.run_switch(agent(), to="claude:gemini", model=homes.NEON, effort="low",
+                                             cfg=self.cfg)
+        self.assertEqual(calls["migrate"][1]["overrides"], {"--model": homes.NEON, "--effort": "low"})
+        for st, kw in ((agent(), {"to": "claude:gemini", "model": "claude-opus-5-5"}), (self.gem, {"model": "opus"})):
+            with self.assertRaisesRegex(switch.SwitchError, "Claude login gemini runs only google/gemini-4-neon, not "):
+                self.run_switch(st, cfg=self.cfg, **kw)
+        res, calls, _ = self.run_switch(self.gem, effort="max", cfg=self.cfg)   # an effort change there
+        self.assertEqual(calls["migrate"][1]["overrides"], {"--model": homes.NEON, "--effort": "max"})
+
+    def test_off_it_the_other_logins_model(self):
+        res, calls, _ = self.run_switch(self.gem, to="claude:work", cfg=self.cfg)
+        self.assertEqual(calls["migrate"][1]["overrides"], {"--model": "claude-opus-5-5", "--effort": "high"})
+        res, calls, _ = self.run_switch(self.gem, to="claude:work", model="sonnet", cfg=self.cfg)
+        self.assertEqual(calls["migrate"][1]["overrides"]["--model"], "sonnet")
+        res, calls, _ = self.run_switch(self.gem, to="codex", cfg=self.cfg)
+        self.assertEqual(calls["start_codex"][:2], ("gpt-6.1-sol", "xhigh"))
+        with self.assertRaisesRegex(switch.SwitchError, "Claude login work cannot run google/gemini-4-neon, the "
+                                                         "model of a login that runs no other: leave out the model"):
+            self.run_switch(self.gem, to="claude:work", model=homes.NEON, cfg=self.cfg)
+
+    def test_its_catalog_is_its_model_with_no_probe(self):
+        with mock.patch.object(switch.claude_session, "claude_control", side_effect=AssertionError("no probe")):
+            self.assertEqual(switch.claude_models("gemini", self.cfg),
+                             [{"value": homes.NEON, "label": homes.NEON, "efforts": launch.EFFORTS}])
+
+    def test_options_list_each_targets_own_models(self):
+        snaps = {"claude:gemini": dict(usage.per_token(self.cfg["usage"]["claude_accounts"]["gemini"]),
+                                       cli="claude", account="gemini")}
+        neon = [{"value": homes.NEON, "label": homes.NEON, "efforts": launch.EFFORTS}]
+        for st in (agent(), self.gem):
+            # stand-ins, as in Options: the agent's lookup and state (a live claude in a tmux pane), Codex's model
+            # cache, and the claude CLI's initialize answer, which needs a real claude and login
+            with mock.patch.object(switch, "find", return_value={"id": st["id"]}), \
+                    mock.patch.object(switch, "state", return_value=st), \
+                    mock.patch.object(switch, "codex_models", return_value=CODEX_MODELS), \
+                    mock.patch.object(switch.claude_session, "claude_control", side_effect=lambda claude, acct, *a: (
+                        probed.append(acct) or {"models": [{"value": "opus", "displayName": "Opus 5.5"}]})), \
+                    mock.patch.object(switch.config, "STATE_DIR", Path(tempfile.mkdtemp())):
+                probed = []
+                opts = switch.options("agent-x", self.cfg, snaps=snaps)
+            by = {t["target"]: t for t in opts["targets"]}
+            self.assertEqual(by["claude:gemini"]["models"], neon)
+            self.assertEqual((by["claude:gemini"]["status"], by["claude:gemini"]["usage"]),
+                             ("ok", "billed per token, weekly budget $500.00"))
+            plan = [{"value": "opus", "label": "Opus 5.5", "efforts": []}]
+            self.assertEqual((by["claude:work"]["models"], by["codex"]["models"]), (plan, CODEX_MODELS))
+            self.assertEqual(opts["models"], {"claude": plan, "codex": CODEX_MODELS})
+            # one probe, of the agent's own login or, from gemini, the default one
+            self.assertEqual([a.get("config_dir") for a in probed], [None])
+        sw = load_script("agent-switch")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            sw.show_options(opts)
+        self.assertIn("  claude:gemini      current   ok          billed per token, weekly budget $500.00\n"
+                      "    its models: google/gemini-4-neon\n", out.getvalue())
+
+
 class Options(unittest.TestCase):
     def test_targets_and_interrupt_warning(self):
         st = agent(busy=True)
@@ -442,23 +542,41 @@ class Options(unittest.TestCase):
         self.assertIn("model unknown, effort unknown", out.getvalue())
 
 
+    def test_a_codex_agent_s_pane_is_the_one_whose_codex_holds_its_thread_s_lock(self):
+        """Found by the thread, not by a tmux session named after the agent, which another pane may share."""
+        from test_fastmode import codex_holder   # a codex process holding a thread's lock, as Codex does
+        h = homes.Homes(self)
+        tid = "019a0000-0000-7000-8000-00000000beef"
+        holder = codex_holder(self, homes.temp_dir(self), tid)
+        h.codex(tid, name="cx", live=False)   # its thread in Codex's database; the holder above is its codex
+        # every pane of the server (the codex's own %8 among them), and none in a tmux session named after the agent
+        fakes.install(self, FAKE_TMUX_PANES="%%2 1\n%%8 %d" % os.getpid(), FAKE_TMUX_SESSION_PANES="",
+                      FAKE_TMUX_SCREEN="\u203a Ask Codex")
+        sess = {"id": tid, "name": "cx", "cli": "codex", "live": True, "cwd": "/w", "status": ""}
+        st = switch.state(sess)
+        self.assertEqual((st["pane"], st["pid"], st["movable"], st["why_not"]), ("%8", holder.pid, True, ""))
+
+
 class Relaunch(unittest.TestCase):
     """Relaunching in the agent's pane: tmux, the agent's process (its argv in /proc, stopping it) are made up."""
 
     def test_codex_resume_line_keeps_sandbox_and_folder(self):
         st = agent("codex", None, "gpt-6.1-sol", "xhigh")
-        typed = []
+        typed, locked = [], []
         with mock.patch.object(switch.procs, "cmdline", return_value=[
                 "codex", "-s", "danger-full-access", "-a", "never", "-C", "/w", "-m", "gpt-6.1-sol",
                 "-c", "model_reasoning_effort=xhigh"]), \
-                mock.patch.object(switch, "stop", return_value=True), \
-                mock.patch.object(switch.commands, "tmux", side_effect=lambda *a, **k: typed.append(a)), \
+                mock.patch.object(switch, "stop", side_effect=lambda pid: not locked.append(fakes.keys_taken())), \
+                mock.patch.object(switch.commands, "tmux",
+                                  side_effect=lambda *a, **k: typed.append(a) or locked.append(fakes.keys_taken())), \
                 mock.patch.object(switch.launch.time, "sleep"), \
-                mock.patch.object(switch, "codex_pane", return_value=("%5", 1234)):   # tmux: the boundary
+                mock.patch.object(switch.registry, "codex_pane", return_value=("%5", 1234, "")):   # tmux and /proc
             ok, detail = switch.relaunch_codex(st, "gpt-6.1-sol", "ultra", None, "/bin/codex")
         self.assertTrue(ok)
         self.assertEqual(typed[0], ("set-environment", "-t", "%5", "-r", "CLAUDE_CONFIG_DIR"))
-        self.assertEqual(typed[1][-1], "stty sane; unset CLAUDE_CONFIG_DIR; /bin/codex resume %s -s danger-full-access "
+        self.assertEqual(typed[1], ("send-keys", "-t", "%5", "C-u"))   # a stray key typed meanwhile is cleared
+        self.assertEqual(locked, [True] * 5)   # the keys lock from the kill until the line's Enter
+        self.assertEqual(typed[2][-1], "stty sane; unset CLAUDE_CONFIG_DIR; /bin/codex resume %s -s danger-full-access "
                                    "-a never -C /w -c check_for_update_on_startup=false -m gpt-6.1-sol "
                                    "-c model_reasoning_effort=ultra" % st["id"])
         typed.clear()
@@ -466,11 +584,22 @@ class Relaunch(unittest.TestCase):
                 mock.patch.object(switch, "stop", return_value=True), \
                 mock.patch.object(switch.commands, "tmux", side_effect=lambda *a, **k: typed.append(a)), \
                 mock.patch.object(switch.launch.time, "sleep"), \
-                mock.patch.object(switch, "codex_pane", return_value=("%5", 1234)):   # tmux: the boundary
+                mock.patch.object(switch.registry, "codex_pane", return_value=("%5", 1234, "")):   # tmux and /proc
             self.assertTrue(switch.relaunch_codex(st, None, "high", None, "/bin/codex")[0])
-        self.assertTrue(typed[1][-1].endswith("-c check_for_update_on_startup=false -c model_reasoning_effort=high"),
-                        typed[1][-1])   # a model it cannot read: none given, so it keeps the CLI's
+        self.assertTrue(typed[2][-1].endswith("-c check_for_update_on_startup=false -c model_reasoning_effort=high"),
+                        typed[2][-1])   # a model it cannot read: none given, so it keeps the CLI's
 
+
+    def test_a_keys_lock_not_had_in_time_stops_nothing(self):
+        st = agent("codex", None, "gpt-6.1-sol", "xhigh")
+        with fakes.keys_held_elsewhere(), mock.patch.object(switch.commands, "LOCK_WAIT_SECONDS", 0.2), \
+                mock.patch.object(switch.procs, "cmdline", return_value=["codex", "-C", "/w"]), \
+                mock.patch.object(switch, "stop") as stop, \
+                mock.patch.object(switch.commands, "tmux", side_effect=AssertionError("nothing is typed")):
+            ok, detail = switch.relaunch_codex(st, "gpt-6.1-sol", "ultra", None, "/bin/codex")
+        stop.assert_not_called()
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("codex pid 999 not stopped, nothing relaunched: "), detail)
 
     def test_a_codex_that_outlives_sigkill_is_not_relaunched(self):
         st = agent("codex", None, "gpt-6.1-sol", "xhigh")

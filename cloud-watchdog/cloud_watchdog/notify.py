@@ -48,8 +48,9 @@ class Notifier:
                     key=res["key"], incident_id=inc["id"], ok=ok, shadow=False, now=self.now)
         return ok, detail
 
-    def email(self, subject, md, key=None, incident_id=None):
-        """Email the human. Every outcome is recorded as an `email` action. Returns:
+    def email(self, subject, md, *, alert, key=None, incident_id=None):
+        """Email the human an alert of kind `alert` (send() says what it is). Every outcome is recorded as an `email`
+        action. Returns:
           "sent"    agent-mail sent it (send() writes the .md and .html bodies under STATE_DIR/outbox first);
           "failed"  agent-mail failed, after the same outbox files were written;
           "folded"  max_emails_per_day was reached: nothing sent, the subject goes into the next digest;
@@ -63,12 +64,17 @@ class Notifier:
             self.db.log("email", "capped: %s" % subject, key=key, incident_id=incident_id, ok=False, shadow=False,
                         now=self.now)
             return "folded"
-        return "sent" if self.send(subject, md, key=key, incident_id=incident_id) else "failed"
+        return "sent" if self.send(subject, md, alert=alert, key=key, incident_id=incident_id) else "failed"
 
-    def send(self, subject, md, key=None, incident_id=None):
+    def send(self, subject, md, *, alert, key=None, incident_id=None):
         """Email the human (owner_email) `md` with messages.footer for `incident_id` under it, through agent-mail,
         after writing the .md and .html bodies under STATE_DIR/outbox. Logs an `email` action. Returns whether
-        agent-mail sent it (False, logged, when no owner_email is configured)."""
+        agent-mail sent it (False, logged, when no owner_email is configured).
+        `alert` is the kind of alert it is, which agent-mail's --alert takes (the mailroom's agentmail/outbound.py
+        ALERT_KINDS lists them; this watchdog's are the cloud-* ones): when the owner's agent mail is kept for the
+        board's Mail tab (mailroom config mailbox.owner_delivery = "local"), the mailroom config's
+        mailbox.gmail_alerts decides which kinds still go through Gmail. None for a mail that is no alert (the
+        digest, "Now live")."""
         to = self.cfg.get("owner_email")
         if not to:
             self.db.log("email", "not sent, no owner_email configured (cloud-watchdog config.toml or the mailroom's "
@@ -82,8 +88,8 @@ class Notifier:
                 tempfile.NamedTemporaryFile("w", dir=outbox, suffix=".html", delete=False) as h:
             t.write(md)
             h.write(md_to_html(md))
-        cmd = ["agent-mail", "send", "--unrouted", "--to", to, "--subject", subject,
-               "--body-file", t.name, "--html", h.name]
+        cmd = (["agent-mail", "send", "--unrouted"] + (["--alert", alert] if alert else [])
+               + ["--to", to, "--subject", subject, "--body-file", t.name, "--html", h.name])
         code, out, err = self.run(cmd, env=creds.base_env(), timeout=120)
         ok = code == 0
         self.db.log("email", "%s: %s" % (subject, (out + err).strip()[-200:]), key=key, incident_id=incident_id, ok=ok,

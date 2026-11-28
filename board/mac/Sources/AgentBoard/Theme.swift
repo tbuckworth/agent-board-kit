@@ -5,6 +5,13 @@ enum AgentState: String, CaseIterable, Identifiable {
     case busy, background, waiting, blocked, idle, stale, offline
     var id: String { rawValue }
 
+    /// An agent at work: in a turn (busy), or its turn ended while it waits on a background command it started, which
+    /// wakes it when that finishes (background). In this order: the first outranks the second (foremost).
+    static let working: [AgentState] = [.busy, .background]
+
+    /// What one mark shows for these states: the first state of `working` among them, nil when none is at work.
+    static func foremost(_ states: [AgentState]) -> AgentState? { working.first(where: states.contains) }
+
     var label: String {
         switch self {
         case .busy: return "busy"
@@ -17,7 +24,7 @@ enum AgentState: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Busy is a warm Wes Anderson caramel (Isle of Dogs #B6854D, deepened for white text);
+    /// Busy is a warm caramel (#B6854D, deepened for white text);
     /// green is reserved for "waiting on you", the one the owner acts on.
     var hex: UInt32 {
         switch self {
@@ -45,11 +52,76 @@ extension EnvironmentValues {
     }
 }
 
+/// A label's icon and title side by side, the gap between them (5 points before zoom) multiplied by `zoom` as every
+/// other dimension is: Label's own gap is 8 points at every zoom, so a row of labels zoomed out would outgrow its room.
+struct ZoomedLabelStyle: LabelStyle {
+    let zoom: CGFloat
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 5 * zoom) {
+            configuration.icon
+            configuration.title
+        }
+    }
+}
+
 enum Palette {
     /// held mail from the owner, usage running low
     static let attention = Color(hex: 0xD99A1E)
     /// healthy meters
     static let ok = Color(hex: 0x3D8BD9)
+}
+
+/// A colour as the desktop sends it, "#RRGGBB" (agentboard/colours.py); anything else fails the decoding.
+struct HexColour: Decodable, Equatable {
+    let rgb: UInt32
+    var color: Color { Color(hex: rgb) }
+
+    init(rgb: UInt32) { self.rgb = rgb }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        let text = try c.decode(String.self)
+        let digits = text.dropFirst()
+        guard text.first == "#", digits.count == 6, digits.allSatisfy(\.isHexDigit), let v = UInt32(digits, radix: 16) else {
+            throw DecodingError.dataCorruptedError(in: c, debugDescription: "not a #RRGGBB colour: \(text)")
+        }
+        rgb = v
+    }
+}
+
+/// The board groups' colours, as the desktop sends them with the Time page's figures and the usage breakdown
+/// (agentboard/colours.py, for_layout): each group's colour and its sub-groups' shades, in layout order, and
+/// Ungrouped's. The Mail tab's threads come with their own (MailboxThread). Names are values here, not keys, which the
+/// decoder's snake-case rule would change.
+struct GroupColours: Decodable, Equatable {
+    struct Shade: Decodable, Equatable {
+        var name: String
+        var colour: HexColour
+    }
+
+    struct Group: Decodable, Equatable {
+        var name: String
+        var colour: HexColour
+        var shades: [Shade]
+    }
+
+    var groups: [Group]
+    var ungrouped: HexColour
+
+    /// A group's colour; Ungrouped's for a name the layout does not hold, the Time page's Unsorted time and the usage
+    /// breakdown's.
+    func group(_ name: String) -> Color {
+        (groups.first { $0.name == name }?.colour ?? ungrouped).color
+    }
+
+    /// A sub-group's shade; the group's colour for time in no sub-group (nil), or in a sub-group the layout no longer
+    /// holds (the Time page still shows its time).
+    func subgroup(_ sub: String?, of group: String) -> Color {
+        guard let s = sub, let shade = groups.first(where: { $0.name == group })?.shades.first(where: { $0.name == s })
+        else { return self.group(group) }
+        return shade.colour.color
+    }
 }
 
 extension Color {
@@ -67,6 +139,14 @@ extension NSColor {
 }
 
 enum Fmt {
+    /// `text` to show with each line laid out left to right, whatever right-to-left letters it holds: a left-to-right
+    /// mark before each line. Laid out by its first strong letter, a line that starts with a right-to-left one (a
+    /// Hebrew geresh looks like an apostrophe) would show its words in another order than they come in it. For display
+    /// only: what the app sends never carries the marks.
+    static func leftToRight(_ text: String) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: false).map { "\u{200E}" + $0 }.joined(separator: "\n")
+    }
+
     static func age(_ seconds: Double?) -> String {
         guard let s = seconds else { return "-" }
         let d = max(0, Int(s))

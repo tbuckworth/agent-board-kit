@@ -4,8 +4,9 @@
 
 - The [prerequisites](01-prerequisites.md) are installed on the Linux machine, `gh` and Claude Code
   are logged in.
-- The agents' Gmail account and its OAuth client file exist: [02-agent-gmail.md](02-agent-gmail.md),
-  steps 1-3 (`~/.config/agent-mail/credentials.json` is in place).
+- Tailscale runs on the Linux machine, the Mac and the phone ([01-prerequisites.md](01-prerequisites.md)).
+- Only if you want Gmail (`WITH_GMAIL="yes"`): the agents' Gmail account and its OAuth client file exist
+  ([02-agent-gmail.md](02-agent-gmail.md), steps 1-3).
 - Your to-do repo exists: `gh repo create <you>/tasks --private` (details in [06-todo.md](06-todo.md)).
 
 ## Clone and describe yourself
@@ -22,8 +23,10 @@ Every key is explained in the file ([kit.example.env](../kit.example.env)). The 
 | Key | Example | Used for |
 |---|---|---|
 | `OWNER_NAME` | `Alex` | how agents refer to you; the header on every relayed message |
-| `OWNER_EMAIL` | `alex@example.com` | the only sender whose mail is taken as an instruction; where agents report |
-| `AGENT_EMAIL` | `yourname.agents@gmail.com` | the agents' mailbox ([02-agent-gmail.md](02-agent-gmail.md)) |
+| `OWNER_EMAIL` | `alex@example.com` | your identity: the address you log in to Tailscale with. With Gmail on, also the only sender whose mail is taken as an instruction |
+| `WITH_GMAIL` | `no` | `no`: agent mail stays in the Mail tab and phone app. `yes`: also through an agents' Gmail account |
+| `AGENT_EMAIL` | empty | only with Gmail on: the agents' mailbox ([02-agent-gmail.md](02-agent-gmail.md)) |
+| `WITH_PHONE_APP` | `yes` | the Agent Mail phone app ([07-mac.md](07-mac.md), "The phone app") |
 | `GITHUB_OWNER` | `alex-gh` | owner of repos made by `agent-spawn --new-repo` |
 | `TASKS_REPO` | `alex-gh/tasks` | the to-do list's private repo |
 | `REPOS_ROOT` | `~/code` | where `agent-spawn --repo NAME` looks, and where worktrees go |
@@ -55,7 +58,7 @@ What it does, step by step (each step is idempotent; `--only STEP` or `--skip ST
 | `systemd` | renders the user units into `~/.config/systemd/user/` (not started without `--start`): only those your `WITH_*` keys and `MAIL_BACKUP_DIRS` ask for |
 | `cron` | only where no `todo-dispatch.timer` is installed: with `--start`, a crontab line for `todo-desk dispatch` |
 
-## Give Gmail consent
+## Give Gmail consent (only with Gmail on)
 
 ```bash
 agent-mail-auth
@@ -84,7 +87,8 @@ Open the printed URL in your laptop's browser; the redirect comes back through t
 loginctl enable-linger "$USER"
 ```
 
-`--start` enables and starts `agent-mailroom` (only once the Gmail token exists), the optional
+`--start` enables and starts `agent-mailroom` (with Gmail on, only once the Gmail token exists), the phone
+app's server (`WITH_PHONE_APP`), the optional
 `agent-memwatch`, the after-boot `agent-restart-restore` unit and the timers you asked for
 (`todo-dispatch`, `agent-cli-update`, and, if set, `agent-board-time` and `agent-mail-backup`).
 `--labels` creates the to-do labels in `TASKS_REPO` (the repo must exist). Lingering keeps user
@@ -105,13 +109,17 @@ Each failure prints the fix. Common ones are in [troubleshooting](09-troubleshoo
 ## First test, end to end
 
 1. From any directory on the Linux machine:
-   `agent-spawn --repo general --branch hello --brief-text "Say hello: email me one line with agent-mail send, then wait."`
+   `agent-spawn --repo general --branch hello --brief-text "Say hello: write me one line with agent-mail send, then wait."`
    (`general` is the last part of `GENERAL_REPO`; any repo name under `REPOS_ROOT` works.)
    It prints the tmux session name; `tmux attach -t hello` to watch it (detach with Ctrl-b d).
-2. The mail arrives in your own inbox from `AGENT_FROM_NAME (hello)`. Reply "thanks, now close".
-3. Within about 30 seconds the reply appears in the `hello` session; it closes itself.
-4. Now from your phone, email the agents' address (a fresh mail, not a reply): "What agents are
-   running?". No session owns it, so the orchestrator answers.
+2. Its message arrives in the board's Mail tab (and the phone app) from `AGENT_FROM_NAME (hello)`. Reply
+   "thanks, now close".
+3. Within a second or two the reply appears in the `hello` session; it closes itself.
+4. Now press **Orchestrator…** on the board (or in the phone app) and send "What agents are running?". The
+   orchestrator answers in the Mail tab.
+
+With Gmail on, the same works by email: the agent's mail reaches your inbox, your reply reaches the agent within
+about 30 seconds, and a fresh mail to the agents' address goes to the orchestrator.
 
 ## Updating
 

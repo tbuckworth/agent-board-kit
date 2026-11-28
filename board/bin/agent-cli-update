@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""agent-cli-update: update Codex and Claude Code on this machine (`codex update`, `claude update`).
+"""agent-cli-update: update Codex and Claude Code on this machine (`codex update`, `claude update`), then try fast
+mode's effort keys on each one's installed version if they were not tried on it yet (`agent-mail fast-trial CLI
+--if-untested`; README.md, "CLI updates").
 
-    agent-cli-update            update both now; one line each in ~/.local/state/agent-board/cli-update.log
+    agent-cli-update            update both and try them now; one line each in ~/.local/state/agent-board/cli-update.log
     agent-cli-update log [N]    the last N lines of that log (default 20)
 
-agent-cli-update.timer runs it. A CLI that is not installed is skipped; the exit status is 1 when an installed one
-fails to update, or when neither is installed.
+agent-cli-update.timer runs it. A CLI that is not installed is skipped (no update, no trial); the exit status is 1
+when an installed one's update or trial fails, or when neither is installed. A failed trial undoes no update.
 """
 import sys
 from pathlib import Path

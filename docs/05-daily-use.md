@@ -1,19 +1,25 @@
 # 5. Daily use
 
-## Talking to your agents by email
+## Talking to your agents
+
+You read and answer agents in the board's **Mail** tab (the Mac) and the **Agent Mail** phone app, and send
+requests with **Orchestrator…** in either. With Gmail on, the same works by email: reply to an agent's mail, or
+write to the agents' address in a new thread for the orchestrator.
 
 | You want | Do |
 |---|---|
-| answer an agent | reply to its mail, from any device. It gets your reply in its session within ~30 s |
-| start something | email the agents' address (new thread): "Start an agent on repo X to do Y". The orchestrator spawns it and replies with its name |
-| pass a message on | "Tell the agent on X to also do Z" |
-| status | "What are the agents up to?" (an HTML report: facts from the event log plus a short narrative) |
-| stop an agent | reply "close" in its thread. It lands its work and closes, or tells you what is unlanded and asks |
-| a group chat | "Set up a group chat for the agents on X and Y". The orchestrator makes it as yours; you get one mail for the group, and your reply in that thread is your post ([Group chats](#group-chats)) |
-| restart the machine | "Install the updates and restart" (asks you to confirm; agents resume after boot) |
+| answer an agent | reply to its mail in the Mail tab or the phone app. It gets your reply in its session within a second or two |
+| start something | **Orchestrator…**: "Start an agent on repo X to do Y". The orchestrator spawns it and tells you its name |
+| pass a message on | right-click its tile, **Send message…**; or ask the orchestrator "tell the agent on X to also do Z" |
+| status | the tiles; or ask the orchestrator "what are the agents up to?" (a report: facts from the event log plus a short narrative) |
+| stop an agent | **Close…** on its tile, or reply "close" in its thread. It lands its work and closes, or tells you what is unlanded and asks |
+| a group chat | **New group chat…** on a tile, or ask the orchestrator; post in **Chats** ([Group chats](#group-chats)) |
+| a quick back-and-forth | **Fast** on a Mail-tab thread ([The Mail tab](#the-mail-tab)) |
+| restart the machine | ask the orchestrator "install the updates and restart" (it asks you to confirm; agents resume after boot) |
 
-Only mail from `OWNER_EMAIL` with a DKIM pass is acted on. Everything else is held for you
-(`agent-mail inbox --held`).
+Only you can instruct agents: through the board (your own ssh login to the Linux machine), the phone app (your
+device on your tailnet, with a passkey) and, with Gmail on, mail from `OWNER_EMAIL` with a DKIM pass. Other mail
+is held for you (`agent-mail inbox --held`).
 
 **Mail to an agent that has closed** (a reply, or a forward of its thread) goes to the orchestrator
 with the thread. If you wrote as if the agent were still there, it asks whether to start a new one; if
@@ -66,15 +72,22 @@ Details: `mailroom/README.md`, "Groups", and `board/README.md`, "Group chats".
 ## The Mail tab
 
 The board's **Mail** tab holds the mail between you and your agents, kept by the mailroom on the Linux
-machine: threads, search, Inbox / Snoozed / Archived, snooze, Gmail-like keys (j/k, arrows, e, r,
-Space), and replies with files (drag, paste or pick). Your reply there reaches the agent exactly like
-an emailed one, and the agent answers in your Gmail thread. Drafts are kept per thread. Options and
-plots are drawn in the mail; picking an option starts your reply with it.
+machine: threads, search, Inbox / Snoozed / Archived, snooze, Gmail-like keys (j/k, arrows, e, r, u, s,
+Space, z or ⌘Z to undo), and replies with files (drag, paste a screenshot, or pick). Your reply there
+reaches the agent within a second or two, exactly like an emailed one. Options and plots are drawn in the
+mail; picking an option starts your reply with it, and you can answer each question separately, with a
+comment, or comment on selected text. A click on a plot, table or image enlarges it; a double-click on a
+thread opens it in a window of its own; a tile's double-click opens that agent's latest mail. Drafts are
+kept on the Linux machine, per thread, with their last few versions.
 
-- Your Gmail gets the same agent mail. **Sync with Gmail** (the ⋯ menu) brings the two into step, what
-  is archived or read in either counting in both. It needs your own Gmail login on the board
-  (`gmail_credentials` with the `gmail.modify` scope; `board/README.md`, "Optional: your Gmail").
-- Mail sent before this release is not in the store yet: run `agent-mail mailbox backfill` once.
+- **No Gmail by default.** Agent mail lives in the tab and the phone app, and every alert is kept there too
+  (security alerts also post a Mac notification). With Gmail on (`WITH_GMAIL="yes"`), agent mail to you also goes
+  through Gmail unless the mailroom config's `mailbox.owner_delivery` is `"local"`; the tab and Gmail then keep
+  their own read and archive state. Details: `mailroom/README.md`.
+- **Forward** on an agent's mail makes a fresh draft of it in your own Gmail, for you to address and send.
+  It needs your own Gmail login on the board (`gmail_credentials`, with a scope that can make drafts:
+  `board/README.md`, "Optional: your Gmail (read-check and Forward)").
+- Mail sent before the message store existed is not in the tab: run `agent-mail mailbox backfill` once.
 - The store keeps every agent mail. `MAIL_BACKUP_DIRS` in `kit.env` copies it, and the mailroom
   database, to another disk every hour.
 

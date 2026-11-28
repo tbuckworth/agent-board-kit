@@ -24,6 +24,16 @@ def ppid(pid):
         return None
 
 
+def ancestors(pid):
+    """pid's parent, that one's parent, and so on up to the first process (pid itself not among them)."""
+    out = []
+    while True:
+        pid = ppid(pid)
+        if not pid:
+            return out
+        out.append(pid)
+
+
 def parents():
     """{pid: ppid} for every process we can see."""
     out = {}

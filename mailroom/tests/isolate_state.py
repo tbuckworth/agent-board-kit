@@ -1,4 +1,5 @@
-"""Point the mailroom's state and config directories and the status log at fresh temporary directories.
+"""Point the mailroom's state and config directories, the status log and tmux's socket folder at fresh temporary
+directories.
 
 Every test module imports this before anything from agentmail or bin/: agentmail.config reads
 AGENT_MAIL_STATE_DIR and AGENT_MAIL_CONFIG_DIR, and agentmail.statuslog AGENT_STATUS_DIR, once, at first
@@ -30,6 +31,10 @@ BASE = Path(tempfile.mkdtemp(prefix="agent-mail-tests-"))
 for var, name in DIRS:
     (BASE / name).mkdir()
     os.environ[var] = str(BASE / name)
+# tmux's socket folder: commands.tmux takes its server from it (config tmux_socket being unset here), so a test that
+# reaches a real tmux by mistake finds an empty folder, never the owner's own server. A test may set its own.
+(BASE / "tmux").mkdir()
+os.environ["TMUX_TMPDIR"] = str(BASE / "tmux")
 
 # The identity the installer writes into config.json from kit.env, here with example values.
 IDENTITY = {"account": "agents@example.com", "from_name": "Agents", "allowlist": ["owner@example.com"],

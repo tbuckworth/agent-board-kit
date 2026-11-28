@@ -1,0 +1,64 @@
+/* The voice page (web/voice/index.html): one big Talk button over the conversation's transcript. Light or dark as the
+   system is, in the Mail page's colours (web/mail/app.css). */
+:root {
+  color-scheme: light dark;
+  --font: -apple-system, system-ui, Roboto, "Segoe UI", Helvetica, Arial, sans-serif;
+  --bg: #ffffff; --fg: #1f1f1f; --muted: #5f6368; --line: #e3e5e8; --field: rgba(0, 0, 0, 0.055);
+  --accent: #2f6fdb; --on-accent: #ffffff; --stop: #b3261e; --on-stop: #ffffff; --error: #b3261e;
+  --you: #e8f0fe; --desk: #f1f3f4; --tool: #8250df;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131314; --fg: #e3e3e3; --muted: #9aa0a6; --line: #34363a; --field: rgba(255, 255, 255, 0.08);
+    --accent: #8ab4f8; --on-accent: #0b1d3a; --stop: #f2b8b5; --on-stop: #601410; --error: #f2b8b5;
+    --you: #1f3760; --desk: #232425; --tool: #b393f7;
+  }
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg); font: 16px/1.45 var(--font);
+  -webkit-text-size-adjust: 100%; }
+main { max-width: 640px; margin: 0 auto; padding: max(16px, env(safe-area-inset-top)) 16px
+  max(24px, env(safe-area-inset-bottom)); display: flex; flex-direction: column; align-items: center; gap: 12px; }
+header { width: 100%; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+h1 { margin: 0; font-size: 22px; font-weight: 600; }
+.model { margin: 0; color: var(--muted); font-size: 13px; }
+a { color: var(--accent); }
+.gate, .error { width: 100%; margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--field); }
+.gate p { margin: 0 0 10px; }
+.filled { min-height: 44px; padding: 0 22px; border: 0; border-radius: 22px; background: var(--accent);
+  color: var(--on-accent); font: 600 16px/1 var(--font); cursor: pointer; }
+.filled:disabled { opacity: 0.45; }
+.error { color: var(--error); overflow-wrap: anywhere; }
+
+.talk { width: 168px; height: 168px; margin: 12px 0 0; border: 0; border-radius: 50%; background: var(--accent);
+  color: var(--on-accent); font: 600 26px/1 var(--font); cursor: pointer; touch-action: manipulation;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18); transition: transform 120ms ease, background 160ms ease; }
+.talk:active { transform: scale(0.97); }
+.talk:disabled { opacity: 0.45; cursor: default; }
+.talk.on { background: var(--stop); color: var(--on-stop); }
+.talk:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+.state { margin: 0; min-height: 1.45em; color: var(--muted); text-align: center; }
+.state.asking { color: var(--tool); font-weight: 600; }
+
+.transcript { width: 100%; margin: 8px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column;
+  gap: 8px; }
+.transcript li { max-width: 88%; padding: 8px 12px; border-radius: 14px; overflow-wrap: anywhere; }
+.transcript .who { display: block; font-size: 12px; font-weight: 600; color: var(--muted); }
+.transcript .you { align-self: flex-end; background: var(--you); }
+.transcript .desk { align-self: flex-start; background: var(--desk); }
+.transcript .tool { align-self: center; max-width: 100%; padding: 2px 8px; font-size: 13px; color: var(--tool); }
+.transcript .tool.going::after { content: "…"; }
+.transcript .note { align-self: center; font-size: 13px; color: var(--muted); }
+
+/* While a conversation goes, Stop stays at the bottom of the window however long the transcript grows. */
+body.talking main { padding-bottom: calc(88px + env(safe-area-inset-bottom)); }
+.bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 2; display: flex; align-items: center;
+  justify-content: center; gap: 16px; padding: 12px 16px max(12px, env(safe-area-inset-bottom));
+  background: var(--bg); border-top: 1px solid var(--line); }
+.barstate { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted);
+  font-size: 14px; }
+.stop { min-height: 48px; padding: 0 32px; border: 0; border-radius: 24px; background: var(--stop);
+  color: var(--on-stop); font: 600 18px/1 var(--font); cursor: pointer; flex: none; }
+.stop:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }

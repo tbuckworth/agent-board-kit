@@ -6,6 +6,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -13,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _kitenv  # noqa: E402,F401  (scratch config with an example owner, before agentboard reads any)
 from _kitenv import AGENTS, OWNER  # noqa: E402
-from agentboard import collect, gmailstate, google, meetings, sources  # noqa: E402
+from agentboard import collect, gmailstate, google, meetings, sources, speech  # noqa: E402
 
 OWN = "me@example.com"         # the calendar login's own account (its primary calendar's id)
 WORK = "work@example.org"      # a work calendar shared with that login
@@ -22,6 +24,26 @@ CODEX_HOOK_REVIEW = ("  Hooks need review\n  1 hook is new or changed.\n"
                      "  Hooks can run outside the sandbox after you trust them.\n"
                      "› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n"
                      "  enter confirm · esc skip\n")
+
+
+LIMIT_TEXT = "You've hit your weekly limit · resets Dec 3, 5am (UTC) · out of usage credits"
+LIMIT_INFO = {"status": "rejected", "resetsAt": 1796274000, "rateLimitType": "seven_day", "overageStatus": "rejected",
+              "overageDisabledReason": "out_of_credits", "isUsingOverage": False}
+
+
+def api_error_reply(text=LIMIT_TEXT, error="rate_limit", status=429, api_error="usage_limit_reached", info=LIMIT_INFO):
+    """What `claude -p --output-format stream-json` prints after its init when its request fails: by default, as its
+    login is at its weekly limit (Claude Code 2.1.332, 27 Nov 2026), the limit's event, Claude Code's reply in place of
+    an answer (a synthetic message carrying, under snake_case names, what its transcript entry for it holds), and an
+    error result; with `info` None, no limit's event and no limit in the reply."""
+    params = {"rate_limit_info": info} if info else None
+    reply = {"type": "assistant", "parent_tool_use_id": None, "error": error, "is_api_error_message": True,
+             "api_error_status": status, "api_error": api_error, "api_error_params": params,
+             "message": {"id": "e6bee196-8d4e-42b0-9a96-515b77d8d626", "model": "<synthetic>", "role": "assistant",
+                         "type": "message", "content": [{"type": "text", "text": text}]}}
+    result = {"type": "result", "subtype": "success", "is_error": True, "result": text, "terminal_reason": "api_error",
+              "api_error_status": status}
+    return ([{"type": "rate_limit_event", "rate_limit_info": info}] if info else []) + [reply, result]
 
 
 def iso(ts):
@@ -78,14 +100,40 @@ def collector(d, claude=lambda: [], panes=lambda: [], **kw):
                              git=sources.GitCache(), claude=claude, panes=panes, **kw)
 
 
+def codex_home(home, threads, held=()):
+    """A Codex home in folder `home`: state_5.sqlite with a threads table holding `threads` (dicts of its columns; the
+    rest default to a user's thread in /x), and a locked writer lock file for each thread id in `held`, as a running
+    Codex keeps one. Returns the open lock files: closing them is that Codex exiting."""
+    import fcntl
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "thread-writer-locks").mkdir()
+    con = sqlite3.connect(str(home / "state_5.sqlite"))
+    con.execute("create table threads(id, name, title, cwd, git_branch, rollout_path, updated_at, model, "
+                "reasoning_effort, created_at, archived, source, thread_source, agent_nickname)")
+    for t in threads:
+        row = dict({"name": "", "title": "", "cwd": "/x", "git_branch": "", "rollout_path": "", "model": "m",
+                    "reasoning_effort": "x", "archived": 0, "source": "cli", "thread_source": "user",
+                    "agent_nickname": None}, **t)
+        con.execute("insert into threads(%s) values(%s)" % (", ".join(row), ", ".join("?" * len(row))),
+                    list(row.values()))
+    con.commit()
+    con.close()
+    handles = []
+    for tid in held:
+        fh = open(home / "thread-writer-locks" / (tid + ".lock"), "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        handles.append(fh)
+    return handles
+
+
 def mailroom_db(path):
-    """A mailroom database at `path` with the routing tables the board reads, empty; an open connection to it."""
+    """A mailroom database at `path` with the tables the board reads, empty; an open connection to it."""
     con = sqlite3.connect(str(path))
     con.executescript("""
       create table sessions(tag text primary key, cli text, session_id text, session_name text, cwd text,
                             created_at integer, origin_host text);
       create table sent(id integer primary key, tag text, gmail_id text, thread_id text, message_id text,
-                        to_addr text, subject text, sent_at integer, in_reply_to_inbound integer);
+                        to_addr text, subject text, sent_at integer, in_reply_to_inbound integer, eml text);
       create table inbound(id integer primary key, gmail_id text, thread_id text, message_id text, from_addr text,
                            from_name text, subject text, received_at integer, matched_tag text, match_rule text,
                            action text, detail text, body text, released_to text, released_at integer);
@@ -93,26 +141,26 @@ def mailroom_db(path):
     return con
 
 
-def gmail_of(me, box, inbox, unread, fail=None):
+def gmail_of(me, box, unread, fail=None, draft=None):
     """A real GmailState (the board's view of the agents' mail in the owner's Gmail) whose HTTP layer, Gmail's API over
     the network, which a test cannot reach, answers as the mailbox of `me` would. `box` maps Gmail ids to their
-    Message-IDs (any other g<N> asked for is <gN@x>); the ids in `inbox` are in the inbox and those in `unread` unread,
-    sets a test may change between checks, and a batchModify taking INBOX or UNREAD off takes ids out of them; a list
-    is paged as the request's maxResults asks. `fail`: a URL fragment Gmail answers with an HTTP error. Also the calls
-    made, (method, url, headers, body) each."""
+    Message-IDs, which a search by rfc822msgid finds; the ids in `unread` are unread, a set a test may change between
+    checks; a list is paged as the request's maxResults asks; a draft uploaded is answered with `draft` if given, else
+    as Gmail answers, its message id d<N> for the Nth. `fail`: a URL fragment Gmail answers with an HTTP error. Also
+    the calls made, (method, url, headers, the bytes of an upload or None) each."""
     calls = []
 
-    def http(method, url, data=None, headers=None, body=None):
-        calls.append((method, url, headers, body))
+    def http(method, url, data=None, headers=None, body=None, raw=None, timeout=20):
+        calls.append((method, url, headers, raw))
         if fail and fail in url:
             raise google.GoogleError("Google API answered HTTP 503", 503)
         if url == google.TOKEN_URL:
             return {"access_token": "AT-secret", "expires_in": 3600}
         path, query = urllib.parse.urlsplit(url)[2:4]
-        if path.endswith("/messages/batchModify"):
-            for label in body["removeLabelIds"]:
-                {"INBOX": inbox, "UNREAD": unread}[label].difference_update(body["ids"])
-            return {}
+        if path.endswith("/upload/gmail/v1/users/me/drafts"):
+            n = sum(1 for c in calls if "/upload/" in c[1])
+            made = {"id": "r-%d" % n, "message": {"id": "d%d" % n, "threadId": "d%d" % n, "labelIds": ["DRAFT"]}}
+            return draft or made
         if path.endswith("/profile"):
             return {"emailAddress": me}
         if path.endswith("/messages"):
@@ -122,12 +170,11 @@ def gmail_of(me, box, inbox, unread, fail=None):
                 want = sources.norm_id(q.split(":", 1)[1])
                 return {"messages": [{"id": g, "threadId": "t-" + g} for g, m in box.items()
                                      if sources.norm_id(m) == want]}
-            ids = sorted(inbox if "in:inbox" in q else unread)
+            ids = sorted(unread)                                        # the read check's list of unread mail
             start, page = int(args.get("pageToken", ["0"])[0]), int(args["maxResults"][0])
             more = {"nextPageToken": str(start + page)} if start + page < len(ids) else {}
             return dict({"messages": [{"id": g} for g in ids[start:start + page]]}, **more)
-        gid = path.rsplit("/", 1)[1]
-        return {"payload": {"headers": [{"name": "Message-Id", "value": box.get(gid, "<%s@x>" % gid)}]}}
+        raise ValueError("no stand-in answer for %s %s" % (method, path))
     creds = Path(tempfile.mkdtemp()) / "credentials.json"
     creds.write_text(json.dumps({"type": "authorized_user", "client_id": "c", "client_secret": "s",
                                  "refresh_token": "r"}))
@@ -182,3 +229,45 @@ def meetings_reader(fake, config=None, creds=True):
         (d / "token.json").write_text(json.dumps({"client_id": "c", "client_secret": "s", "refresh_token": "r"}))
     return meetings.Meetings(config_path=config or d / "none.json", creds_path=d / "token.json", http=fake, sync=True)
 
+
+def until(check, seconds=10):
+    """check() once it is true, or after `seconds`: whether it came true, for what another thread or process does."""
+    ends = time.time() + seconds
+    while not check() and time.time() < ends:
+        time.sleep(0.01)
+    return check()
+
+
+class Voice:
+    """The desktop's voice daemon, the real speech.Server on the Unix socket `socket` (in `folder` by default), with a
+    stand-in for Kokoro: each text it is given becomes 10 ms of audio a character (24 kHz, 16-bit), after `delay`
+    seconds, and a text holding `fail` makes it raise. `said` keeps each text it was given, `busy` the most it was
+    given at once. `config`: a settings file naming the socket. close() stops it."""
+
+    def __init__(self, folder, socket=None, fail=None, delay=0.0):
+        self.folder, self.fail, self.delay = Path(folder), fail, delay
+        self.socket = str(socket or self.folder / "speech.sock")
+        self.said, self.busy, self.now, self.lock = [], 0, 0, threading.Lock()
+        self.config = self.folder / "speech.json"
+        self.config.write_text(json.dumps({"socket": self.socket}))
+        self.log = self.folder / "speech.log"
+        self.server = speech.Server(self.synth, self.socket, log_path=self.log)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def synth(self, text):
+        with self.lock:
+            self.now += 1
+            self.busy = max(self.busy, self.now)
+        try:
+            self.said.append(text)
+            time.sleep(self.delay)
+            if self.fail and self.fail in text:
+                raise RuntimeError("the stand-in could not say it")
+            return b"\x10\x00" * (240 * len(text)), 24000
+        finally:
+            with self.lock:
+                self.now -= 1
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()

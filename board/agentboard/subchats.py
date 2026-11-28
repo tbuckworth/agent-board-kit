@@ -108,6 +108,10 @@ def sync(layout, agents, run):
                     problems.append("%s: %s" % (where, e))
                     if had:
                         after[s["id"]] = had
+                    elif isinstance(e, chats.ChatMadeError) and e.group:   # made all the same: kept, not made again
+                        after[s["id"]] = dict(want, chat=e.group)
+                        notes.append("made chat %s for %s: %s (its answer not understood)"
+                                     % (e.group, where, ", ".join(names)))
         for sid, had in before.items():
             if sid in after:                   # its sub-group is in the layout
                 continue

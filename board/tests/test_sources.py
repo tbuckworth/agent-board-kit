@@ -369,22 +369,86 @@ class MailOwnerTest(unittest.TestCase):
 
     def test_it_sends_unrouted_to_the_owner_with_the_body_on_stdin(self):
         self.stand_in(0)
-        self.assertEqual(sources.mail_owner("Desktop is back", "All 3 agents restored."), (True, ""))
-        self.assertEqual((self.d / "argv").read_text().split(),
-                         ["send", "--unrouted", "--to", "owner@example.com", "--subject", "Desktop", "is", "back"])
+        self.assertEqual(sources.mail_owner("Desktop is back", "All 3 agents restored.", alert=None), (True, ""))
+        self.assertEqual((self.d / "argv").read_text().split("\n")[:-1],
+                         ["send", "--unrouted", "--to", "owner@example.com", "--subject", "Desktop is back"])
         self.assertEqual((self.d / "stdin").read_text(), "All 3 agents restored.\n")
+
+    def test_an_alert_names_its_kind_for_the_mailroom(self):
+        self.stand_in(0)
+        self.assertEqual(sources.mail_owner("s", "b", alert="memory"), (True, ""))
+        self.assertEqual((self.d / "argv").read_text().split("\n")[:-1],
+                         ["send", "--unrouted", "--alert", "memory", "--to", "owner@example.com", "--subject", "s"])
+
+    def test_every_caller_says_whether_its_mail_is_an_alert(self):
+        self.stand_in(0)
+        with self.assertRaises(TypeError):
+            sources.mail_owner("s", "b")                    # no default: an alert left out is never taken for none
+        self.assertFalse((self.d / "argv").exists())
 
     def test_a_failure_says_why(self):
         self.stand_in(3)
-        self.assertEqual(sources.mail_owner("s", "b"), (False, "agent-mail exit 3: refused"))
+        self.assertEqual(sources.mail_owner("s", "b", alert=None), (False, "agent-mail exit 3: refused"))
         sources.find_bin = lambda name: None
-        self.assertEqual(sources.mail_owner("s", "b"), (False, "agent-mail is not installed"))
+        self.assertEqual(sources.mail_owner("s", "b", alert=None), (False, "agent-mail is not installed"))
 
     def test_without_an_owner_address_nothing_is_sent(self):
         self.stand_in(0)
         sources.MAIL_CONFIG.write_text("{}")
-        self.assertEqual(sources.mail_owner("s", "b"), (False, "no owner address in the mailroom config (owner_email)"))
+        self.assertEqual(sources.mail_owner("s", "b", alert=None),
+                         (False, "no owner address in the mailroom config (owner_email)"))
         self.assertFalse((self.d / "argv").exists())
+
+
+class SecurityAlertsTest(unittest.TestCase):
+    """sources.security_alerts: the mailroom's security-alerts.jsonl, as the collector passes it on (README, "Security
+    alerts on the Mac"), in the form the mailroom writes it (outbound.record_security_alert)."""
+    NOW = 1_800_000_000.0
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.path = self.d / "security-alerts.jsonl"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d)
+
+    def line(self, at, kind="phone-enrolment", subject="Phone mail: a passkey was enrolled", thread="L0123456789abcdef"):
+        return json.dumps({"at": at, "kind": kind, "subject": subject, "thread_id": thread}) + "\n"
+
+    def test_no_file_is_no_alerts(self):
+        self.assertEqual(sources.security_alerts(self.NOW, self.path), ([], 0))
+
+    def test_the_last_seven_days_oldest_first(self):
+        self.path.write_text(self.line(self.NOW - 8 * 86400, thread="Lold") + self.line(self.NOW - 60, "fast-keys")
+                             + self.line(self.NOW - 7200, thread="Learlier") + self.line(int(self.NOW - 7 * 86400)))
+        got, bad = sources.security_alerts(self.NOW, self.path)
+        self.assertEqual(bad, 0)
+        self.assertEqual([(a["at"], a["kind"], a["thread_id"]) for a in got],
+                         [(self.NOW - 7 * 86400, "phone-enrolment", "L0123456789abcdef"),
+                          (self.NOW - 7200, "phone-enrolment", "Learlier"), (self.NOW - 60, "fast-keys", "L0123456789abcdef")])  # gitleaks:allow (a made-up thread id)
+        self.assertEqual(set(got[0]), {"at", "kind", "subject", "thread_id"})
+        self.assertIsInstance(got[0]["at"], float)
+
+    def test_a_line_that_is_not_an_alert_is_passed_over_and_counted_but_one_being_written_is_not(self):
+        self.path.write_text("not json\n" + json.dumps({"at": True, "kind": "x", "subject": "s", "thread_id": "t"})
+                             + "\n" + json.dumps({"at": self.NOW, "kind": "x", "subject": 5, "thread_id": "t"}) + "\n"
+                             + json.dumps([1]) + "\n" + self.line(self.NOW - 5) + '{"at": 17')
+        got, bad = sources.security_alerts(self.NOW, self.path)
+        self.assertEqual((len(got), bad), (1, 4))
+
+    def test_a_long_subject_is_cut(self):
+        self.path.write_text(self.line(self.NOW, subject="x" * 1000))
+        self.assertEqual(len(sources.security_alerts(self.NOW, self.path)[0][0]["subject"]),
+                         sources.SECURITY_ALERT_CHARS)
+
+    def test_the_file_is_the_mailroom_s_under_its_state_folder(self):
+        self.assertEqual(sources.SECURITY_ALERTS, Path(os.environ["AGENT_MAIL_STATE_DIR"]) / "security-alerts.jsonl")
+
+    def test_a_file_that_cannot_be_read_raises(self):
+        self.path.mkdir()
+        with self.assertRaises(OSError):
+            sources.security_alerts(self.NOW, self.path)
 
 
 if __name__ == "__main__":
